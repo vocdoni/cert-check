@@ -184,8 +184,12 @@ DNS (Cloudflare, both "DNS only"):
      `<publicURL>/#error=invalid_state&diag=<diagnosticId>`. The diagnostic ID is logged with the
      SNI, the reason and the time. The auth listener never renders HTML: every user-facing
      message, including the copyable diagnostic report, comes from the main UI.
-5. UI reads `location.hash`, clears it with `history.replaceState(null, '', '/')`, and calls
-   `POST /api/v1/transactions/redeem {"code":"…"}`. The browser sends the cookie.
+5. UI reads `location.hash`, clears it with `history.replaceState(null, '', '/')`, and:
+   - with `#code=<code>`, calls `POST /api/v1/transactions/redeem {"code":"…"}`. The browser
+     sends the cookie.
+   - with `#error=<code>&diag=<id>`, renders the error view directly. The report holds the
+     diagnostic ID, error code, time, user agent and the pending-attempt data from
+     `sessionStorage`; the server log holds the rest under the same ID.
    - The server consumes the code atomically. The code's transaction must equal the cookie's
      transaction (constant-time compare), otherwise the generic error `invalid_or_expired`.
    - It returns the result, deletes the transaction and expires the cookie.
