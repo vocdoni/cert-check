@@ -180,8 +180,10 @@ DNS (Cloudflare, both "DNS only"):
      in the transaction.
    - Issues a one-use code and answers `303 See Other` to `<publicURL>/#code=<code>`. The base is
      fixed by configuration, never taken from the request.
-   - Unknown, expired or used state: an HTML page "This sign-in link is no longer valid" with a
-     link to `<publicURL>`. No redirect.
+   - Unknown, expired or used state: `303 See Other` to
+     `<publicURL>/#error=invalid_state&diag=<diagnosticId>`. The diagnostic ID is logged with the
+     SNI, the reason and the time. The auth listener never renders HTML: every user-facing
+     message, including the copyable diagnostic report, comes from the main UI.
 5. UI reads `location.hash`, clears it with `history.replaceState(null, '', '/')`, and calls
    `POST /api/v1/transactions/redeem {"code":"…"}`. The browser sends the cookie.
    - The server consumes the code atomically. The code's transaction must equal the cookie's
@@ -579,9 +581,9 @@ Exact grammars are in the section "Provider profiles".
   instead of a hung navigation.
 - The handler returns `421 Misdirected Request` when `r.Host` (port stripped, lowercased)
   differs from `r.TLS.ServerName`.
-- Only `GET /v1/authenticate` is routed. Any other path or method → 404 with
-  `Cache-Control: no-store`. The HTML error page references no external resource (inline CSS,
-  `<link rel="icon" href="data:,">`).
+- Only `GET /v1/authenticate` is routed. Any other path or method → 404 with an empty body and
+  `Cache-Control: no-store`. The auth listener serves no HTML and sets
+  `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'` on every response.
 - `tlsauth.Handler.Authenticate(r)` gets the provider from `r.TLS.ServerName` and the chain from
   `r.TLS.PeerCertificates`, then calls `Checker.Check`.
 
@@ -614,7 +616,7 @@ Routes (Go 1.22+ `ServeMux` patterns, stdlib only):
 | `GET /` and static assets | Embedded UI |
 | `GET /api/v1/providers` | 200 `[{"id":"fnmt","name":"FNMT – Persona Física","description":"…","beta":false}, …]`, enabled providers only, display order; `beta:true` entries go in the Beta `<optgroup>` |
 | `POST /api/v1/transactions` | `Content-Type: application/json`, body ≤ 1 KiB `{"provider":"fnmt"}` → 201 `{"authUrl":"https://fnmt.auth.<authDomain>:<port>/v1/authenticate?state=<state>","expiresAt":"2026-10-30T23:05:00Z"}` (RFC 3339, UTC) + cookie. Errors use `{"status":"error","error":{"code","message","retryable"}}`: 400 `unknown_provider`, 415 `unsupported_media_type`, 429 `rate_limited` (+ `Retry-After`), 503 `store_full` (retryable) |
-| `POST /api/v1/transactions/redeem` | body ≤ 1 KiB `{"code":"…"}` + cookie → 200 `{"status":"success","result":<Result>}` or 200 `{"status":"error","error":{"code":"<ErrorCode>","message":"…","retryable":bool},"diagnostics":<Diagnostics>}`; invalid/expired/mismatch → 400 `{"status":"error","error":{"code":"invalid_or_expired","message":"…","retryable":false}}` |
+| `POST /api/v1/transactions/redeem` | body ≤ 1 KiB `{"code":"…"}` + cookie → 200 `{"status":"success","result":<Result>}` or 200 `{"status":"error","error":{"code":"<ErrorCode>","message":"…","retryable":bool},"diagnostics":<Diagnostics>}`; invalid/expired/mismatch → 400 `{"status":"error","error":{"code":"invalid_or_expired","message":"…","retryable":false},"diagnostics":{"diagnosticId","time","serverVersion","code":"invalid_or_expired","technicalDetail":"code_unknown_or_expired"\|"cookie_missing"\|"cookie_mismatch"}}` (no identity data) |
 | `GET /api/v1/transactions/current` | Cookie-bound → 200 `{"status":"pending"\|"completed"\|"none","provider","createdAt","authHost","authPort"}`. The UI uses it to detect an authentication step that never reached the server (see "Diagnostics and support report") |
 | `GET /healthz` | 200 if the process is serving |
 | `GET /readyz` | 200 when the registry is loaded, the auth cert is present and both listeners are up; else 503 |
@@ -665,7 +667,8 @@ otherwise).
   - `X-Content-Type-Options: nosniff`
   - `Strict-Transport-Security: max-age=31536000`
   - `Cache-Control: no-store` on the API.
-- The auth listener sends the same headers on its HTML error page.
+- The auth listener sends `Referrer-Policy`, `X-Content-Type-Options`, HSTS and its own
+  `default-src 'none'` CSP on its redirects and 404s.
 
 ### UI (`web/`)
 
@@ -962,6 +965,8 @@ What must hold:
   - `golang.org/x/text/unicode/norm`
   - `golang.org/x/sync/singleflight`
   - `golang.org/x/time/rate`
+  - `golang.org/x/crypto/cryptobyte` (strict DER parsing and encoding for the OCSP codec; the
+    module `golang.org/x/crypto` is allowed for this package only)
 
   The allowlist names direct dependencies. Transitive modules pulled by `go mod tidy` are
   accepted; `go.sum` is committed and `govulncheck` covers them. Adding a direct dependency
