@@ -1,6 +1,6 @@
 # Certificate Authentication Checker: design
 
-Status: draft   Class: architectural
+Status: audited (2026-10-30)   Class: architectural
 Owner decisions so far:
 - 2026-10-30 (request): Go backend + very simple Vocdoni-branded web UI. One page titled
   "Certificate Authentication Checker", a selector of supported certificates and an
@@ -19,6 +19,7 @@ Owner decisions so far:
   Sectigo) plus a "Beta" group (FNMT representative/employee, Firmaprofesional, ANF, Uanataca,
   SIGNE, Lleidanet, DNIe).
 - 2026-10-30 (Q3): auth listener TLS 1.2 by default (D2), switch for 1.3.
+- 2026-10-30 (mid-audit request): on error, show a detailed diagnostic report that is easy to copy/paste for Vocdoni support.
 
 ## Problem
 
@@ -114,13 +115,14 @@ over the research spec on transport and launch scope.
     service digital identities.
   - `additional-ca-certificates/*.pem`: 70 more.
   - `spanish_tsl_inventory_2026-10-30.json`: TSL `TSL20260924`, sequence 189, next update
-    2027-03-21.
+    2027-03-21. It lives outside this repository; see "Profile registry" for the in-repo copy.
   - `policy_candidates/*.json` and the evidence files.
   - Per-provider digests extracted for this project, in `docs/research/appendix-*.md` of this repo.
 - Toolchain: Go 1.27.3 locally.
 - Verified Go stdlib facts:
-  - The TLS server sends `ClientCAs.Subjects()` as `certificate_authorities` regardless of the
-    `ClientAuth` mode (`crypto/tls/handshake_server.go:670-671`, `handshake_server_tls13.go:840-841`).
+  - The TLS server sends `ClientCAs.Subjects()` as `certificate_authorities` for every
+    `ClientAuth` mode that requests a certificate (`>= RequestClientCert`;
+    `crypto/tls/handshake_server.go:654-671`, `handshake_server_tls13.go:840-841`).
   - `SessionTicketsDisabled` disables resumption (`handshake_server.go:450, 602`).
   - `x509.ParseCertificate` rejects negative serials unless `GODEBUG=x509negativeserial=1`
     (`crypto/x509/parser.go:962-1011`).
@@ -176,11 +178,11 @@ DNS (Cloudflare, both "DNS only"):
      provider.
    - Runs `certauth` validation on the peer chain and stores the result, success or typed error,
      in the transaction.
-   - Issues a one-use code and answers `303 See Other` to
-     `<publicURL>/?code=<code>`. The base is fixed by configuration, never taken from the request.
+   - Issues a one-use code and answers `303 See Other` to `<publicURL>/#code=<code>`. The base is
+     fixed by configuration, never taken from the request.
    - Unknown, expired or used state: an HTML page "This sign-in link is no longer valid" with a
      link to `<publicURL>`. No redirect.
-5. UI sees `?code=`, removes it from the address bar (`history.replaceState`) and calls
+5. UI reads `location.hash`, clears it with `history.replaceState(null, '', '/')`, and calls
    `POST /api/v1/transactions/redeem {"code":"…"}`. The browser sends the cookie.
    - The server consumes the code atomically. The code's transaction must equal the cookie's
      transaction (constant-time compare), otherwise the generic error `invalid_or_expired`.
@@ -199,7 +201,7 @@ Module `github.com/vocdoni/cert-check`, `go 1.27`.
 | `certauth` | Public entry point. `Checker`, `Result`, `Identity`, `Document`, `RevocationInfo`, typed `*Error` with `Code`. Orchestrates the pipeline. |
 | `certauth/profiles` | Profile registry types, embedded pinned anchors (`anchors/*.pem`, fingerprints pinned in Go source and checked at load), the production `Default()` registry, test-certificate markers. |
 | `certauth/identity` | Strict RDN parsing of `RawSubject` (duplicates and multi-valued RDNs preserved), SAN directoryName decoding, SubjectDirectoryAttributes `dateOfBirth`, DNI/NIE validation, name normalisation (NFC), per-profile identity adapters. |
-| `certauth/revocation` | Safe fetcher (scheme/host allowlist, private-IP block, size/time bounds, redirect control), OCSP request/verify, CRL verify with scope checks, bounded caches, explicit status model. |
+| `certauth/revocation` | Safe fetcher (scheme/host allowlist, private-IP block, size/time bounds, redirect control), OCSP request/verify, CRL verify with scope checks, bounded caches, explicit status model. `Check` takes the issuer from the caller's verified chain; it never derives it from client-supplied material. |
 | `certauth/tlsauth` | Handler-like integration: `ServerConfig(...) *tls.Config` with SNI→provider, `ClientCAs`, TLS policy, tickets off, `RequestClientCert`; `Handler.Authenticate(r *http.Request) (*certauth.Result, error)` resolving the provider from `r.TLS.ServerName`. This is the unit a future CSP imports. |
 | `internal/server` | Main and auth HTTP handlers, transaction store, rate limiting, security headers, health/readiness. |
 | `internal/acme` | certmagic configuration, DNS-01 via `libdns/cloudflare`, storage under the data dir; static cert/key alternative for local dev and tests. |
@@ -233,6 +235,7 @@ type Result struct {
     Certificate CertificateInfo        // subject (RFC 4514), issuer CN, serial hex, validity, SHA-256, key algorithm
     Revocation  RevocationInfo         // status, method (ocsp|crl), checkedAt, thisUpdate, nextUpdate, source host
     ValidatedAt time.Time
+    Diagnostics Diagnostics        // session-bound report, see "Diagnostics and support report"
 }
 
 type Identity struct {
@@ -246,7 +249,12 @@ type Identity struct {
     Sources       map[string]string // field -> provenance
 }
 
-type Error struct { Code ErrorCode; Retryable bool; Detail string /* internal, never PII */ }
+type Error struct {
+    Code        ErrorCode
+    Retryable   bool
+    Detail      string       // internal, never PII
+    Diagnostics Diagnostics  // session-bound report, see "Diagnostics and support report"
+}
 ```
 
 `ErrorCode` values, each mapped to a UI message:
@@ -305,6 +313,9 @@ Rules:
 - A unit test asserts that every anchor fingerprint appears in
   `spanish_tsl_inventory_2026-10-30.json` with a granted CA/QC status, or in a reviewed exception
   list. The exception list holds intermediates only.
+- `spanish_tsl_inventory_2026-10-30.json` is copied verbatim to `certauth/profiles/testdata/`
+  with its SHA-256 recorded in `certauth/profiles/testdata/SOURCES.md`; the test reads it from
+  there.
 
 ### Validation pipeline (`Checker.Check`)
 
@@ -314,7 +325,11 @@ Order matters. Each step fails closed with a typed error.
    - Chain length 1..`MaxChainLen`, each DER at most 16 KiB.
    - Empty chain → `no_certificate`.
    - Unknown provider → `provider_mismatch`.
-2. **Path.** For each enabled profile of the provider, run `leaf.Verify` with:
+2. **Algorithms (before path building).** Leaf key: RSA ≥ 2048 bits, or ECDSA P-256/P-384/
+   P-521 (per-profile `MinRSABits` override only where documented). Leaf signature algorithm:
+   SHA-256 or stronger. Failure → `weak_algorithm`. This runs first because Go reports a
+   SHA-1 leaf signature inside `Verify` as `UnknownAuthorityError`, not as a distinct error.
+3. **Path.** For each enabled profile of the provider, run `leaf.Verify` with:
    - `Roots` = the profile's anchors;
    - `Intermediates` = the profile's pinned intermediates **only**. Client-sent certificates beyond
      the leaf are ignored for path building, so a client cannot route through an unknown sub-CA
@@ -325,15 +340,22 @@ Order matters. Each step fails closed with a typed error.
      Research verified that every in-scope anchor either has no EKU or includes clientAuth
      (FNMT G2 and the ACCV CLIENTE CAs carry EKU lists with clientAuth).
 
-   Go treats an absent leaf EKU as "any", so step 4 applies the profile's stricter leaf EKU rule.
+   Go treats an absent leaf EKU as "any", so step 5 applies the profile's stricter leaf EKU rule.
    The candidates are the profiles whose path verifies. None → map the `x509` error:
-   - expired or not-yet-valid → `expired` / `not_yet_valid`;
-   - unknown authority → `untrusted_issuer`;
-   - otherwise `invalid_chain`.
-3. **Profile.** The leaf asserts at least one OID of exactly one candidate profile, read from
+   - `CertificateInvalidError{Reason: Expired}`: if `now` is before `leaf.NotBefore` →
+     `not_yet_valid`; if after `leaf.NotAfter` → `expired`; otherwise the failing certificate
+     is an anchor or intermediate → `invalid_chain` (Go uses `Expired` for every date failure
+     and for every certificate in the chain);
+   - `UnknownAuthorityError`: if the leaf verifies (same options) against the union of all
+     enabled providers' anchors → `provider_mismatch`, else `untrusted_issuer`;
+   - `CertificateInvalidError{Reason: IncompatibleUsage}` → `unsupported_purpose`;
+   - `UnhandledCriticalExtension` → `invalid_chain` (Detail names the OID; the step-5
+     exception mechanism runs before `Verify`, so this only fires for unlisted OIDs);
+   - anything else → `invalid_chain`.
+4. **Profile.** The leaf asserts at least one OID of exactly one candidate profile, read from
    `leaf.Policies`. Zero profiles → `unsupported_profile`. More than one profile → `internal`
    (a registry bug, tested against).
-4. **Purpose.**
+5. **Purpose.**
    - KeyUsage must include `digitalSignature` when the extension is present. An absent KU is
      allowed only if the profile says so.
    - EKU follows the profile rule. The default, `RequireClientAuth`, needs the EKU extension
@@ -345,31 +367,34 @@ Order matters. Each step fails closed with a typed error.
    - Exception mechanism, profile-scoped. A profile may list `HandledCriticalExtensions` (OIDs)
      that our code parses and validates itself.
      - Only listed OIDs are removed from a **copy** of the leaf's `UnhandledCriticalExtensions`
-       before `Verify`; the signature input (`RawTBSCertificate`) is untouched.
+       before `Verify` (step 3); the signature input (`RawTBSCertificate`) is untouched.
      - Each listed OID needs a parser that must succeed (malformed → `invalid_chain`).
      - First and only planned use: `qcStatements` (1.3.6.1.5.5.7.1.3) on `aoc-idcat-g2`. Leaves
        issued before AOC profile v6.8 (2023-05-10) may mark it critical, and they can still be
        valid until 2028.
      - The DNIe `personalDataInfo` (2.16.724.1.2.2.4.1) is added only if a fixture shows it
        critical.
-5. **Algorithms.**
-   - Leaf key: RSA ≥ 2048 bits, or ECDSA P-256/P-384/P-521. A per-profile `MinRSABits` override
-     is allowed only where documented (DNIe 1920-bit, only if that profile is enabled).
-   - Leaf signature algorithm: SHA-256 or stronger.
 6. **Test certificates.** Reject `test_certificate` when the leaf matches a profile marker:
    - fingerprint;
-   - exact subject marker combination documented by the issuer;
-   - a public synthetic identity listed in the research.
+   - exact subject marker combination documented by the issuer.
 7. **Identity.** The profile adapter extracts the typed identity (see "Identity extraction"). Any
    grammar failure, checksum failure or disagreement between duplicated fields →
    `identity_invalid`.
-8. **Revocation.** `revocation.Checker.Check(ctx, leaf, issuer, profile.Revocation)` must return
-   `good`. Intermediates: when a profile pins intermediates, their status is checked the same way.
-   Anchors themselves are governed by the pinned trust configuration (D1).
+7b. **Reserved identities.** The extracted document number and the name markers are checked
+   against the reserved-identity registry → `test_certificate`.
+8. **Revocation.** Let `chain` be the single verified chain returned by step 3
+   (`[leaf, pinned intermediates…, anchor]`). Call
+   `revocation.Checker.Check(ctx, chain[0], chain[1], profile.Revocation)`. `chain[1]` is the
+   only certificate used for CertID construction, OCSP responder authorization and CRL
+   signature/issuer checks. `r.TLS.PeerCertificates[1:]` is never read after step 1, except to
+   echo subject and issuer in the diagnostic report. When a profile pins intermediates, every
+   `chain[i]` with `0 < i < len(chain)-1` is checked the same way with `chain[i+1]` as issuer.
+   Anchors themselves are governed by the pinned trust configuration (D1). The result must be
+   `good` for every checked certificate.
 9. **Result.** Assembled with `ValidatedAt = now`.
 
-Identity runs before revocation so a malformed certificate is rejected without network traffic.
-The result is never returned before step 8 succeeds.
+Identity (steps 7 and 7b) runs before revocation so a malformed certificate is rejected without
+network traffic. The result is never returned before step 8 succeeds.
 
 ### Revocation
 
@@ -382,13 +407,25 @@ unsupported_method`. Only `good` passes. Errors map as follows:
 
 **Order.**
 1. OCSP, using the leaf AIA URLs whose host is in the profile allowlist.
-2. If OCSP is `unavailable`, `stale` or `invalid_evidence` (never after `revoked` or `unknown`),
-   a signed CRL from the leaf CDP URLs whose host is in the allowlist, when the profile permits
-   CRL.
+2. If OCSP is `unavailable`, `stale`, `invalid_evidence` or `unsupported_method` (never after
+   `revoked` or `unknown`), a signed CRL from the leaf CDP URLs whose host is in the
+   allowlist, when the profile permits CRL.
 
-**OCSP.** Responses are parsed with `golang.org/x/crypto/ocsp`. Request building and every
-acceptance check are ours, because `x/crypto/ocsp` cannot add a nonce and does not check the
-responder's EKU, its validity or the ResponderID binding.
+If the leaf has no OCSP AIA URL on an allowlisted host, OCSP yields `unsupported_method` and
+the CRL step runs when permitted; if neither method is usable → `unavailable` →
+`revocation_unavailable`.
+
+**OCSP.** Request and response are encoded and decoded by our own `cryptobyte` code in
+`certauth/revocation` (RFC 6960 §4.1 `OCSPRequest`, §4.2 `BasicOCSPResponse`).
+`golang.org/x/crypto/ocsp` is not used: its parser exposes neither
+`ResponseData.responseExtensions` (where the nonce comes back) nor any embedded certificate
+beyond the first, and it checks neither the responder's EKU, validity nor the ResponderID
+binding. The parser yields: responderID (byName DER or byKey SHA-1), producedAt, every
+SingleResponse (CertID hash algorithm, issuerNameHash, issuerKeyHash, serial, status,
+revocationTime/reason, thisUpdate, optional nextUpdate, singleExtensions), responseExtensions
+(nonce 1.3.6.1.5.5.7.48.1.2) and every embedded certificate. An unknown critical single- or
+response-level extension → `invalid_evidence`. Exactly one SingleResponse must match the
+requested CertID.
 - **Request.** Built by our own ASN.1 encoding: CertID from the actual issuer (SHA-1 CertID
   hashing is allowed; it is not a signature algorithm), plus the nonce extension when required.
   Sent by HTTP POST `application/ocsp-request`.
@@ -413,18 +450,28 @@ responder's EKU, its validity or the ResponderID binding.
 - **Non-issued serials.** Responders answer a never-issued serial with
   `revoked/certificateHold/1970-01-01` (RFC 6960 §2.2). It is mapped to `revoked` with no "retry
   later" UX.
-- Cache `good` for min(5 min, nextUpdate − now). Never cache `unknown`, `unavailable` or invalid
-  evidence. `revoked` may be cached until nextUpdate.
+- Cache `good` for min(5 min, nextUpdate − now). OCSP cache key: (SHA-256 of issuer DER, serial
+  hex); a cached `good` is reused only within min(5 min, nextUpdate − now) of its own
+  `thisUpdate`. Never cache `unknown`, `unavailable` or invalid evidence. `revoked` may be
+  cached until nextUpdate.
 
 **CRL:**
 - Fetched only from allowlisted CDP hosts.
-- `x509.ParseRevocationList`, `CheckSignatureFrom(issuer)`, issuer DN equals the leaf issuer.
+- `x509.ParseRevocationList`; issuer and signature checks are in the Issuer bullet below.
 - `thisUpdate ≤ now + 5m` and `nextUpdate ≥ now`; a missing nextUpdate → `stale`.
-- Scope: if the CRL carries IssuingDistributionPoint, its distributionPoint URI must equal the URI
-  it was fetched from (the leaf's CDP). FNMT CRLs are partitioned (`CRLU<n>.crl`, sparse
-  numbers) and carry a critical IDP naming the partition. Only the leaf's CDP URI is used;
-  partitions are never enumerated. `onlyContainsCACerts`, `onlyContainsAttributeCerts`,
-  `indirectCRL` and `onlySomeReasons` → `unsupported_method`.
+- Scope. If the CRL carries IssuingDistributionPoint: at least one GeneralName of its
+  `distributionPoint.fullName` must byte-equal one GeneralName of the DistributionPoint of the
+  checked certificate's CDP extension from which the fetch URL was taken (RFC 5280
+  §6.3.3 b.2.i). The comparison uses the certificate's CDP names, never the final URL after
+  redirects (ACCV and DNIe redirect). `nameRelativeToCRLIssuer` → `unsupported_method`.
+  For a leaf check, `onlyContainsCACerts`, `onlyContainsAttributeCerts`, `indirectCRL` or
+  `onlySomeReasons` → `unsupported_method`. For a pinned-intermediate check (DNIe), an ARL with
+  `onlyContainsCACerts` is accepted (AC RAIZ DNIE 2 sets it), and `onlyContainsUserCerts` →
+  `unsupported_method`. FNMT CRLs are partitioned (`CRLU<n>.crl`, sparse numbers) and carry a
+  critical IDP naming the partition; only the leaf's CDP names are used and partitions are never
+  enumerated.
+- Issuer: `bytes.Equal(crl.RawIssuer, issuer.RawSubject)` on DER, then
+  `crl.CheckSignatureFrom(issuer)`.
 - Criticality: Go's `ParseRevocationList` stores CRL and CRL-entry extensions without enforcing
   criticality (`crypto/x509/parser.go:1190+`). Our code rejects (`unsupported_method`) any
   critical CRL or CRL-entry extension other than IDP and the standard entry extensions (reason
@@ -432,8 +479,11 @@ responder's EKU, its validity or the ResponderID binding.
   CRL).
 - Delta CRLs are not used.
 - A serial listed with any reason, including certificateHold → `revoked`.
-- Cached by URL until min(nextUpdate, 1 h), with bounded total bytes (default 64 MiB) and at most
-  one concurrent fetch per URL (singleflight).
+- Cache: the parsed `*x509.RevocationList` and a `map[string]struct{}` of listed serials (hex)
+  are cached by URL until min(nextUpdate, 1 h); the raw bytes are discarded after parsing.
+  Fetch and parse run once per URL under singleflight; concurrent checks wait for the cached
+  entry. The cache bound (default 128 MiB, estimated as 2 × raw size per entry) evicts the least
+  recently used entry. A single CRL above the 32 MiB response cap → `unavailable`.
 
 **Fetcher (SSRF controls):**
 - `http`/`https` only, and the host must be in the union of the profile allowlists.
@@ -469,12 +519,21 @@ responder's EKU, its validity or the ResponderID binding.
   `identity_unsupported_document` ("this certificate identifies the holder with a document other
   than a Spanish DNI/NIE"). The prefix is never stripped to force a match. A bare value is
   accepted only when the profile declares `AllowBare`.
-- Reserved and test identities (versioned registry, all valid by checksum) → `test_certificate`:
-  - `00000000T`, `99999999R`, `X0000000T` (FNMT/DNIe specimen examples);
-  - `99949992L` (AOC NOMDOS/ESPECIMENDOS production test series);
+- Reserved and test identities (versioned registry, all checksum-valid) → `test_certificate`,
+  checked after identity extraction (step 7b) for every profile:
+  - `00000000T`, `99999999R`, `99999972C`, `99999018D`, `X0000000T` (FNMT and DNIe kits and
+    profile examples);
+  - the shared ESPECIMEN series `99949990V`, `99949991H`, `99949992L`, `99949993C`,
+    `99949994K`, `99949995E`, `99949996T`, `99949997R`, `99949998W`, `99949999A`
+    (FNMT, AOC, DIGITEL, Bewor and Sectigo specimens all use it);
   - `12345678Z` (Camerfirma test series).
-
-  This list is a backstop; it does not replace profile pinning.
+- Name markers (compared after NFC, case-folded): surnames containing `ESPECIMEN`,
+  `PRUEBAS`, `FICTICIO`, `APELLIDOUNO`, `APELLIDO1`, `DE LA PEÇA DE PROVES`, `DE PROVES`;
+  given names equal to `NOMBRE`, `PRUEBAS`, `PRUEBASPF`, `PRUEBASREV`, `CIUDADANO`, or
+  matching `^NOM ?(UN O|D'DIEZ|DOS|SEIS|NUEVE|DIEZ)$`; organization `ENTIDAD DE PRUEBAS` /
+  `Entidad de pruebas`.
+  A marker match → `test_certificate`. This list is a backstop for kit refreshes; it does not
+  replace fingerprint pinning of the committed specimens.
 - Names: Unicode NFC, collapse internal whitespace, trim. Never split given names. Never split a
   combined surname field. First and second surname come only from separate documented fields.
 - Full name: `GivenNames + " " + Surnames`.
@@ -492,7 +551,8 @@ Exact grammars are in the section "Provider profiles".
 ### TLS on the auth listener (`certauth/tlsauth`)
 
 - `GetConfigForClient` picks the provider config by exact SNI `<id>.auth.<authDomain>`
-  (lowercased). An unknown SNI fails the handshake with `unrecognized_name` so no
+  (lowercased). An unknown SNI makes `GetConfigForClient` return an error; Go aborts the
+  handshake with the `internal_error` alert (`crypto/tls/handshake_server.go:170-172`), so no
   certificate-less page is served.
 - Per-provider config:
   - `ClientAuth: tls.RequestClientCert`. The handshake succeeds without a certificate so we can
@@ -505,11 +565,23 @@ Exact grammars are in the section "Provider profiles".
   - TLS 1.2 cipher suites: ECDHE-ECDSA/RSA with AES-128/256-GCM or ChaCha20-Poly1305.
   - Curves: X25519, P-256, P-384.
   - `GetCertificate` from `internal/acme`.
+- `NextProtos: []string{"http/1.1"}` on every per-provider config, and
+  `TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){}` on the auth
+  `http.Server`, so HTTP/2 is never negotiated and no connection can be reused across provider
+  hosts under the wildcard certificate.
 - Every HTTP request on the auth listener re-runs the checks: no connection-level caching of
   results.
 - HTTP server timeouts:
   - `ReadHeaderTimeout` 10 s, `ReadTimeout` 30 s, `WriteTimeout` 60 s, `IdleTimeout` 30 s.
   - `MaxHeaderBytes` 16 KiB.
+- The validation context on the auth listener is bounded to 40 s; on expiry the transaction
+  stores `internal` (retryable) and the 303 is still sent, so the UI shows a retry message
+  instead of a hung navigation.
+- The handler returns `421 Misdirected Request` when `r.Host` (port stripped, lowercased)
+  differs from `r.TLS.ServerName`.
+- Only `GET /v1/authenticate` is routed. Any other path or method → 404 with
+  `Cache-Control: no-store`. The HTML error page references no external resource (inline CSS,
+  `<link rel="icon" href="data:,">`).
 - `tlsauth.Handler.Authenticate(r)` gets the provider from `r.TLS.ServerName` and the chain from
   `r.TLS.PeerCertificates`, then calls `Checker.Check`.
 
@@ -517,6 +589,12 @@ Exact grammars are in the section "Provider profiles".
 
 - certmagic with only the DNS-01 solver (`libdns/cloudflare`, token from `CLOUDFLARE_API_TOKEN`).
   HTTP-01 and TLS-ALPN-01 are disabled.
+- Token scope (owner choice, recorded at spec approval). Default: `CLOUDFLARE_API_TOKEN` has
+  `Zone:DNS:Edit` on `vocdoni.dev`; risk accepted: a leaked token can rewrite every
+  `vocdoni.dev` record. Supported alternative: CNAME delegation — `_acme-challenge.auth.cert-check.vocdoni.dev`
+  CNAME → `_acme-challenge.cert-check.<acme-zone>` on a dedicated Cloudflare zone holding nothing
+  else, the token scoped to that zone only, and `CERTCHECK_ACME_DNS_OVERRIDE_DOMAIN=_acme-challenge.cert-check.<acme-zone>`
+  passed to certmagic's `DNS01Solver.OverrideDomain`.
 - Name: `*.auth.<authDomain>`.
 - Issuer: Let's Encrypt production by default; staging via `CERTCHECK_ACME_CA=staging`.
 - Storage: `<CERTCHECK_DATA_DIR>/certmagic` on the Railway volume, so redeploys don't re-issue
@@ -534,19 +612,51 @@ Routes (Go 1.22+ `ServeMux` patterns, stdlib only):
 | Route | Behaviour |
 |---|---|
 | `GET /` and static assets | Embedded UI |
-| `GET /api/v1/providers` | `[{"id","name","description"}]`, enabled providers only, in display order |
-| `POST /api/v1/transactions` | Body ≤ 1 KiB JSON `{"provider"}` → 201 `{authUrl, expiresAt}` + cookie. Unknown provider → 400. Store full → 503. |
-| `POST /api/v1/transactions/redeem` | Body ≤ 1 KiB `{"code"}` + cookie → 200 `{"status":"success","result":…}` or `{"status":"error","error":{"code","message","retryable"}}`; invalid/expired/mismatch → 400 `{"status":"error","error":{"code":"invalid_or_expired",…}}` |
+| `GET /api/v1/providers` | 200 `[{"id":"fnmt","name":"FNMT – Persona Física","description":"…","beta":false}, …]`, enabled providers only, display order; `beta:true` entries go in the Beta `<optgroup>` |
+| `POST /api/v1/transactions` | `Content-Type: application/json`, body ≤ 1 KiB `{"provider":"fnmt"}` → 201 `{"authUrl":"https://fnmt.auth.<authDomain>:<port>/v1/authenticate?state=<state>","expiresAt":"2026-10-30T23:05:00Z"}` (RFC 3339, UTC) + cookie. Errors use `{"status":"error","error":{"code","message","retryable"}}`: 400 `unknown_provider`, 415 `unsupported_media_type`, 429 `rate_limited` (+ `Retry-After`), 503 `store_full` (retryable) |
+| `POST /api/v1/transactions/redeem` | body ≤ 1 KiB `{"code":"…"}` + cookie → 200 `{"status":"success","result":<Result>}` or 200 `{"status":"error","error":{"code":"<ErrorCode>","message":"…","retryable":bool},"diagnostics":<Diagnostics>}`; invalid/expired/mismatch → 400 `{"status":"error","error":{"code":"invalid_or_expired","message":"…","retryable":false}}` |
+| `GET /api/v1/transactions/current` | Cookie-bound → 200 `{"status":"pending"\|"completed"\|"none","provider","createdAt","authHost","authPort"}`. The UI uses it to detect an authentication step that never reached the server (see "Diagnostics and support report") |
 | `GET /healthz` | 200 if the process is serving |
 | `GET /readyz` | 200 when the registry is loaded, the auth cert is present and both listeners are up; else 503 |
+
+`<Result>` (camelCase; absent optional strings are `""`, absent objects `null`):
+
+```
+{"provider":{"id","name"},
+ "profile":{"id","name","holderRole":"natural_person|representative|public_employee"},
+ "identity":{"document":{"type":"DNI|NIE","country":"ES","number","raw","source"},
+             "givenNames","surnames","firstSurname","secondSurname","fullName",
+             "birthDate":"YYYY-MM-DD"|null,"sources":{"<field>":"<provenance>"}},
+ "organization":{"name","identifier"}|null,
+ "certificate":{"subject","issuer","serialHex","notBefore","notAfter","sha256","keyAlgorithm"},
+ "revocation":{"status":"good","method":"ocsp|crl","checkedAt","thisUpdate","nextUpdate"|null,"source":"<host>"},
+ "validatedAt",
+ "diagnostics":<Diagnostics>}
+```
+
+`message` is produced by the server's single code→English-message table (the UI shows it and
+adds per-code recovery guidance). All timestamps are RFC 3339 UTC.
+
+Both POST handlers require `Content-Type: application/json` (415 otherwise) and, when present,
+`Sec-Fetch-Site` ∈ {`same-origin`, `none`} and `Origin` equal to `CERTCHECK_PUBLIC_URL` (403
+otherwise).
 
 - **Transaction store.** Mutex-protected maps keyed by SHA-256 of secrets.
   - Lifetime: 5 min from creation. A completed result is kept until redeemed or expired.
   - A janitor runs every 30 s.
   - Capacity 10 000 transactions → 503 when full.
-- **Rate limiting.** Per client IP (`X-Real-IP`, falling back to the leftmost `X-Forwarded-For`,
-  as set by the Railway edge): 20 transaction creations and 60 redeems per minute. Global
-  concurrency limit on validations: 32.
+- **Rate limiting.** Client IP on the main listener = the rightmost `X-Forwarded-For` entry,
+  which is the one appended by the Railway edge; `CERTCHECK_TRUSTED_PROXY_HOPS` (default `1`)
+  selects it, and the header the edge actually sets (`X-Forwarded-For`, `X-Real-IP`,
+  `X-Envoy-External-Address`) is confirmed during rollout step 4 and recorded here. The leftmost
+  entry is never used. Without any forwarded header (local run) the TCP remote address is used.
+  Limits: 20 transaction creations and 60 redeems per minute per IP → 429 with `Retry-After`.
+  The auth listener caps concurrent connections at 512 (listener-level semaphore; excess
+  connections are closed before the handshake) and runs no validation until the state check
+  passes. Global validation concurrency: 32; a validation waiting more than 10 s for a slot →
+  `internal` (retryable).
+- **Server timeouts.** Main listener: `ReadHeaderTimeout` 10 s, `ReadTimeout` 15 s,
+  `WriteTimeout` 30 s, `IdleTimeout` 60 s, `MaxHeaderBytes` 16 KiB.
 - **Security headers on every response:**
   - `Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self';
     script-src 'self'; font-src 'self'; connect-src 'self'; frame-ancestors 'none';
@@ -586,8 +696,28 @@ Routes (Go 1.22+ `ServeMux` patterns, stdlib only):
       all browser windows and retry;
     - a different certificate type was presented → select the matching provider;
     - temporary revocation outage → retry shortly.
+    - Every error view includes the diagnostic report and the 'Copy diagnostic report' button (see 'Diagnostics and support report').
+- Rendering: all identity, certificate and error strings are inserted with `textContent`;
+  `innerHTML` is never used with API data.
 - Accessibility: labels, visible focus, `aria-live` status region, contrast AA, works at 320 px
   width.
+
+### Diagnostics and support report
+
+- `certauth.Error` carries `Diagnostics` (also attached to `Result` on success):
+  - `diagnosticId` (random 16 bytes, hex; never derived from identity);
+  - `time`, `serverVersion`, `provider`, `failedStep` (`bounds|path|profile|purpose|algorithms|test_marker|identity|revocation`);
+  - `code`, `technicalDetail` (exact underlying error text, e.g. the x509 error, "policy OIDs present [...]; expected one of [...]", "OCSP http://host/path → HTTP 503 after 4.9s");
+  - `tls`: version, cipher suite, SNI, client certificate presented (bool), chain length received;
+  - `certificate` (leaf; plus subject/issuer of every chain cert received): subject DN (RFC 4514), issuer DN, serial (hex), notBefore/notAfter, SHA-256, key algorithm/size/curve, signature algorithm, KU, EKU (incl. unknown OIDs), policy OIDs, critical extension OIDs, AIA OCSP/caIssuers URLs, CDP URLs;
+  - `profileCandidates`: profile ids tried, with the path or profile result per candidate;
+  - `revocationAttempts[]`: method, URL, HTTP status, duration, outcome, producedAt/thisUpdate/nextUpdate, responder subject, nonce sent/echoed.
+- Redeem error responses include `diagnostics` (session-bound, like the result).
+- New `GET /api/v1/transactions/current` (cookie-bound) → `{status: "pending"|"completed"|"none", provider, createdAt, authHost, authPort}`. The UI remembers an in-flight attempt in `sessionStorage`. When the user comes back without `#code` and the transaction is still `pending`, the UI shows "the authentication step never reached our server". It then lists the likely causes (certificate selection cancelled, port NNNNN blocked by the network, the browser could not use the key) and offers a report with the auth host and port, the time and the user agent.
+- UI error view: human message + recovery guidance, a collapsible "Technical details" `<pre>` holding the full plain-text report, and a "Copy diagnostic report" button (Clipboard API, with select-all fallback). Report header: diagnostic ID, time, page URL without query, user agent, server version. Notice: "This report contains your certificate details (name and ID number). Share it only with Vocdoni support."
+- The server logs one line per failure with the diagnostic ID and the non-PII fields: code, step, provider, profile candidates, issuer DN, policy OIDs, revocation URL host/status/duration, TLS version/cipher. It never logs the subject DN, names, DNI, serial or SHA-256 of the leaf.
+- Auth-listener TLS handshake errors go to slog at warn, with the SNI and the error text (no PII available at that layer).
+- Acceptance criterion: AC13.
 
 ### Configuration (`internal/config`)
 
@@ -604,6 +734,8 @@ Routes (Go 1.22+ `ServeMux` patterns, stdlib only):
 | `CLOUDFLARE_API_TOKEN` | required with ACME | DNS-01 token (secret) |
 | `CERTCHECK_TLS_CERT_FILE` / `_KEY_FILE` | unset | Static cert instead of ACME |
 | `CERTCHECK_AUTH_TLS13` | `false` | Allow TLS 1.3 on the auth listener (D2) |
+| `CERTCHECK_TRUSTED_PROXY_HOPS` | `1` | Trusted proxy hops; selects the client IP counted from the right of `X-Forwarded-For` |
+| `CERTCHECK_ACME_DNS_OVERRIDE_DOMAIN` | unset | Optional DNS-01 CNAME delegation target, passed to certmagic's `DNS01Solver.OverrideDomain` |
 | `CERTCHECK_LOG_LEVEL` | `info` | slog level |
 
 Invalid or missing required configuration makes startup fail with a clear message. Nothing secret
@@ -615,6 +747,7 @@ is logged.
   method/latency.
 - **Never logged:** DNI/NIE, names, birth date, subject DN, certificate bytes or fingerprint,
   state, code or cookie values.
+- The diagnostic ID links the user's copied report to the server log line.
 - Identity data lives only in the transaction's memory until redeemed or expired, and is never
   written to disk.
 
@@ -629,10 +762,15 @@ is logged.
   - source repo `vocdoni/cert-check` branch `main` with auto-deploy and "wait for CI";
   - 1 replica;
   - volume at `/data`;
+  - `RAILWAY_RUN_UID=0` is set on the service: Railway mounts volumes as `root`
+    (docs.railway.com/volumes#permissions) and the `nonroot` image (UID 65532) cannot create
+    `/data/certmagic` otherwise. The process therefore runs as root inside the container; the
+    image stays `distroless:static` (no shell, no package manager). Rollout step 3 is complete
+    only when `/data/certmagic/` exists on the volume and `/readyz` returns 200;
   - HTTP domain `cert-check.vocdoni.dev` → port 8080, plus the generated `*.up.railway.app`
     domain;
   - TCP proxy → port 8443;
-  - healthcheck `/readyz`;
+  - healthcheck `/readyz`, `healthcheckTimeout: 600` in `railway.json`;
   - the variables above, with `CLOUDFLARE_API_TOKEN` as a sealed secret;
   - config-as-code in `railway.json` (builder Dockerfile, healthcheck path and timeout, restart
     policy).
@@ -665,7 +803,8 @@ is logged.
     can read the holder's name and DNI.
   - The switch `CERTCHECK_AUTH_TLS13` allows 1.3 once the client base is known to work.
 - **D3. Non-443 auth port** (Railway TCP proxy). Strict corporate egress firewalls may block it.
-  The UI shows a hint if navigation fails.
+  The UI shows a hint when the user returns without a code while the transaction is still
+  `pending` (see "Diagnostics and support report").
 - **D4. No census or issuance.** The checker stops at the validated identity.
 
 ### Alternatives considered
@@ -693,7 +832,9 @@ Rollout:
    - `/api/v1/providers`;
    - a TLS handshake to each provider subdomain lists the expected CA names
      (`openssl s_client -connect … -servername …`);
-   - the no-certificate path returns `no_certificate`.
+   - the no-certificate path returns `no_certificate`;
+   - the header the Railway edge actually sets for the client IP (`X-Forwarded-For`, `X-Real-IP`,
+     `X-Envoy-External-Address`) is confirmed and recorded in the rate-limiting bullet.
 5. Owner tests with real certificates per provider in Chrome, Firefox and Safari/Edge as
    available.
 
@@ -722,11 +863,11 @@ What must hold:
 | OCSP down/slow | CRL fallback if permitted; else `revocation_unavailable` (retryable). Never success. |
 | OCSP/CRL tampered or replayed | Signature/CertID/freshness checks → `invalid_evidence` → retryable error; old `good` cannot outlive its bounds |
 | Malformed or oversized ASN.1 | Bounded parse → typed error; fuzz tests on identity parsers |
-| Wrong provider's certificate presented | `provider_mismatch` (it cannot verify against this provider's anchors) |
+| Wrong provider's certificate presented | `provider_mismatch` (leaf verifies against another enabled provider's anchors); a certificate from no enabled provider → `untrusted_issuer` |
 | State replay / code replay / code without cookie | One-use, constant-time match → generic `invalid_or_expired` |
 | ACME failure at boot | Auth listener not serving; `/readyz` 503; Railway healthcheck keeps the previous deployment (or the service stays not-ready); logs say why |
 | Anchor expiry | Profile auto-disabled at startup with a warning; provider hidden if it has no enabled profile |
-| Memory pressure | Bounded transaction store, CRL cache bytes and fetch concurrency |
+| Memory pressure | Bounded transaction store, parsed-CRL cache size, auth connections, validation and fetch concurrency |
 | Restart | In-flight transactions lost; UI shows `invalid_or_expired` with "start again" |
 | Clock skew | 5 min tolerance on evidence `thisUpdate` only; certificate validity uses the real clock |
 | Spoofed identity headers | No header ever carries identity; the auth decision uses only the local TLS state |
@@ -761,15 +902,19 @@ What must hold:
   - private-IP destination blocked, a redirect not followed, a non-allowlisted host blocked.
 - [ ] **AC5** Profiles: every embedded anchor matches its pinned SHA-256, parses with Go 1.27, is a
   CA valid at the build date, and appears as a granted service identity in the bundled TSL
-  inventory (or is in the reviewed intermediate exception list). A test per profile runs a
-  synthetic leaf shaped like the real profile (same subject attribute layout, extensions and
-  OIDs) through the full pipeline with a test anchor substituted.
+  inventory (`certauth/profiles/testdata/`, or is in the reviewed intermediate exception list). A
+  test per profile runs a synthetic leaf shaped like the real profile (same subject attribute
+  layout, extensions and OIDs) through the full pipeline with a test anchor substituted. Each
+  committed specimen is rejected with `test_certificate` twice: once by fingerprint, and once with
+  the fingerprint list emptied in the test, by identity or name marker.
 - [ ] **AC6** End-to-end (Go test, real listeners on loopback, synthetic test provider injected by
   the test only):
   - create a transaction, mTLS-authenticate with a client certificate, follow the 303, redeem with
     the cookie, then assert the result;
   - negatives: no client certificate, wrong SNI provider, replayed state, replayed code, redeem
-    without or with another cookie, expired transaction, unknown SNI handshake failure.
+    without or with another cookie, expired transaction, unknown SNI handshake failure;
+  - the test passes the `__Host-certcheck_tx` value as an explicit `Cookie` header (a Secure
+    cookie is not sent over `http://127.0.0.1` by `cookiejar`).
 - [ ] **AC7** Security headers present on all main-listener and auth-listener responses (test).
   No log line in the e2e run contains the test identity's DNI or names (test captures slog
   output).
@@ -796,6 +941,11 @@ What must hold:
 - [ ] **AC11** The owner authenticates successfully with at least one real idCAT or FNMT
   certificate on the deployed service and sees the correct data. Recorded with browser and OS
   versions.
+- [ ] **AC12** `go list -deps ./certauth/...` contains no package under
+  `github.com/vocdoni/cert-check/internal/` or `/web` (CI step).
+- [ ] **AC13** Diagnostics present and complete for each error-code path in the AC3/AC4 suites.
+  The e2e test asserts that the log has the diagnostic ID and no identity fields. The UI shows
+  the copy button and the report text matches the fixture.
 
 ## Constraints
 
@@ -809,12 +959,13 @@ What must hold:
 - **Allowed third-party dependencies:**
   - `github.com/caddyserver/certmagic`
   - `github.com/libdns/cloudflare`
-  - `golang.org/x/crypto/ocsp`
   - `golang.org/x/text/unicode/norm`
   - `golang.org/x/sync/singleflight`
   - `golang.org/x/time/rate`
 
-  Anything else needs a controller ruling.
+  The allowlist names direct dependencies. Transitive modules pulled by `go mod tidy` are
+  accepted; `go.sum` is committed and `govulncheck` covers them. Adding a direct dependency
+  still needs a ruling.
 - Pure Go, `CGO_ENABLED=0`. No `GODEBUG` relaxations of x509 parsing.
 - No PII in logs, URLs, error details or test fixtures committed to the repo. Real personal
   certificates are never committed.
@@ -844,7 +995,7 @@ rejected, never guessed.
 
 | Provider id | UI name | Profiles (digest) | Notes |
 |---|---|---|---|
-| `fnmt` | FNMT – Persona Física | `fnmt-citizen-rsa` (A), `fnmt-citizen-g2` (A) | ID `IDCES-<DNI/NIE>` or bare (2016 kit) in 2.5.4.5; SAN dirName `5734.1.{1,2,3,4}` must agree, order-independent. Split surnames from SAN `.1.2`/`.1.3`. G2 leaves are ECDSA P-256. Some leaves have LDAP-only CDP, so OCSP only. G2 OCSP path `/ocspusuG2/` (case-sensitive): always use the leaf AIA verbatim. |
+| `fnmt` | FNMT – Persona Física | `fnmt-citizen-rsa` (A), `fnmt-citizen-g2` (A) | ID in 2.5.4.5: `fnmt-citizen-rsa`: `IDCES-<DNI/NIE>` or bare (`AllowBare`, May-2016 kit); `fnmt-citizen-g2`: `IDCES-` only; SAN dirName `5734.1.{1,2,3,4}` must agree, order-independent. Split surnames from SAN `.1.2`/`.1.3`. G2 leaves are ECDSA P-256. Some leaves have LDAP-only CDP, so OCSP only. G2 OCSP path `/ocspusuG2/` (case-sensitive): always use the leaf AIA verbatim. TestMarkers: fingerprints of the 14 FNMT fixtures plus the identities above. |
 | `idcat` | idCAT Certificat | `aoc-idcat-g2` (B), `aoc-idcat-g3` (B) | Policy `1.3.6.1.4.1.15096.1.3.2.86.2` for both, dispatched by anchor. ID `IDCES-<id>` only (no bare). `IDCxx-`/`PASxx-` → `identity_unsupported_document`. Subject C must equal the prefix country. G2 handles critical qcStatements. Legacy ` - DNI <id>` surname strip only on exact grammar plus equality (expected never to fire). OCSP: one certificate per request. |
 | `accv` | ACCV – Ciudadano (software) | `accv-citizen-software-current` (A), anchors RSA1 + ECC1 CLIENTE | Bare 9-char NIF (DNI or NIE; K/L/M → unsupported). SAN dirName CN `NOMBRE\|APELLIDO1\|APELLIDO2` plus UID must agree. OCSP CRL-backed (3-day window). RSA1 CRL 13.6 MB. |
 | `digitel` | DIGITEL ON – Ciudadano | `digitel-citizen-sw-g1` (C) | Specimen `99949996T` deny-listed. |
@@ -852,12 +1003,12 @@ rejected, never guessed.
 | `sectigo` | Sectigo – Ciudadano | `sectigo-citizen-local` (C), anchors R35 + E35 | `digitalSignature` mandatory (optional in Sectigo v2.8). OCSP pre-generated 7-day window. Specimen `99949990V` deny-listed. |
 | `fnmt-representative` (beta) | FNMT – Representante | `fnmt-representative-rsa`, `-g2` (A), three roles each | Human identity from 2.5.4.5/42/4. Entity from O + 2.5.4.97 is shown as "Represents". SAN `.1.4` is `IDCES-` prefixed here. Holder role `representative`. |
 | `fnmt-employee` (beta) | FNMT – Empleado Público | `fnmt-employee-rsa` (`17.2`), `fnmt-employee-g2` (`23.1.0`) software lanes only (A) | Pseudonym/judicial OIDs explicitly rejected. Employing administration (O) shown. Holder role `public_employee`. |
-| `firmaprofesional` (beta) | Firmaprofesional | `firmaprofesional-personal-sw` (C) | Deduplicate the anchor DN in the CA list (two DERs, one DN). |
+| `firmaprofesional` (beta) | Firmaprofesional | `firmaprofesional-personal-sw` (C) | Pin `2b75cc4f…` only; `4ccf17c0…` (same key, same DN, 55 s shorter validity) is recorded in the exception list as a known alias and not loaded. |
 | `anf` (beta) | ANF AC | `anf-asociacion-class2-sw`, `anf-sl-class2-sw` (C) | Two legal providers, two anchors. Standard Subject mapping only; private SAN is ignored. |
 | `uanataca` (beta) | Uanataca | `uanataca-citizen-sw` (C), OID `1.3.6.1.4.1.47286.1.1.1.1` | Older TSL-cited OIDs not enabled. |
 | `signe` (beta) | SIGNE | `signe-personal-otros-dispositivos` (C) | NIE as `PNOES-<NIE>` accepted only for this profile, as documented. |
 | `lleidanet` (beta) | Lleidanet / inDenova | `lleidanet-natural-person-sw` (C) | |
-| `dnie` (beta) | DNIe (requires card reader) | `dnie-auth` (A, plus fixture answers) | Anchor AC RAIZ DNIE 2 with pinned intermediates AC DNIE 004/005/006 (official AIA downloads, verified against the root; source URL and SHA-256 recorded). Policy exactly `2.16.724.1.2.2.2.4`. EKU `AllowAbsent`. RSA ≥ 2048 (1920-bit ROCA re-issues rejected). ID bare DNI only. SN = first surname. Full surnames from CN grammar `<SURNAMES>, <GIVEN> (AUTENTICACIÓN\|AUTENTICACION)`: CN must start with SN, and GN must match. Birth date from SDA `dateOfBirth` (GeneralizedTime) when present, optional. OCSP only, `good` without nextUpdate → 15 min max age. Intermediates' status via the root ARL (cached until its nextUpdate). |
+| `dnie` (beta) | DNIe (requires card reader) | `dnie-auth` (A, plus fixture answers) | Anchor AC RAIZ DNIE 2 with pinned intermediates AC DNIE 004/005/006 (official AIA downloads, verified against the root; source URL and SHA-256 recorded). Policy exactly `2.16.724.1.2.2.2.4`. EKU `AllowAbsent`. RSA ≥ 2048 (1920-bit ROCA re-issues rejected). ID bare DNI only. SN = first surname. Full surnames from CN grammar `<SURNAMES>, <GIVEN> (AUTENTICACIÓN\|AUTENTICACION)`: CN must start with SN, and GN must match. Birth date from SDA `dateOfBirth` (GeneralizedTime) when present, optional. OCSP only, `good` without nextUpdate → 15 min max age. Intermediates' status via the root ARL (cached until its nextUpdate). AC DNIE 00N beyond 006 are not pinned; a DNIe under a newer sub-CA fails `untrusted_issuer`. The AIA list at `http://pki.policia.es/dnie/certs/` is re-checked at every registry update. |
 
 Not enabled, with the reasons recorded in the digests:
 - Izenpe (no citizen software certificate);

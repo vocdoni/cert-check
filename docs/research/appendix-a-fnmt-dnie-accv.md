@@ -151,7 +151,7 @@ eku_expected: ["1.3.6.1.5.5.7.3.2 clientAuth (require)", "1.3.6.1.4.1.311.10.3.1
 leaf_key_algorithms: [ECDSA P-256]   # leaf signature ecdsa-with-SHA256; validity 4 years
 identity:
   personal_id:
-    location: "subject 2.5.4.5 (UTF8String <=15 per G2 profile; RSA profile says PrintableString; accept both string types)"
+    location: "subject 2.5.4.5 (PrintableString observed in the G2 kit; the G2 profile text says UTF8String; accept both)"
     formats: ["IDCES-<DNI|NIE>"]
     anchored_grammar: '^IDCES-([0-9]{8}[TRWAGMYFPDXBNJZSQVHLCKE]|[XYZ][0-9]{7}[TRWAGMYFPDXBNJZSQVHLCKE])$  + mod-23 check'
   given_names: {location: "subject 2.5.4.42 (profile notes 'NIF/Pasaporte' as the source document)"}
@@ -547,7 +547,7 @@ Not profiled, out of scope for this PoC: ACCV citizen QSCD `1.3.6.1.4.1.8149.3.6
    - DNIe may add a `.X.Y` version suffix: enumerate exact versions and never use prefixes.
    - Every in-scope CA certificate (FNMT, ACCV, DNIe) asserts anyPolicy, so Go's RFC 5280 policy processing cannot block these chains. Do the exact-OID check in the profile layer.
 5. **Identity parsing.**
-   - Walk `RawSubject` RDNs. Accept PrintableString and UTF8String for 2.5.4.5: FNMT RSA uses PrintableString, G2 uses UTF8String.
+   - Walk `RawSubject` RDNs. Accept PrintableString and UTF8String for 2.5.4.5: FNMT RSA uses PrintableString, G2 uses PrintableString in the observed kit (the G2 profile text says UTF8String).
    - Decode SAN `directoryName` with private OIDs: `1.3.6.1.4.1.5734.1.{1,2,3,4,6,7,20,22,47}`, `2.16.724.1.3.5.7.{1,2}.*`, and UID `0.9.2342.19200300.100.1.1`.
    - Parse SubjectDirectoryAttributes `2.5.29.9` / `dateOfBirth 1.3.6.1.5.5.7.9.1` yourself (Go does not) for DNIe.
    - The SAN NIF form differs by profile: FNMT citizen SAN is bare, FNMT representative SAN is `IDCES-` prefixed. Normalize both sides before comparing.
