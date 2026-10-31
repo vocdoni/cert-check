@@ -1,0 +1,16 @@
+[
+  {"id": "fnmt", "name": "FNMT - Persona Física", "description": "Certificado de Persona Física de la FNMT-RCM (AC FNMT Usuarios y AC USUARIOS G2)", "beta": false},
+  {"id": "idcat", "name": "idCAT Certificat", "description": "Certificat idCAT del Consorci AOC", "beta": false},
+  {"id": "accv", "name": "ACCV - Ciudadano (software)", "description": "Certificado cualificado de Ciudadano en soporte software de la ACCV", "beta": false},
+  {"id": "digitel", "name": "DIGITEL ON - Ciudadano", "description": "Certificado cualificado de ciudadano DIGITEL (software)", "beta": false},
+  {"id": "bewor", "name": "Bewor - Persona Física", "description": "Certificado cualificado de persona física Bewor (software)", "beta": false},
+  {"id": "sectigo", "name": "Sectigo - Ciudadano", "description": "Certificado cualificado de ciudadano Sectigo (no QSCD)", "beta": false},
+  {"id": "fnmt-representative", "name": "FNMT - Representante", "description": "Certificado de Representante de la FNMT-RCM", "beta": true},
+  {"id": "fnmt-employee", "name": "FNMT - Empleado Público", "description": "Certificado de Empleado Público de la FNMT-RCM (software)", "beta": true},
+  {"id": "firmaprofesional", "name": "Firmaprofesional", "description": "Certificado Personal de Persona Física (sin DCCF)", "beta": true},
+  {"id": "anf", "name": "ANF AC", "description": "Certificado de Clase 2 de Persona Física (software)", "beta": true},
+  {"id": "uanataca", "name": "Uanataca", "description": "Certificado cualificado de Persona Física Ciudadano en software", "beta": true},
+  {"id": "signe", "name": "SIGNE", "description": "Certificado personal de Persona Física en otros dispositivos", "beta": true},
+  {"id": "lleidanet", "name": "Lleidanet / inDenova", "description": "Certificado cualificado de persona física en software", "beta": true},
+  {"id": "dnie", "name": "DNIe (requires card reader)", "description": "Certificado de autenticación del DNI electrónico (tarjeta y lector)", "beta": true}
+]

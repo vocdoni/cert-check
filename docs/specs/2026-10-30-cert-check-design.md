@@ -452,8 +452,10 @@ requested CertID.
   with a documented reason).
 - **Nonce.** Send a 32-byte nonce when the profile marks the responder nonce-capable, and require
   the same nonce back; a missing or different nonce → `invalid_evidence`. All FNMT, DNIe and
-  ACCV responders echo nonces (checked live 2026-10-30). Profiles without nonce support rely on
-  freshness only.
+  ACCV responders echo nonces (checked live 2026-10-30); the live probe of 2026-10-31 saw the
+  idCAT (EC-Ciutadania), DIGITEL, Bewor, ANF and Uanataca responders echo them too. Every profile
+  requires the nonce except Sectigo and Firmaprofesional (no nonce back; freshness only); SIGNE
+  and Lleidanet are CRL-only.
 - **Non-issued serials.** Responders answer a never-issued serial with
   `revoked/certificateHold/1970-01-01` (RFC 6960 §2.2). It is mapped to `revoked` with no "retry
   later" UX.
@@ -477,6 +479,11 @@ requested CertID.
   `unsupported_method`. FNMT CRLs are partitioned (`CRLU<n>.crl`, sparse numbers) and carry a
   critical IDP naming the partition; only the leaf's CDP names are used and partitions are never
   enumerated.
+- Distribution points are walked in certificate order. A leaf is `good` at the first CRL that
+  covers it and does not list it. A pinned intermediate is checked against every usable
+  allowlisted distribution point and is `good` only when all of them answer `good`; `revoked`
+  from any wins. AC DNIE 005/006 name the empty, unscoped root `CRL.crl` before `ARL.crl`, and
+  AC RAIZ DNIE 2 publishes CA revocations in the ARL only.
 - Issuer: `bytes.Equal(crl.RawIssuer, issuer.RawSubject)` on DER, then
   `crl.CheckSignatureFrom(issuer)`.
 - Criticality: Go's `ParseRevocationList` stores CRL and CRL-entry extensions without enforcing
@@ -496,7 +503,9 @@ requested CertID.
 - `http`/`https` only, and the host must be in the union of the profile allowlists.
 - Dial through a `net.Dialer.Control` that rejects loopback, private, link-local, multicast and
   unspecified IPs after resolution.
-- Redirects: at most 3, only to the same scheme and host, or to another host in the allowlist.
+- Redirects: at most 3, only to the same scheme or an `http`→`https` upgrade (never `https`→`http`),
+  and only to the same host or another host in the allowlist. SIGNE's `signe-subca.crl` answers
+  302 to `https://crl.firmaprofesional.com/` (allowlisted for SIGNE).
   ACCV `/gestcert/` and DNIe `/dnie/crls/` answer 302 to same-host paths.
 - Timeouts: 5 s total for OCSP, 15 s for CRL.
 - Response caps: OCSP 64 KiB, CRL 32 MiB.
@@ -658,6 +667,7 @@ otherwise).
   `X-Envoy-External-Address`) is confirmed during rollout step 4 and recorded here. The leftmost
   entry is never used. Without any forwarded header (local run) the TCP remote address is used.
   Limits: 20 transaction creations and 60 redeems per minute per IP → 429 with `Retry-After`.
+  IPv6 clients are keyed by their /64 (one allocation), IPv4 clients by address.
   The auth listener caps concurrent connections at 512 (listener-level semaphore; excess
   connections are closed before the handshake) and runs no validation until the state check
   passes. Global validation concurrency: 32; a validation waiting more than 10 s for a slot →
@@ -751,8 +761,9 @@ is logged.
 
 ### Observability and privacy
 
-- `log/slog` JSON. Log lines carry request id, provider, profile id, outcome code and revocation
-  method/latency.
+- `log/slog` JSON. Log lines carry the diagnostic ID, provider, profile id, outcome code and
+  revocation method/latency. The diagnostic ID is the request id; no separate request-id
+  attribute (ruling R49).
 - **Never logged:** DNI/NIE, names, birth date, subject DN, certificate bytes or fingerprint,
   state, code or cookie values.
 - The diagnostic ID links the user's copied report to the server log line.
@@ -1006,8 +1017,8 @@ rejected, never guessed.
 | Provider id | UI name | Profiles (digest) | Notes |
 |---|---|---|---|
 | `fnmt` | FNMT – Persona Física | `fnmt-citizen-rsa` (A), `fnmt-citizen-g2` (A) | ID in 2.5.4.5: `fnmt-citizen-rsa`: `IDCES-<DNI/NIE>` or bare (`AllowBare`, May-2016 kit); `fnmt-citizen-g2`: `IDCES-` only; SAN dirName `5734.1.{1,2,3,4}` must agree, order-independent. Split surnames from SAN `.1.2`/`.1.3`. G2 leaves are ECDSA P-256. Some leaves have LDAP-only CDP, so OCSP only. G2 OCSP path `/ocspusuG2/` (case-sensitive): always use the leaf AIA verbatim. TestMarkers: fingerprints of the 14 FNMT fixtures plus the identities above. |
-| `idcat` | idCAT Certificat | `aoc-idcat-g2` (B), `aoc-idcat-g3` (B) | Policy `1.3.6.1.4.1.15096.1.3.2.86.2` for both, dispatched by anchor. ID `IDCES-<id>` only (no bare). `IDCxx-`/`PASxx-` → `identity_unsupported_document`. Subject C must equal the prefix country. G2 handles critical qcStatements. Legacy ` - DNI <id>` surname strip only on exact grammar plus equality (expected never to fire). OCSP: one certificate per request. |
-| `accv` | ACCV – Ciudadano (software) | `accv-citizen-software-current` (A), anchors RSA1 + ECC1 CLIENTE | Bare 9-char NIF (DNI or NIE; K/L/M → unsupported). SAN dirName CN `NOMBRE\|APELLIDO1\|APELLIDO2` plus UID must agree. OCSP CRL-backed (3-day window). RSA1 CRL 13.6 MB. |
+| `idcat` | idCAT Certificat | `aoc-idcat-g2` (B), `aoc-idcat-g3` (B) | Policy `1.3.6.1.4.1.15096.1.3.2.86.2` for both, dispatched by anchor. ID `IDCES-<id>` only (no bare). `IDCxx-`/`PASxx-` → `identity_unsupported_document`. Subject C must equal the prefix country. G2 handles critical qcStatements. Legacy ` - DNI <id>` surname strip only on exact grammar plus equality (expected never to fire). OCSP: one certificate per request. RSA leaves use the global 2048-bit floor (the CP/DPC 3072 minimum is not enforced, R73). |
+| `accv` | ACCV – Ciudadano (software) | `accv-citizen-software-current` (A), anchors RSA1 + ECC1 CLIENTE | Bare 9-char NIF (DNI or NIE; K/L/M → unsupported). SAN dirName CN `NOMBRE\|APELLIDO1\|APELLIDO2` plus UID must agree. OCSP CRL-backed (3-day window). RSA1 CRL 13.6 MB. RSA leaves use the global 2048-bit floor (the CP/DPC 3072 minimum is not enforced, R73). |
 | `digitel` | DIGITEL ON – Ciudadano | `digitel-citizen-sw-g1` (C) | Specimen `99949996T` deny-listed. |
 | `bewor` | Bewor – Persona Física | `bewor-natural-person-sw` (C) | `.1.1.1` (centralised HSM) not allowed. Specimen `99949999A` deny-listed. |
 | `sectigo` | Sectigo – Ciudadano | `sectigo-citizen-local` (C), anchors R35 + E35 | `digitalSignature` mandatory (optional in Sectigo v2.8). OCSP pre-generated 7-day window. Specimen `99949990V` deny-listed. |
@@ -1016,9 +1027,9 @@ rejected, never guessed.
 | `firmaprofesional` (beta) | Firmaprofesional | `firmaprofesional-personal-sw` (C) | Pin `2b75cc4f…` only; `4ccf17c0…` (same key, same DN, 55 s shorter validity) is recorded in the exception list as a known alias and not loaded. |
 | `anf` (beta) | ANF AC | `anf-asociacion-class2-sw`, `anf-sl-class2-sw` (C) | Two legal providers, two anchors. Standard Subject mapping only; private SAN is ignored. |
 | `uanataca` (beta) | Uanataca | `uanataca-citizen-sw` (C), OID `1.3.6.1.4.1.47286.1.1.1.1` | Older TSL-cited OIDs not enabled. |
-| `signe` (beta) | SIGNE | `signe-personal-otros-dispositivos` (C) | NIE as `PNOES-<NIE>` accepted only for this profile, as documented. |
-| `lleidanet` (beta) | Lleidanet / inDenova | `lleidanet-natural-person-sw` (C) | |
-| `dnie` (beta) | DNIe (requires card reader) | `dnie-auth` (A, plus fixture answers) | Anchor AC RAIZ DNIE 2 with pinned intermediates AC DNIE 004/005/006 (official AIA downloads, verified against the root; source URL and SHA-256 recorded). Policy exactly `2.16.724.1.2.2.2.4`. EKU `AllowAbsent`. RSA ≥ 2048 (1920-bit ROCA re-issues rejected). ID bare DNI only. SN = first surname. Full surnames from CN grammar `<SURNAMES>, <GIVEN> (AUTENTICACIÓN\|AUTENTICACION)`: CN must start with SN, and GN must match. Birth date from SDA `dateOfBirth` (GeneralizedTime) when present, optional. OCSP only, `good` without nextUpdate → 15 min max age. Intermediates' status via the root ARL (cached until its nextUpdate). AC DNIE 00N beyond 006 are not pinned; a DNIe under a newer sub-CA fails `untrusted_issuer`. The AIA list at `http://pki.policia.es/dnie/certs/` is re-checked at every registry update. |
+| `signe` (beta) | SIGNE | `signe-personal-otros-dispositivos` (C) | NIE as `PNOES-<NIE>` accepted only for this profile, as documented. CRL only (leaf OCSP answers unknown). `signe-subca.crl` answers 302 to `https://crl.firmaprofesional.com/signe/signe-subca.crl`; that host is allowlisted for SIGNE. |
+| `lleidanet` (beta) | Lleidanet / inDenova | `lleidanet-natural-person-sw` (C) | CRL only: the `ocsp2.esigna.es` responder certificate lacks id-pkix-ocsp-nocheck, so its answers are never acceptable; the leaf AIA OCSP URL is ignored. |
+| `dnie` (beta) | DNIe (requires card reader) | `dnie-auth` (A, plus fixture answers) | Anchor AC RAIZ DNIE 2 with pinned intermediates AC DNIE 004/005/006 (official AIA downloads, verified against the root; source URL and SHA-256 recorded). Policy exactly `2.16.724.1.2.2.2.4`. EKU `AllowAbsent`. RSA ≥ 2048 (1920-bit ROCA re-issues rejected). ID bare DNI only. SN = first surname. Full surnames from CN grammar `<SURNAMES>, <GIVEN> (AUTENTICACIÓN\|AUTENTICACION)`: CN must start with SN, and GN must match. Birth date from SDA `dateOfBirth` (GeneralizedTime) when present, optional. OCSP only, `good` without nextUpdate → 15 min max age. Intermediates' status via the root CRLs: every allowlisted DP (`CRL.crl` and `ARL.crl` for 005/006, `ARL.crl` for 004) must answer good (cached until min(nextUpdate, 1 h)). AC DNIE 00N beyond 006 are not pinned; a DNIe under a newer sub-CA fails `untrusted_issuer`. The AIA list at `http://pki.policia.es/dnie/certs/` is re-checked at every registry update. |
 
 Not enabled, with the reasons recorded in the digests:
 - Izenpe (no citizen software certificate);

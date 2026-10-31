@@ -1,0 +1,28 @@
+{
+  "status": "error",
+  "error": {
+    "code": "no_certificate",
+    "message": "No certificate was presented.",
+    "retryable": false
+  },
+  "diagnostics": {
+    "diagnosticId": "a94f0c7e1d3b4825b6c0e9f2d7138a5c",
+    "time": "2026-10-31T09:16:02Z",
+    "serverVersion": "v0.1.0",
+    "provider": "fnmt",
+    "failedStep": "bounds",
+    "code": "no_certificate",
+    "technicalDetail": "the TLS handshake carried no client certificate",
+    "tls": {
+      "version": "TLS 1.2",
+      "cipherSuite": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+      "sni": "fnmt.auth.cert-check.vocdoni.dev",
+      "clientCertificatePresented": false,
+      "chainLength": 0
+    },
+    "certificate": null,
+    "chain": null,
+    "profileCandidates": null,
+    "revocationAttempts": null
+  }
+}
