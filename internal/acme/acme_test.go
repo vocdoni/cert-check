@@ -1,0 +1,434 @@
+package acme
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"errors"
+	"math/big"
+	"os"
+	"path/filepath"
+	"slices"
+	"testing"
+	"time"
+
+	"github.com/caddyserver/certmagic"
+	"github.com/libdns/cloudflare"
+
+	"github.com/vocdoni/cert-check/internal/testpki"
+)
+
+const (
+	testDomain = "auth.example.test"
+	testToken  = "tok-SECRET-123"
+)
+
+func validOptions(t *testing.T) Options {
+	t.Helper()
+	return Options{
+		AuthDomain:      testDomain,
+		DataDir:         t.TempDir(),
+		Email:           "ops@example.test",
+		CloudflareToken: testToken,
+	}
+}
+
+// newTestACME builds an ACME manager and stops its certmagic cache with the test.
+func newTestACME(t *testing.T, o Options) *Manager {
+	t.Helper()
+	m, err := NewACME(o)
+	if err != nil {
+		t.Fatalf("NewACME: %v", err)
+	}
+	t.Cleanup(m.Close)
+	return m
+}
+
+// selfSigned returns a self-signed certificate for names with the given validity.
+func selfSigned(t *testing.T, notBefore, notAfter time.Time, names ...string) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	tpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: names[0]},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+		DNSNames:     names,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, key.Public(), key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}
+}
+
+// wildcardCert is a currently valid certificate for "*.<testDomain>".
+func wildcardCert(t *testing.T) tls.Certificate {
+	t.Helper()
+	now := time.Now()
+	return selfSigned(t, now.Add(-time.Hour), now.Add(24*time.Hour), "*."+testDomain)
+}
+
+// writePEM stores cert and its key as PEM files in a fresh directory.
+func writePEM(t *testing.T, cert tls.Certificate) (certFile, keyFile string) {
+	t.Helper()
+	keyDER, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	dir := t.TempDir()
+	certFile, keyFile = filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+	if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return certFile, keyFile
+}
+
+func TestNewACMEValidation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Options)
+	}{
+		{"missing auth domain", func(o *Options) { o.AuthDomain = "" }},
+		{"missing data dir", func(o *Options) { o.DataDir = "" }},
+		{"missing email", func(o *Options) { o.Email = "" }},
+		{"missing token", func(o *Options) { o.CloudflareToken = "" }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			o := validOptions(t)
+			tc.mutate(&o)
+			m, err := NewACME(o)
+			if err == nil {
+				m.Close()
+				t.Fatal("NewACME succeeded, want an error")
+			}
+			if m != nil {
+				t.Errorf("NewACME returned a manager with an error: %v", m)
+			}
+		})
+	}
+}
+
+func TestNewACMEConfig(t *testing.T) {
+	tests := []struct {
+		name     string
+		staging  bool
+		override string
+		wantCA   string
+	}{
+		{"production", false, "", certmagic.LetsEncryptProductionCA},
+		{"staging", true, "", certmagic.LetsEncryptStagingCA},
+		{"override domain", false, "_acme-challenge.delegate.example.net", certmagic.LetsEncryptProductionCA},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			o := validOptions(t)
+			o.Staging, o.OverrideDomain = tc.staging, tc.override
+			m := newTestACME(t, o)
+
+			if want := "*." + testDomain; m.name != want {
+				t.Errorf("name = %q, want %q", m.name, want)
+			}
+			if len(m.cfg.Issuers) != 1 {
+				t.Fatalf("issuers = %d, want 1", len(m.cfg.Issuers))
+			}
+			issuer, ok := m.cfg.Issuers[0].(*certmagic.ACMEIssuer)
+			if !ok {
+				t.Fatalf("issuer is %T, want *certmagic.ACMEIssuer", m.cfg.Issuers[0])
+			}
+			if issuer.CA != tc.wantCA {
+				t.Errorf("CA = %q, want %q", issuer.CA, tc.wantCA)
+			}
+			if issuer.Email != o.Email || !issuer.Agreed {
+				t.Errorf("Email = %q, Agreed = %v, want %q, true", issuer.Email, issuer.Agreed, o.Email)
+			}
+			if !issuer.DisableHTTPChallenge || !issuer.DisableTLSALPNChallenge {
+				t.Errorf("DisableHTTPChallenge = %v, DisableTLSALPNChallenge = %v, want true, true",
+					issuer.DisableHTTPChallenge, issuer.DisableTLSALPNChallenge)
+			}
+			if issuer.DNS01Solver == nil {
+				t.Fatal("DNS01Solver is nil, want a DNS-01 solver")
+			}
+			solver, ok := issuer.DNS01Solver.(*certmagic.DNS01Solver)
+			if !ok {
+				t.Fatalf("DNS01Solver is %T, want *certmagic.DNS01Solver", issuer.DNS01Solver)
+			}
+			provider, ok := solver.DNSProvider.(*cloudflare.Provider)
+			if !ok {
+				t.Fatalf("DNSProvider is %T, want *cloudflare.Provider", solver.DNSProvider)
+			}
+			if provider.APIToken != testToken {
+				t.Errorf("APIToken = %q, want the configured token", provider.APIToken)
+			}
+			if solver.OverrideDomain != tc.override {
+				t.Errorf("OverrideDomain = %q, want %q", solver.OverrideDomain, tc.override)
+			}
+			storage, ok := m.cfg.Storage.(*certmagic.FileStorage)
+			if !ok {
+				t.Fatalf("Storage is %T, want *certmagic.FileStorage", m.cfg.Storage)
+			}
+			if want := filepath.Join(o.DataDir, "certmagic"); storage.Path != want {
+				t.Errorf("Storage.Path = %q, want %q", storage.Path, want)
+			}
+			if !m.cfg.OCSP.DisableStapling {
+				t.Error("OCSP.DisableStapling = false, want true")
+			}
+		})
+	}
+}
+
+func TestNewACMEKeepsGlobalsUntouched(t *testing.T) {
+	storage, issuers := certmagic.Default.Storage, certmagic.Default.Issuers
+	acmeCA := certmagic.DefaultACME.CA
+	newTestACME(t, validOptions(t))
+	if certmagic.Default.Storage != storage || len(certmagic.Default.Issuers) != len(issuers) {
+		t.Error("certmagic.Default was modified")
+	}
+	if certmagic.DefaultACME.CA != acmeCA || certmagic.DefaultACME.DNS01Solver != nil {
+		t.Error("certmagic.DefaultACME was modified")
+	}
+}
+
+func TestObtainBackoffSchedule(t *testing.T) {
+	want := []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute, time.Hour}
+	if !slices.Equal(obtainBackoff, want) {
+		t.Errorf("obtainBackoff = %v, want %v", obtainBackoff, want)
+	}
+	m := newTestACME(t, validOptions(t))
+	if !slices.Equal(m.backoff, want) {
+		t.Errorf("Manager backoff = %v, want %v", m.backoff, want)
+	}
+}
+
+func TestRunRetriesWithBackoff(t *testing.T) {
+	m := newTestACME(t, validOptions(t))
+	m.backoff = []time.Duration{time.Millisecond}
+	cert := wildcardCert(t)
+
+	var calls int
+	m.manage = func(ctx context.Context, names []string) error {
+		calls++
+		if want := []string{"*." + testDomain}; !slices.Equal(names, want) {
+			t.Errorf("manage names = %v, want %v", names, want)
+		}
+		if m.Ready() {
+			t.Errorf("Ready() = true during attempt %d, want false until the certificate is obtained", calls)
+		}
+		if calls < 3 {
+			return errors.New("dns-01 failed")
+		}
+		_, err := m.cfg.CacheUnmanagedTLSCertificate(ctx, cert, nil)
+		return err
+	}
+
+	if m.Ready() {
+		t.Fatal("Ready() = true before Run")
+	}
+	if err := m.Run(t.Context()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls != 3 {
+		t.Errorf("manage calls = %d, want 3", calls)
+	}
+	if !m.Ready() {
+		t.Error("Ready() = false after Run, want true")
+	}
+}
+
+func TestRunStopsOnCancel(t *testing.T) {
+	m := newTestACME(t, validOptions(t))
+	m.backoff = []time.Duration{time.Hour}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var calls int
+	m.manage = func(context.Context, []string) error {
+		calls++
+		cancel() // the backoff wait must end on cancellation, not after an hour
+		return errors.New("dns-01 failed")
+	}
+
+	err := m.Run(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Run = %v, want context.Canceled", err)
+	}
+	if calls != 1 {
+		t.Errorf("manage calls = %d, want 1", calls)
+	}
+	if m.Ready() {
+		t.Error("Ready() = true after a cancelled Run, want false")
+	}
+}
+
+func TestRunClampsBackoff(t *testing.T) {
+	m := newTestACME(t, validOptions(t))
+	m.backoff = []time.Duration{time.Millisecond, 2 * time.Millisecond}
+	var calls int
+	m.manage = func(ctx context.Context, _ []string) error {
+		calls++
+		if calls < 6 { // more failures than backoff entries
+			return errors.New("dns-01 failed")
+		}
+		_, err := m.cfg.CacheUnmanagedTLSCertificate(ctx, wildcardCert(t), nil)
+		return err
+	}
+	if err := m.Run(t.Context()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls != 6 || !m.Ready() {
+		t.Errorf("calls = %d, Ready() = %v, want 6, true", calls, m.Ready())
+	}
+}
+
+func TestReadyACMERequiresValidCertificate(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name string
+		cert tls.Certificate
+		want bool
+	}{
+		{"valid wildcard", wildcardCert(t), true},
+		{"expired wildcard", selfSigned(t, now.Add(-48*time.Hour), now.Add(-time.Hour), "*."+testDomain), false},
+		{"other name", selfSigned(t, now.Add(-time.Hour), now.Add(time.Hour), "*.other.example.test"), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestACME(t, validOptions(t))
+			m.manage = func(ctx context.Context, _ []string) error {
+				_, err := m.cfg.CacheUnmanagedTLSCertificate(ctx, tc.cert, nil)
+				return err
+			}
+			if err := m.Run(t.Context()); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if got := m.Ready(); got != tc.want {
+				t.Errorf("Ready() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGetCertificateACME(t *testing.T) {
+	m := newTestACME(t, validOptions(t))
+	cert := wildcardCert(t)
+	if _, err := m.cfg.CacheUnmanagedTLSCertificate(t.Context(), cert, nil); err != nil {
+		t.Fatalf("cache certificate: %v", err)
+	}
+	got, err := m.GetCertificate(&tls.ClientHelloInfo{ServerName: "abc." + testDomain})
+	if err != nil {
+		t.Fatalf("GetCertificate: %v", err)
+	}
+	if len(got.Certificate) == 0 || string(got.Certificate[0]) != string(cert.Certificate[0]) {
+		t.Error("GetCertificate did not return the cached wildcard certificate")
+	}
+}
+
+func TestRunStatic(t *testing.T) {
+	cert, _ := testpki.ServerTLS(t, testDomain)
+	if err := NewStatic(cert).Run(t.Context()); err != nil {
+		t.Errorf("Run on a static manager = %v, want nil", err)
+	}
+}
+
+func TestStatic(t *testing.T) {
+	t.Run("serves the certificate", func(t *testing.T) {
+		cert, _ := testpki.ServerTLS(t, testDomain)
+		m := NewStatic(cert)
+		got, err := m.GetCertificate(&tls.ClientHelloInfo{ServerName: testDomain})
+		if err != nil {
+			t.Fatalf("GetCertificate: %v", err)
+		}
+		if len(got.Certificate) == 0 || string(got.Certificate[0]) != string(cert.Certificate[0]) {
+			t.Error("GetCertificate did not return the static certificate")
+		}
+		if !m.Ready() {
+			t.Error("Ready() = false, want true")
+		}
+	})
+
+	t.Run("expired leaf is not ready", func(t *testing.T) {
+		now := time.Now()
+		m := NewStatic(selfSigned(t, now.Add(-48*time.Hour), now.Add(-time.Hour), testDomain))
+		if m.Ready() {
+			t.Error("Ready() = true for an expired certificate, want false")
+		}
+	})
+
+	t.Run("load from files", func(t *testing.T) {
+		cert, _ := testpki.ServerTLS(t, testDomain)
+		certFile, keyFile := writePEM(t, cert)
+		m, err := LoadStatic(certFile, keyFile)
+		if err != nil {
+			t.Fatalf("LoadStatic: %v", err)
+		}
+		if !m.Ready() {
+			t.Error("Ready() = false, want true")
+		}
+		got, err := m.GetCertificate(&tls.ClientHelloInfo{ServerName: testDomain})
+		if err != nil {
+			t.Fatalf("GetCertificate: %v", err)
+		}
+		if string(got.Certificate[0]) != string(cert.Certificate[0]) {
+			t.Error("GetCertificate did not return the certificate read from the file")
+		}
+	})
+
+	t.Run("load errors", func(t *testing.T) {
+		cert, _ := testpki.ServerTLS(t, testDomain)
+		certFile, keyFile := writePEM(t, cert)
+		otherCert, _ := testpki.ServerTLS(t, testDomain)
+		_, otherKeyFile := writePEM(t, otherCert)
+		garbage := filepath.Join(t.TempDir(), "garbage.pem")
+		if err := os.WriteFile(garbage, []byte("not pem"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		missing := filepath.Join(t.TempDir(), "missing.pem")
+
+		tests := []struct {
+			name              string
+			certFile, keyFile string
+		}{
+			{"garbage certificate", garbage, keyFile},
+			{"garbage key", certFile, garbage},
+			{"missing certificate", missing, keyFile},
+			{"missing key", certFile, missing},
+			{"key does not match", certFile, otherKeyFile},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				m, err := LoadStatic(tc.certFile, tc.keyFile)
+				if err == nil {
+					t.Fatalf("LoadStatic succeeded (%v), want an error", m)
+				}
+			})
+		}
+	})
+}
+
+func TestCloseIsIdempotent(t *testing.T) {
+	m, err := NewACME(validOptions(t))
+	if err != nil {
+		t.Fatalf("NewACME: %v", err)
+	}
+	m.Close()
+	m.Close()
+	NewStatic(tls.Certificate{}).Close()
+}
