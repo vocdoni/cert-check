@@ -24,8 +24,11 @@ type ConfigOptions struct {
 	AuthDomain     string // e.g. "auth.cert-check.vocdoni.dev"; provider hosts are "<id>.<AuthDomain>"
 	GetCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	AllowTLS13     bool         // CERTCHECK_AUTH_TLS13 (deviation D2); default TLS 1.2 only
-	Logger         *slog.Logger // handshake-level warnings; nil = slog.Default()
+	Logger         *slog.Logger // handshake-level debug lines; nil = slog.Default()
 }
+
+// maxLoggedSNI caps the client-chosen server name in logs and errors.
+const maxLoggedSNI = 64
 
 var tls12Suites = []uint16{
 	tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
@@ -78,8 +81,11 @@ func ServerConfig(o ConfigOptions) (*tls.Config, error) {
 			sni := strings.ToLower(hello.ServerName)
 			cfg, ok := perSNI[sni]
 			if !ok {
-				log.Warn("auth handshake rejected: unknown SNI", "sni", sni)
-				return nil, fmt.Errorf("tlsauth: unknown server name %q", sni)
+				// Debug, not Warn: scanners reach the port with empty or
+				// random SNI all the time. The client-chosen name is capped.
+				shown := sni[:min(len(sni), maxLoggedSNI)]
+				log.Debug("auth handshake rejected: unknown SNI", "sni", shown)
+				return nil, fmt.Errorf("tlsauth: unknown server name %q", shown)
 			}
 			return cfg, nil
 		},
@@ -124,7 +130,9 @@ func CheckHost(r *http.Request) error {
 
 // Authenticate validates r.TLS.PeerCertificates for the provider named by
 // r.TLS.ServerName. Every call re-runs the full pipeline. The error is
-// *certauth.Error (diagnostics include the TLS details).
+// *certauth.Error (diagnostics include the TLS details). For a request
+// without TLS state the error is CodeInternal and its Diagnostics are empty:
+// it carries no diagnostic ID.
 func (h *Handler) Authenticate(r *http.Request) (*certauth.Result, error) {
 	if r.TLS == nil {
 		return nil, &certauth.Error{Code: certauth.CodeInternal, Retryable: true, Detail: "request without TLS state"}

@@ -307,29 +307,38 @@ func TestServerConfigTLS13(t *testing.T) {
 
 func TestUnknownSNIRejected(t *testing.T) {
 	w := newWorld(t)
+	long := strings.Repeat("x", 100) + "." + authDomain
 	cases := []struct {
 		name    string
 		client  *tls.Config
-		wantLog string
+		wantLog string // the sni attribute, truncated to 64 bytes
 	}{
-		{"unknown provider", &tls.Config{ServerName: gammaHost, RootCAs: w.serverPool}, "sni=" + gammaHost},
+		{"unknown provider", &tls.Config{ServerName: gammaHost, RootCAs: w.serverPool}, "sni=" + gammaHost + "\n"},
 		// crypto/tls sends no SNI extension when ServerName is an IP literal.
-		{"no SNI", &tls.Config{ServerName: "127.0.0.1", RootCAs: w.serverPool}, `sni=""`},
+		{"no SNI", &tls.Config{ServerName: "127.0.0.1", RootCAs: w.serverPool}, `sni=""` + "\n"},
+		{"long SNI", &tls.Config{ServerName: long, RootCAs: w.serverPool}, "sni=" + long[:64] + "\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			var logs syncBuffer
-			cfg := w.config(t, false, slog.New(slog.NewTextHandler(&logs, nil)))
-			_, srvErr, cliErr := pipeHandshake(t, cfg, c.client)
-			if srvErr == nil {
-				t.Error("server handshake succeeded, want failure")
+			var debug, info syncBuffer
+			for _, l := range []struct {
+				buf   *syncBuffer
+				level slog.Level
+			}{{&debug, slog.LevelDebug}, {&info, slog.LevelInfo}} {
+				cfg := w.config(t, false, slog.New(slog.NewTextHandler(l.buf, &slog.HandlerOptions{Level: l.level})))
+				_, srvErr, cliErr := pipeHandshake(t, cfg, c.client)
+				if srvErr == nil {
+					t.Errorf("%v logger: server handshake succeeded, want failure", l.level)
+				}
+				if cliErr == nil || !strings.Contains(cliErr.Error(), "internal error") {
+					t.Errorf("%v logger: client error = %v, want an internal error alert", l.level, cliErr)
+				}
 			}
-			if cliErr == nil || !strings.Contains(cliErr.Error(), "internal error") {
-				t.Errorf("client error = %v, want an internal error alert", cliErr)
+			if got := debug.String(); !strings.Contains(got, "level=DEBUG") || !strings.Contains(got, c.wantLog) {
+				t.Errorf("debug log = %q, want a DEBUG line ending with %q", got, c.wantLog)
 			}
-			got := logs.String()
-			if !strings.Contains(got, "level=WARN") || !strings.Contains(got, c.wantLog) {
-				t.Errorf("log = %q, want a WARN line with %s", got, c.wantLog)
+			if got := info.String(); got != "" {
+				t.Errorf("info log = %q, want nothing (scanners hit the port constantly)", got)
 			}
 		})
 	}
@@ -577,8 +586,12 @@ func TestAuthenticateWithoutTLS(t *testing.T) {
 	if res != nil {
 		t.Fatalf("result = %+v, want nil", res)
 	}
-	if e := authError(t, err); e.Code != certauth.CodeInternal {
+	e := authError(t, err)
+	if e.Code != certauth.CodeInternal {
 		t.Errorf("code = %q, want %q", e.Code, certauth.CodeInternal)
+	}
+	if e.Diagnostics.DiagnosticID != "" {
+		t.Errorf("DiagnosticID = %q, want none (documented)", e.Diagnostics.DiagnosticID)
 	}
 }
 
