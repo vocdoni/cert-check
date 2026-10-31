@@ -188,14 +188,16 @@ func hostAllowed(u *url.URL, allowed []string) bool {
 	return slices.Contains(allowed, key)
 }
 
-// checkRedirect: at most MaxRedirects, same scheme, and the target is the same
-// host or another allowlisted host.
+// checkRedirect: at most MaxRedirects, the same scheme or an http -> https
+// upgrade (never a downgrade; SIGNE's CRL moved to https), and the target is
+// an allowlisted host.
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) > MaxRedirects {
 		return fmt.Errorf("%w: too many redirects", ErrRedirectBlocked)
 	}
 	prev := via[len(via)-1].URL
-	if req.URL.Scheme != prev.Scheme {
+	upgrade := prev.Scheme == "http" && req.URL.Scheme == "https"
+	if req.URL.Scheme != prev.Scheme && !upgrade {
 		return fmt.Errorf("%w: scheme change", ErrRedirectBlocked)
 	}
 	allowed, _ := req.Context().Value(allowKey{}).([]string)

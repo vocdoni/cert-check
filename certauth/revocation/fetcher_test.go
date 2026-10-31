@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -270,7 +271,14 @@ func TestFetchRedirects(t *testing.T) {
 		cHits.Add(1)
 		_, _ = w.Write(body)
 	}))
-	f := NewFetcher(FetcherOptions{DialContext: n.DialContext})
+	var dialMu sync.Mutex
+	var dialed []string
+	f := NewFetcher(FetcherOptions{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialMu.Lock()
+		dialed = append(dialed, addr)
+		dialMu.Unlock()
+		return n.DialContext(ctx, network, addr)
+	}})
 	allowed := []string{"a.example.es", "b.example.es"}
 
 	cases := []struct {
@@ -283,7 +291,6 @@ func TestFetchRedirects(t *testing.T) {
 		{"fourth redirect blocked", "http://a.example.es/r1", "", ErrRedirectBlocked},
 		{"other allowlisted host", "http://a.example.es/to-b", "http://b.example.es/final.crl", nil},
 		{"host not allowlisted", "http://a.example.es/to-c", "", ErrRedirectBlocked},
-		{"scheme change", "http://a.example.es/to-https", "", ErrRedirectBlocked},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -308,6 +315,54 @@ func TestFetchRedirects(t *testing.T) {
 	}
 	if got := cHits.Load(); got != 0 {
 		t.Errorf("non-allowlisted host saw %d requests, want 0", got)
+	}
+
+	// An http -> https upgrade is followed. The fake network has no TLS
+	// listener, so the fetch fails at the dial of port 443, after the
+	// redirect check let it through.
+	t.Run("upgrade to https followed", func(t *testing.T) {
+		_, err := f.Fetch(t.Context(), FetchRequest{URL: "http://a.example.es/to-https", MaxBytes: 1 << 10, Timeout: 5 * time.Second, AllowedHosts: allowed})
+		if err == nil || errors.Is(err, ErrRedirectBlocked) {
+			t.Fatalf("Fetch error = %v, want a dial failure after the redirect", err)
+		}
+		dialMu.Lock()
+		defer dialMu.Unlock()
+		if !slices.Contains(dialed, "a.example.es:443") {
+			t.Errorf("dialed %q, want a.example.es:443", dialed)
+		}
+	})
+}
+
+func TestCheckRedirectScheme(t *testing.T) {
+	allowed := []string{"a.example.es", "b.example.es"}
+	cases := []struct {
+		name     string
+		from, to string
+		wantErr  error
+	}{
+		{"http to https to an allowlisted host", "http://a.example.es/x.crl", "https://b.example.es/x.crl", nil},
+		{"http to https on the same host", "http://a.example.es/x.crl", "https://a.example.es/x.crl", nil},
+		{"https to https", "https://a.example.es/x.crl", "https://b.example.es/x.crl", nil},
+		{"https to http blocked", "https://a.example.es/x.crl", "http://a.example.es/x.crl", ErrRedirectBlocked},
+		{"http to https to a host not allowlisted", "http://a.example.es/x.crl", "https://c.example.es/x.crl", ErrRedirectBlocked},
+		{"http to ftp blocked", "http://a.example.es/x.crl", "ftp://a.example.es/x.crl", ErrRedirectBlocked},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.WithValue(t.Context(), allowKey{}, allowed)
+			prev, err := http.NewRequestWithContext(ctx, http.MethodGet, c.from, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.to, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = checkRedirect(req, []*http.Request{prev})
+			if (c.wantErr == nil && err != nil) || (c.wantErr != nil && !errors.Is(err, c.wantErr)) {
+				t.Errorf("checkRedirect(%s -> %s) = %v, want %v", c.from, c.to, err, c.wantErr)
+			}
+		})
 	}
 }
 

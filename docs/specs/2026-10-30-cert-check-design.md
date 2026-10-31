@@ -501,7 +501,9 @@ requested CertID.
 - `http`/`https` only, and the host must be in the union of the profile allowlists.
 - Dial through a `net.Dialer.Control` that rejects loopback, private, link-local, multicast and
   unspecified IPs after resolution.
-- Redirects: at most 3, only to the same scheme and host, or to another host in the allowlist.
+- Redirects: at most 3, only to the same scheme or an `http`→`https` upgrade (never `https`→`http`),
+  and only to the same host or another host in the allowlist. SIGNE's `signe-subca.crl` answers
+  302 to `https://crl.firmaprofesional.com/` (allowlisted for SIGNE).
   ACCV `/gestcert/` and DNIe `/dnie/crls/` answer 302 to same-host paths.
 - Timeouts: 5 s total for OCSP, 15 s for CRL.
 - Response caps: OCSP 64 KiB, CRL 32 MiB.
