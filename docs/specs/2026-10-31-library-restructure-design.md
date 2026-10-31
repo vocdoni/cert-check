@@ -140,7 +140,7 @@ type ProviderRef struct {
 // tags and is never serialised by the library.
 
 // Option configures providers and handlers.
-type Option func(*options)
+type Option func(*opts.Settings) // opts = internal/opts: Revocation, Now, Logger, Version, MaxChainLen; applied by internal/engine
 
 func WithRevocation(r *Revocation) Option // share one revocation checker across providers; default: process-wide singleton
 func WithClock(now func() time.Time) Option // pipeline clock (anchor validity at construction, validation time); default time.Now
