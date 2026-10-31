@@ -49,8 +49,35 @@ func TestAddressAllowed(t *testing.T) {
 		{"198.18.0.1", false},
 		{"240.0.0.1", false},
 		{"2001:db8::1", false},
+		// R51: documentation, 6to4, Teredo and legacy IPv6 ranges.
+		{"192.0.2.1", false},    // TEST-NET-1
+		{"198.51.100.1", false}, // TEST-NET-2
+		{"203.0.113.1", false},  // TEST-NET-3
+		{"192.88.99.1", false},  // 6to4 relay anycast
+		{"::ffff:192.0.2.1", false},
+		{"::ffff:198.51.100.1", false},
+		{"::ffff:203.0.113.1", false},
+		{"::ffff:192.88.99.1", false},
+		{"2002:7f00:1::1", false},  // 6to4 embedding 127.0.0.1
+		{"2002:808:808::1", false}, // 6to4 embedding a public IPv4: still blocked
+		{"2001::1", false},         // Teredo
+		{"2001:0:4136:e378:8000:63bf:3fff:fdd2", false},
+		{"::7f00:1", false},  // IPv4-compatible 127.0.0.1
+		{"::808:808", false}, // IPv4-compatible 8.8.8.8
+		{"100::1", false},    // discard-only
+		{"fec0::1", false},   // deprecated site-local
+		{"feff::1", false},   // top of fec0::/10
+		// Public controls, including neighbours of the new prefixes.
 		{"8.8.8.8", true},
+		{"1.1.1.1", true},
+		{"192.0.3.1", true},
+		{"198.51.101.1", true},
+		{"203.0.114.1", true},
+		{"192.88.100.1", true},
 		{"2001:4860:4860::8888", true},
+		{"2606:4700::1111", true},
+		{"2003::1", true},
+		{"2a00:1450:4001::1", true},
 	}
 	for _, c := range cases {
 		t.Run(c.addr, func(t *testing.T) {
@@ -78,8 +105,19 @@ func TestCheckDialAddress(t *testing.T) {
 		{"tcp4", "10.0.0.1:80", true},
 		{"tcp4", "no-port", true},
 		{"tcp4", "example.es:80", true}, // never a name: Control sees resolved IPs only
+		{"tcp4", "192.0.2.10:80", true},
+		{"tcp4", "198.51.100.10:80", true},
+		{"tcp4", "203.0.113.10:443", true},
+		{"tcp4", "192.88.99.1:80", true},
+		{"tcp6", "[::ffff:203.0.113.10]:80", true},
+		{"tcp6", "[2002:c0a8:101::1]:80", true}, // 6to4 embedding 192.168.1.1
+		{"tcp6", "[2001:0:4136:e378:8000:63bf:3fff:fdd2]:80", true},
+		{"tcp6", "[::a00:1]:80", true}, // IPv4-compatible 10.0.0.1
+		{"tcp6", "[100::5]:80", true},
+		{"tcp6", "[fec0::1]:80", true},
 		{"tcp4", "8.8.8.8:80", false},
 		{"tcp6", "[2001:4860:4860::8888]:443", false},
+		{"tcp6", "[2606:4700::1111]:443", false},
 	}
 	for _, c := range cases {
 		t.Run(c.address, func(t *testing.T) {
