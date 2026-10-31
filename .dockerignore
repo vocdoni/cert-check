@@ -1,0 +1,8 @@
+.git
+.delivery
+.claude
+docs
+**/*_test.go
+web/internal
+web/testdata
+**/testdata
