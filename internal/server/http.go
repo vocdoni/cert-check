@@ -103,9 +103,10 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	return errors.Is(err, io.EOF)
 }
 
-// clientIP returns the rightmost X-Forwarded-For entry selected by
-// trustedHops (1 = the entry appended by the edge). The leftmost entry is
-// never trusted. Without the header (or hops == 0) it is the TCP peer.
+// clientIP returns the rate-limit key of the client: the rightmost
+// X-Forwarded-For entry selected by trustedHops (1 = the entry appended by
+// the edge), bucketed by bucket. The leftmost entry is never trusted.
+// Without the header (or hops == 0) it is the TCP peer.
 func clientIP(r *http.Request, trustedHops int) netip.Addr {
 	remote := func() netip.Addr {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -113,7 +114,7 @@ func clientIP(r *http.Request, trustedHops int) netip.Addr {
 			return netip.Addr{}
 		}
 		a, _ := netip.ParseAddr(host)
-		return a.Unmap()
+		return bucket(a)
 	}
 	values := r.Header.Values("X-Forwarded-For")
 	if trustedHops == 0 || len(values) == 0 {
@@ -133,7 +134,17 @@ func clientIP(r *http.Request, trustedHops int) netip.Addr {
 	if err != nil {
 		return remote()
 	}
-	return a.Unmap()
+	return bucket(a)
+}
+
+// bucket keys IPv6 clients by their /64 (one allocation), IPv4 by address.
+// One /64 holder cannot fill the limiter table with distinct addresses.
+func bucket(a netip.Addr) netip.Addr {
+	a = a.Unmap()
+	if a.Is6() {
+		return netip.PrefixFrom(a, 64).Masked().Addr()
+	}
+	return a
 }
 
 // ipLimiter is a per-IP token bucket with bounded memory.

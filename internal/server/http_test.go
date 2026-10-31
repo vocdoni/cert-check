@@ -238,9 +238,14 @@ func TestClientIP(t *testing.T) {
 		{"entry with port", peer, []string{"1.1.1.1:443"}, 1, "10.0.0.9"},
 		{"whitespace", peer, []string{" 1.1.1.1 ,  2.2.2.2 "}, 1, "2.2.2.2"},
 		{"hops 0", peer, []string{"1.1.1.1, 2.2.2.2"}, 0, "10.0.0.9"},
-		{"IPv6 entry", peer, []string{"1.1.1.1, 2001:db8::1"}, 1, "2001:db8::1"},
+		// IPv6 clients are keyed by their /64 (one allocation), IPv4 by address.
+		{"IPv6 entry", peer, []string{"1.1.1.1, 2001:db8::1"}, 1, "2001:db8::"},
+		{"IPv6 entry same /64", peer, []string{"2001:db8::ffff:1234:5678:9abc"}, 1, "2001:db8::"},
+		{"IPv6 entry other /64", peer, []string{"2001:db8:0:1::1"}, 1, "2001:db8:0:1::"},
 		{"IPv4-mapped entry", peer, []string{"::ffff:1.2.3.4"}, 1, "1.2.3.4"},
-		{"IPv6 peer", "[2001:db8::9]:443", nil, 1, "2001:db8::9"},
+		{"IPv6 peer", "[2001:db8::9]:443", nil, 1, "2001:db8::"},
+		{"IPv6 peer other /64", "[2001:db8:0:2::9]:443", nil, 1, "2001:db8:0:2::"},
+		{"IPv6 zoned peer", "[fe80::1%eth0]:443", nil, 1, "fe80::"},
 		{"IPv4-mapped peer", "[::ffff:10.0.0.9]:443", nil, 1, "10.0.0.9"},
 		{"bad peer", "garbage", nil, 1, ""},
 	}

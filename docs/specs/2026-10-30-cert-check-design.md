@@ -663,6 +663,7 @@ otherwise).
   `X-Envoy-External-Address`) is confirmed during rollout step 4 and recorded here. The leftmost
   entry is never used. Without any forwarded header (local run) the TCP remote address is used.
   Limits: 20 transaction creations and 60 redeems per minute per IP → 429 with `Retry-After`.
+  IPv6 clients are keyed by their /64 (one allocation), IPv4 clients by address.
   The auth listener caps concurrent connections at 512 (listener-level semaphore; excess
   connections are closed before the handshake) and runs no validation until the state check
   passes. Global validation concurrency: 32; a validation waiting more than 10 s for a slot →
