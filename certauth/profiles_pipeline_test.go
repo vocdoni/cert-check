@@ -37,6 +37,8 @@ const (
 	ppDNI      = "12345679S"
 	ppNIE      = "X1234567L"
 	ppEmail    = "titular@example.test"
+	ppCRLURL   = "http://pki.policia.es/dnie/crls/CRL.crl"
+	ppCRLPath  = "/dnie/arls/CRL.crl"
 	ppARLURL   = "http://pki.policia.es/dnie/crls/ARL.crl"
 	ppARLPath  = "/dnie/arls/ARL.crl"
 )
@@ -288,7 +290,8 @@ func ppShapeNamed(t testing.TB, name string) ppShape {
 
 // ppPKI is DefaultProviders with every anchor replaced by a testpki CA of
 // the same key family and the DNIe intermediates replaced by one testpki
-// intermediate whose CDP points at the ARL.
+// intermediate whose CDP names the root CRL and then the ARL (AC DNIE
+// 005/006 shape).
 type ppPKI struct {
 	now        time.Time
 	providers  []profiles.Provider
@@ -297,6 +300,7 @@ type ppPKI struct {
 	dnieInter  *testpki.CA
 	responders map[*testpki.CA]*testpki.Responder
 	crls       map[*testpki.CA][]byte
+	dnieCRL    []byte // empty root CRL of the DNIe anchor (IDP without scope flags)
 	arl        []byte // good ARL of the DNIe anchor (IDP onlyContainsCACerts)
 }
 
@@ -319,9 +323,11 @@ func newPPPKI(t testing.TB, now time.Time) *ppPKI {
 			prof.Anchors = anchors
 			if prof.ID == "dnie-auth" {
 				p.dnieInter = p.anchors[prof.ID][0].Intermediate(t, "dnie-auth intermediate", testpki.CertSpec{Now: now,
-					KeyPair: tKey(t, "pp-dnie-intermediate", testpki.RSA2048), CDP: []testpki.DistributionPoint{{URIs: []string{ppARLURL}}}})
+					KeyPair: tKey(t, "pp-dnie-intermediate", testpki.RSA2048),
+					CDP:     []testpki.DistributionPoint{{URIs: []string{ppCRLURL}}, {URIs: []string{ppARLURL}}}})
 				prof.Intermediates = []profiles.Anchor{profiles.TestAnchor(p.dnieInter.Cert)}
 				cas = append(cas, p.dnieInter)
+				p.dnieCRL = p.anchors[prof.ID][0].CRL(t, testpki.CRLSpec{Now: now, IDP: &testpki.IDPSpec{URIs: []string{ppCRLURL}}})
 				p.arl = p.anchors[prof.ID][0].CRL(t, testpki.CRLSpec{Now: now, IDP: &testpki.IDPSpec{URIs: []string{ppARLURL}, OnlyCA: true}})
 			}
 			p.profiles[prof.ID] = *prof
@@ -400,7 +406,8 @@ const (
 )
 
 // check serves the shape's revocation endpoints on a fresh fake network and
-// runs the pipeline on [leaf]. arl replaces the DNIe ARL handler when non-nil.
+// runs the pipeline on [leaf]. arl replaces the DNIe ARL handler when non-nil;
+// the DNIe root CRL is always served.
 func (p *ppPKI) check(t *testing.T, reg *profiles.Registry, s ppShape, leaf *x509.Certificate, mode ppMode, arl http.Handler) (*Result, error) {
 	t.Helper()
 	issuer := p.issuer(s)
@@ -439,6 +446,8 @@ func (p *ppPKI) check(t *testing.T, reg *profiles.Registry, s ppShape, leaf *x50
 		if arl == nil {
 			arl = testpki.Bytes("application/pkix-crl", p.arl)
 		}
+		sites.handle(t, ppCRLURL, testpki.Redirect(ppCRLPath))
+		sites.handle(t, ppSiteURL(t, ppCRLURL, ppCRLPath), testpki.Bytes("application/pkix-crl", p.dnieCRL))
 		sites.handle(t, ppARLURL, testpki.Redirect(ppARLPath))
 		sites.handle(t, ppSiteURL(t, ppARLURL, ppARLPath), arl)
 	}

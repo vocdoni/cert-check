@@ -651,12 +651,15 @@ func TestIntermediateRevocation(t *testing.T) {
 				attempts = e.Diagnostics.RevocationAttempts
 			}
 			// The leaf is checked first (OCSP, issuer = the intermediate), then
-			// the intermediate against the ARL (issuer = the anchor).
+			// the intermediate against both of its DPs (issuer = the anchor):
+			// the empty root CRL never settles a CA on its own.
 			if len(attempts) < 2 || attempts[0].Method != revocation.MethodOCSP || attempts[0].Outcome != revocation.StatusGood {
 				t.Fatalf("attempts = %+v, want the leaf OCSP good first", attempts)
 			}
-			if !slices.ContainsFunc(attempts[1:], func(a RevocationAttempt) bool { return a.Method == revocation.MethodCRL && a.URL == ppARLURL }) {
-				t.Errorf("attempts = %+v, want a CRL attempt at %s", attempts, ppARLURL)
+			for _, u := range []string{ppCRLURL, ppARLURL} {
+				if !slices.ContainsFunc(attempts[1:], func(a RevocationAttempt) bool { return a.Method == revocation.MethodCRL && a.URL == u }) {
+					t.Errorf("attempts = %+v, want a CRL attempt at %s", attempts, u)
+				}
 			}
 		})
 	}

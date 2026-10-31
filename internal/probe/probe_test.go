@@ -339,7 +339,7 @@ func TestDefaultTargets(t *testing.T) {
 		"uanataca-citizen-sw":               {4, 4},
 		"signe-personal-otros-dispositivos": {0, 2},
 		"lleidanet-natural-person-sw":       {1, 1},
-		"dnie-auth":                         {3, 1},
+		"dnie-auth":                         {3, 2},
 	}
 	got := map[string]counts{}
 	pinned := map[string][]string{} // profile -> SHA-256 of its anchors and pinned intermediates
@@ -380,14 +380,14 @@ func TestDefaultTargets(t *testing.T) {
 		}
 	}
 
-	// DNIe: OCSP per pinned intermediate, the ARL against the root.
+	// DNIe: OCSP per pinned intermediate, the root CRL and ARL against the root.
 	for _, tg := range targets {
 		if tg.Profile != "dnie-auth" {
 			continue
 		}
 		selfSigned := bytes.Equal(tg.Issuer.RawIssuer, tg.Issuer.RawSubject)
 		if (tg.Kind == KindCRL) != selfSigned {
-			t.Errorf("dnie %s %s: issuer %q self-signed=%v, want the root only for the ARL", tg.Kind, tg.URL, tg.Issuer.Subject, selfSigned)
+			t.Errorf("dnie %s %s: issuer %q self-signed=%v, want the root only for the CRLs", tg.Kind, tg.URL, tg.Issuer.Subject, selfSigned)
 		}
 	}
 }

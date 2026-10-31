@@ -218,13 +218,19 @@ func (c *Checker) fillOCSP(res *Result, ev OCSPEvidence, source string) {
 	}
 }
 
+// checkCRL walks the usable distribution points in certificate order. A
+// leaf is good at the first CRL that covers it and does not list it. A CA
+// certificate (pinned intermediate) is checked against every usable
+// distribution point and is good only when all of them answer good: AC RAIZ
+// DNIE 2 publishes CA revocations in ARL.crl only, while AC DNIE 005/006
+// name the empty, unscoped CRL.crl first.
 func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, p Policy, scope Scope, now time.Time, res *Result) Status {
 	dps, err := ParseCRLDistributionPoints(cert)
 	if err != nil {
 		res.Attempts = append(res.Attempts, Attempt{Method: MethodCRL, Outcome: StatusUnsupportedMethod, Detail: err.Error()})
 		return StatusUnsupportedMethod
 	}
-	last, tried := StatusUnsupportedMethod, false
+	last, tried, good, failed := StatusUnsupportedMethod, false, false, false
 	for _, dp := range usableDistributionPoints(dps, issuer) {
 		for _, gn := range dp.FullName {
 			raw, ok := gn.URI()
@@ -236,16 +242,28 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 				continue
 			}
 			tried = true
-			st := c.crlOnce(ctx, raw, cert, issuer, dp, p, scope, now, res)
-			if st == StatusGood || st == StatusRevoked {
+			switch st := c.crlOnce(ctx, raw, cert, issuer, dp, p, scope, now, res); st {
+			case StatusRevoked:
 				return st
+			case StatusGood:
+				if scope == ScopeLeaf {
+					return st
+				}
+				good = true
+			case StatusUnsupportedMethod:
+				last = worstFailure(last, st)
+			default:
+				failed = true
+				last = worstFailure(last, st)
 			}
-			last = worstFailure(last, st)
 		}
 	}
 	if !tried {
 		res.Attempts = append(res.Attempts, Attempt{Method: MethodCRL, Outcome: StatusUnsupportedMethod, Detail: "no usable allowlisted CDP URL"})
 		return StatusUnsupportedMethod
+	}
+	if good && !failed {
+		return StatusGood
 	}
 	return last
 }

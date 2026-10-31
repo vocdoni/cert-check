@@ -477,6 +477,11 @@ requested CertID.
   `unsupported_method`. FNMT CRLs are partitioned (`CRLU<n>.crl`, sparse numbers) and carry a
   critical IDP naming the partition; only the leaf's CDP names are used and partitions are never
   enumerated.
+- Distribution points are walked in certificate order. A leaf is `good` at the first CRL that
+  covers it and does not list it. A pinned intermediate is checked against every usable
+  allowlisted distribution point and is `good` only when all of them answer `good`; `revoked`
+  from any wins. AC DNIE 005/006 name the empty, unscoped root `CRL.crl` before `ARL.crl`, and
+  AC RAIZ DNIE 2 publishes CA revocations in the ARL only.
 - Issuer: `bytes.Equal(crl.RawIssuer, issuer.RawSubject)` on DER, then
   `crl.CheckSignatureFrom(issuer)`.
 - Criticality: Go's `ParseRevocationList` stores CRL and CRL-entry extensions without enforcing
@@ -1018,7 +1023,7 @@ rejected, never guessed.
 | `uanataca` (beta) | Uanataca | `uanataca-citizen-sw` (C), OID `1.3.6.1.4.1.47286.1.1.1.1` | Older TSL-cited OIDs not enabled. |
 | `signe` (beta) | SIGNE | `signe-personal-otros-dispositivos` (C) | NIE as `PNOES-<NIE>` accepted only for this profile, as documented. |
 | `lleidanet` (beta) | Lleidanet / inDenova | `lleidanet-natural-person-sw` (C) | |
-| `dnie` (beta) | DNIe (requires card reader) | `dnie-auth` (A, plus fixture answers) | Anchor AC RAIZ DNIE 2 with pinned intermediates AC DNIE 004/005/006 (official AIA downloads, verified against the root; source URL and SHA-256 recorded). Policy exactly `2.16.724.1.2.2.2.4`. EKU `AllowAbsent`. RSA ≥ 2048 (1920-bit ROCA re-issues rejected). ID bare DNI only. SN = first surname. Full surnames from CN grammar `<SURNAMES>, <GIVEN> (AUTENTICACIÓN\|AUTENTICACION)`: CN must start with SN, and GN must match. Birth date from SDA `dateOfBirth` (GeneralizedTime) when present, optional. OCSP only, `good` without nextUpdate → 15 min max age. Intermediates' status via the root ARL (cached until its nextUpdate). AC DNIE 00N beyond 006 are not pinned; a DNIe under a newer sub-CA fails `untrusted_issuer`. The AIA list at `http://pki.policia.es/dnie/certs/` is re-checked at every registry update. |
+| `dnie` (beta) | DNIe (requires card reader) | `dnie-auth` (A, plus fixture answers) | Anchor AC RAIZ DNIE 2 with pinned intermediates AC DNIE 004/005/006 (official AIA downloads, verified against the root; source URL and SHA-256 recorded). Policy exactly `2.16.724.1.2.2.2.4`. EKU `AllowAbsent`. RSA ≥ 2048 (1920-bit ROCA re-issues rejected). ID bare DNI only. SN = first surname. Full surnames from CN grammar `<SURNAMES>, <GIVEN> (AUTENTICACIÓN\|AUTENTICACION)`: CN must start with SN, and GN must match. Birth date from SDA `dateOfBirth` (GeneralizedTime) when present, optional. OCSP only, `good` without nextUpdate → 15 min max age. Intermediates' status via the root CRLs: every allowlisted DP (`CRL.crl` and `ARL.crl` for 005/006, `ARL.crl` for 004) must answer good (cached until min(nextUpdate, 1 h)). AC DNIE 00N beyond 006 are not pinned; a DNIe under a newer sub-CA fails `untrusted_issuer`. The AIA list at `http://pki.policia.es/dnie/certs/` is re-checked at every registry update. |
 
 Not enabled, with the reasons recorded in the digests:
 - Izenpe (no citizen software certificate);

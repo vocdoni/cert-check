@@ -777,6 +777,57 @@ func TestCheckCAScope(t *testing.T) {
 			}
 		})
 	}
+
+	// AC DNIE 005/006 shape: the CA names an empty, unscoped CRL first and
+	// the ARL (the only list that carries CA revocations) second. A CA is
+	// never good on the first list alone.
+	const crlURL = "http://crl.test/CRL.crl"
+	twoDP := []struct {
+		name       string
+		arl        func(t *testing.T, f *chkTFixture, cert *x509.Certificate) http.Handler
+		wantStatus Status
+		wantMethod Method
+	}{
+		{
+			name: "ARL listing the CA wins over the empty CRL",
+			arl: func(t *testing.T, f *chkTFixture, cert *x509.Certificate) http.Handler {
+				return f.crl(t, testpki.CRLSpec{
+					IDP:     &testpki.IDPSpec{URIs: []string{arlURL}, OnlyCA: true},
+					Entries: []testpki.CRLEntry{{Serial: cert.SerialNumber, RevokedAt: f.base.Add(-time.Hour), Reason: 1}},
+				})
+			},
+			wantStatus: StatusRevoked, wantMethod: MethodCRL,
+		},
+		{
+			name: "ARL unavailable is never good on the CRL alone",
+			arl: func(*testing.T, *chkTFixture, *x509.Certificate) http.Handler {
+				return chkTStatus(http.StatusServiceUnavailable)
+			},
+			wantStatus: StatusUnavailable,
+		},
+	}
+	for _, tc := range twoDP {
+		t.Run("two DPs: "+tc.name, func(t *testing.T) {
+			f := chkTNewFixture(t)
+			root := f.ca
+			cdp := []testpki.DistributionPoint{{URIs: []string{crlURL}}, {URIs: []string{arlURL}}}
+			cert := root.Intermediate(t, "chkT AC DNIE 005", testpki.CertSpec{Now: f.base, CDP: cdp}).Cert
+			crlHits := f.serve(t, "crl.test", f.crl(t, testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{crlURL}}}))
+			arlHits := f.serve(t, "arl.test", tc.arl(t, f, cert))
+			p := Policy{CRLHosts: []string{"crl.test", "arl.test"}, AllowCRL: true}
+			res := chkTCheck(t, f.checker(t, Options{}), cert, root.Cert, p)
+
+			if res.Status != tc.wantStatus || res.Method != tc.wantMethod {
+				t.Fatalf("Check = %s via %q %s, want %s via %q", res.Status, res.Method, chkTTrace(res.Attempts), tc.wantStatus, tc.wantMethod)
+			}
+			if c, a := crlHits.Load(), arlHits.Load(); c != 1 || a != 1 {
+				t.Errorf("requests: crl.test = %d, arl.test = %d, want 1 each", c, a)
+			}
+			if len(res.Attempts) != 3 || res.Attempts[1].URL != crlURL || res.Attempts[1].Outcome != StatusGood || res.Attempts[2].URL != arlURL {
+				t.Errorf("attempts = %s, want OCSP unsupported, CRL good on %q, then %q", chkTTrace(res.Attempts), crlURL, arlURL)
+			}
+		})
+	}
 }
 
 func TestCheckAttempts(t *testing.T) {

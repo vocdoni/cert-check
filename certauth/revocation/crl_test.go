@@ -529,6 +529,9 @@ func TestRealCRLs(t *testing.T) {
 	}{
 		{"dnie arl", "dnie-arl.crl", "ac-dnie-004.pem", "ac-raiz-dnie-2.pem", "http://pki.policia.es/dnie/crls/ARL.crl", ScopeCA, StatusGood},
 		{"dnie arl for a leaf scope", "dnie-arl.crl", "ac-dnie-004.pem", "ac-raiz-dnie-2.pem", "http://pki.policia.es/dnie/crls/ARL.crl", ScopeLeaf, StatusUnsupportedMethod},
+		// Unscoped IDP, no entries: good for a CA, which is why a CA-scope
+		// check also consults ARL.crl (Checker.checkCRL).
+		{"dnie root crl for a CA", "dnie-crl.crl", "ac-dnie-005.pem", "ac-raiz-dnie-2.pem", "http://pki.policia.es/dnie/crls/CRL.crl", ScopeCA, StatusGood},
 		{"aoc root crl", "aoc-caroot-a.crl", "aoc-subca-ciutadania-g3-a2.pem", "aoc-g3-root-a.pem", "http://epscd.aoc.cat/crl/caroot-a.crl", ScopeCA, StatusGood},
 	}
 	for _, c := range cases {

@@ -69,8 +69,8 @@ func crl(profile, url, issuer string) []endpoint {
 }
 
 // endpoints is the Task 12 URL table: one OCSP row per (responder, issuing
-// CA) and one row per CRL. The DNIe ARL is signed by the root and covers the
-// pinned intermediates.
+// CA) and one row per CRL. The DNIe root CRL and ARL are signed by the root
+// and cover the pinned intermediates (a CA-scope check consults both).
 var endpoints = slices.Concat(
 	ocsp("fnmt-citizen-rsa", "http://ocspusu.cert.fnmt.es/ocspusu/OcspResponder", caFNMTUsuarios),
 	crl("fnmt-citizen-rsa", "http://www.cert.fnmt.es/crlsacusu/CRLU1.crl", caFNMTUsuarios),
@@ -108,6 +108,7 @@ var endpoints = slices.Concat(
 	ocsp("lleidanet-natural-person-sw", "http://ocsp2.esigna.es", caInDenova003),
 	crl("lleidanet-natural-person-sw", "http://crl1.esigna.es/sub/indenova_pki_003.crl", caInDenova003),
 	ocsp("dnie-auth", "http://ocsp.dnie.es", caDNIe004, caDNIe005, caDNIe006),
+	crl("dnie-auth", "http://pki.policia.es/dnie/crls/CRL.crl", caDNIeRoot2),
 	crl("dnie-auth", "http://pki.policia.es/dnie/crls/ARL.crl", caDNIeRoot2),
 )
 
