@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -18,6 +19,7 @@ import (
 	"github.com/vocdoni/cert-check/certauth/revocation"
 	"github.com/vocdoni/cert-check/internal/acme"
 	"github.com/vocdoni/cert-check/internal/config"
+	"github.com/vocdoni/cert-check/internal/probe"
 	"github.com/vocdoni/cert-check/internal/server"
 )
 
@@ -25,10 +27,55 @@ import (
 var version = "dev"
 
 func main() {
-	if err := run(os.Getenv); err != nil {
-		fmt.Fprintln(os.Stderr, "cert-check:", err)
-		os.Exit(1)
+	os.Exit(dispatch(os.Args[1:], os.Getenv, runProbe, os.Stdout, os.Stderr))
+}
+
+// probeFunc runs the revocation probe, adding the live specimens found in
+// specimenDirs, and writes the report to w.
+type probeFunc func(ctx context.Context, specimenDirs []string, w io.Writer) (probe.Summary, error)
+
+// dispatch runs `cert-check probe [specimen-dir...]` (exit 1 on any FAIL
+// line) or, with any other arguments, the service. It returns the exit status.
+func dispatch(args []string, getenv func(string) string, probeRun probeFunc, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "probe" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		sum, err := probeRun(ctx, args[1:], stdout)
+		if err != nil {
+			fmt.Fprintln(stderr, "cert-check probe:", err)
+			return 1
+		}
+		if sum.Failed() {
+			return 1
+		}
+		return 0
 	}
+	if err := run(getenv); err != nil {
+		fmt.Fprintln(stderr, "cert-check:", err)
+		return 1
+	}
+	return 0
+}
+
+// runProbe probes probe.DefaultTargets from this host's network with the
+// production fetcher (no server, no configuration).
+func runProbe(ctx context.Context, specimenDirs []string, w io.Writer) (probe.Summary, error) {
+	targets, err := probe.DefaultTargets()
+	if err != nil {
+		return probe.Summary{}, err
+	}
+	for _, dir := range specimenDirs {
+		sp, err := probe.LoadSpecimens(os.DirFS(dir))
+		if err != nil {
+			return probe.Summary{}, err
+		}
+		targets = append(targets, sp...)
+	}
+	rc, err := revocation.NewChecker(revocation.Options{UserAgent: "cert-check/" + version})
+	if err != nil {
+		return probe.Summary{}, err
+	}
+	return probe.Run(ctx, rc, targets, time.Now(), w)
 }
 
 // run wires and serves the service until SIGINT/SIGTERM.
