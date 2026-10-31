@@ -163,6 +163,42 @@ func FuzzParseDateOfBirth(f *testing.F) {
 	})
 }
 
+func FuzzDateUnmarshalJSON(f *testing.F) {
+	for _, s := range []string{`"1985-07-23"`, `"0987-03-04"`, `"2000-02-29"`, `"1999-02-29"`, `null`, `"2000-2-29"`, `20000229`, `"\u0032000-01-01"`} {
+		f.Add([]byte(s))
+	}
+	f.Fuzz(func(t *testing.T, in []byte) {
+		var d identity.Date
+		if err := d.UnmarshalJSON(in); err != nil {
+			if !errors.Is(err, identity.ErrInvalid) {
+				t.Fatalf("UnmarshalJSON(%q) err = %v, want ErrInvalid", in, err)
+			}
+			if d != (identity.Date{}) {
+				t.Fatalf("UnmarshalJSON(%q) failed but set %v", in, d)
+			}
+			return
+		}
+		if string(in) == "null" {
+			if d != (identity.Date{}) {
+				t.Fatalf("UnmarshalJSON(null) set %v", d)
+			}
+			return
+		}
+		civil := time.Date(d.Year, d.Month, d.Day, 0, 0, 0, 0, time.UTC)
+		if civil.Year() != d.Year || civil.Month() != d.Month || civil.Day() != d.Day || d.Year < 0 || d.Year > 9999 {
+			t.Fatalf("UnmarshalJSON(%q) = %v, not a valid civil date", in, d)
+		}
+		out, err := d.MarshalJSON()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var again identity.Date
+		if err := again.UnmarshalJSON(out); err != nil || again != d {
+			t.Fatalf("round trip of %q: %s -> (%v, %v), want %v", in, out, again, err, d)
+		}
+	})
+}
+
 func FuzzParseDocument(f *testing.F) {
 	ruleSets := [][]identity.DocumentRule{bothRules, idcesRules, bareRules, signeRules, pnoesNIERules, bareDNIRules}
 	for _, tc := range parseDocumentCases() {

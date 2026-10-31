@@ -291,6 +291,53 @@ func TestDateOfBirth(t *testing.T) {
 	})
 }
 
+func TestDateUnmarshalJSON(t *testing.T) {
+	type doc struct {
+		D  identity.Date  `json:"d"`
+		P  *identity.Date `json:"p"`
+		NP *identity.Date `json:"np"`
+	}
+	t.Run("round trip", func(t *testing.T) {
+		in := doc{D: identity.Date{Year: 987, Month: time.March, Day: 4}, P: &identity.Date{Year: 2000, Month: time.February, Day: 29}}
+		b, err := json.Marshal(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got doc
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("Unmarshal(%s) error = %v", b, err)
+		}
+		if got.D != in.D || got.P == nil || *got.P != *in.P || got.NP != nil {
+			t.Errorf("Unmarshal(%s) = %+v (p %v), want %+v (p %v, np nil)", b, got, got.P, in, *in.P)
+		}
+	})
+	t.Run("null leaves the date unset", func(t *testing.T) {
+		got := doc{D: identity.Date{Year: 1980, Month: time.January, Day: 1}, P: &identity.Date{Year: 1980, Month: time.January, Day: 1}}
+		if err := json.Unmarshal([]byte(`{"d":null,"p":null}`), &got); err != nil {
+			t.Fatalf("Unmarshal error = %v", err)
+		}
+		if got.D != (identity.Date{Year: 1980, Month: time.January, Day: 1}) || got.P != nil {
+			t.Errorf("after null: d = %v, p = %v; want d unchanged and p nil", got.D, got.P)
+		}
+	})
+	for _, in := range []string{
+		`"2000-2-29"`, `"2000-02-30"`, `"1999-02-29"`, `"2000-13-01"`, `"2000-00-10"`, `"20000229"`,
+		`"2000-02-29T00:00:00Z"`, `" 2000-02-29"`, `"2000-02-29 "`, `"+2000-02-29"`, `"02000-02-29"`, `""`,
+		`20000229`, `true`, `{}`, `["2000-02-29"]`,
+	} {
+		t.Run("reject "+in, func(t *testing.T) {
+			var d identity.Date
+			err := json.Unmarshal([]byte(in), &d)
+			if err == nil {
+				t.Fatalf("Unmarshal(%s) = %v, want an error", in, d)
+			}
+			if d != (identity.Date{}) {
+				t.Errorf("Unmarshal(%s) left %v, want the zero date", in, d)
+			}
+		})
+	}
+}
+
 func TestNormalizeName(t *testing.T) {
 	tests := []struct {
 		in, want string

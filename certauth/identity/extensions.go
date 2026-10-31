@@ -3,6 +3,7 @@ package identity
 import (
 	"crypto/x509"
 	"encoding/asn1"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -73,6 +74,25 @@ func (d Date) String() string { return fmt.Sprintf("%04d-%02d-%02d", d.Year, int
 
 // MarshalJSON encodes the date as "YYYY-MM-DD".
 func (d Date) MarshalJSON() ([]byte, error) { return []byte(`"` + d.String() + `"`), nil }
+
+// UnmarshalJSON decodes a "YYYY-MM-DD" string holding a valid civil date;
+// any other form is an ErrInvalid error. null leaves d unchanged (a *Date
+// field becomes nil), as encoding/json does for its own types.
+func (d *Date) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return invalidf("date: not a JSON string")
+	}
+	t, err := time.Parse(time.DateOnly, s)
+	if err != nil {
+		return invalidf("date: %q is not YYYY-MM-DD", s)
+	}
+	*d = Date{Year: t.Year(), Month: t.Month(), Day: t.Day()}
+	return nil
+}
 
 // DateOfBirth reads SubjectDirectoryAttributes dateOfBirth. found is false
 // when the extension or the attribute is absent. The value must be exactly one

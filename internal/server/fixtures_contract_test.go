@@ -9,7 +9,6 @@ import (
 	"slices"
 	"strconv"
 	"testing"
-	"time"
 
 	"github.com/vocdoni/cert-check/certauth/identity"
 )
@@ -17,33 +16,35 @@ import (
 // fixturesDir holds the UI's redeem fixtures (Task 11, ruling R38).
 const fixturesDir = "../../web/testdata/fixtures"
 
-// decodeFixture strictly decodes a redeem fixture into redeemResponse.
-// identity.Date has MarshalJSON only, so a non-null birthDate cannot be
-// decoded into certauth.Result: it is checked against what Date.MarshalJSON
-// writes, then nulled for the strict decode.
+// decodeFixture strictly decodes a redeem fixture into redeemResponse. A
+// non-null birthDate decodes into identity.Date and must re-encode to the
+// same string.
 func decodeFixture(t *testing.T, raw []byte) redeemResponse {
 	t.Helper()
 	var generic map[string]any
 	if err := json.Unmarshal(raw, &generic); err != nil {
 		t.Fatalf("fixture is not JSON: %v", err)
 	}
+	got := decodeRedeem(t, raw)
 	result, _ := generic["result"].(map[string]any)
 	ident, _ := result["identity"].(map[string]any)
-	if bd, ok := ident["birthDate"].(string); ok {
-		d, err := time.Parse(time.DateOnly, bd)
-		if err != nil {
-			t.Fatalf("birthDate %q: %v", bd, err)
-		}
-		marshalled, err := identity.Date{Year: d.Year(), Month: d.Month(), Day: d.Day()}.MarshalJSON()
-		if err != nil || string(marshalled) != strconv.Quote(bd) {
-			t.Errorf("birthDate %q, want the identity.Date encoding %s", bd, marshalled)
-		}
-		ident["birthDate"] = nil
-		if raw, err = json.Marshal(generic); err != nil {
-			t.Fatalf("re-encode fixture: %v", err)
-		}
+	bd, isString := ident["birthDate"].(string)
+	var decoded *identity.Date
+	if got.Result != nil {
+		decoded = got.Result.Identity.BirthDate
 	}
-	return decodeRedeem(t, raw)
+	switch {
+	case isString && decoded == nil:
+		t.Errorf("birthDate %q decoded to nil", bd)
+	case isString:
+		marshalled, err := decoded.MarshalJSON()
+		if err != nil || string(marshalled) != strconv.Quote(bd) {
+			t.Errorf("birthDate %q decoded to %v, re-encoded %s (%v)", bd, *decoded, marshalled, err)
+		}
+	case decoded != nil:
+		t.Errorf("birthDate %v decoded from a fixture without a birthDate string", *decoded)
+	}
+	return got
 }
 
 // keyPaths returns every object key path of a JSON document ("[]" stands
