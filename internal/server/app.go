@@ -105,16 +105,18 @@ func (a *App) MainHandler() http.Handler {
 }
 
 // newMainServer returns the main http.Server with the spec timeouts; its
-// ErrorLog goes to slog at warn.
+// ErrorLog goes to slog at warn. "OPTIONS *" reaches h, so it carries the
+// security headers.
 func newMainServer(h http.Handler, log *slog.Logger) *http.Server {
 	return &http.Server{
-		Handler:           h,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    16 << 10,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		Handler:                      h,
+		DisableGeneralOptionsHandler: true,
+		ReadHeaderTimeout:            10 * time.Second,
+		ReadTimeout:                  15 * time.Second,
+		WriteTimeout:                 30 * time.Second,
+		IdleTimeout:                  60 * time.Second,
+		MaxHeaderBytes:               16 << 10,
+		ErrorLog:                     slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
 }
 

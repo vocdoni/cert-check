@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -411,6 +412,25 @@ func authGet(t *testing.T, c *http.Client, rawURL, host string) (*http.Response,
 }
 
 var e2eHex32 = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// rawOptionsAsterisk sends "OPTIONS * HTTP/1.1" on conn (an http.Client
+// cannot) and returns the response with its body; conn is closed.
+func rawOptionsAsterisk(t *testing.T, conn net.Conn, host string) (*http.Response, []byte) {
+	t.Helper()
+	defer func() { _ = conn.Close() }() // the response is fully read below
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	if _, err := io.WriteString(conn, "OPTIONS * HTTP/1.1\r\nHost: "+host+"\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatalf("write OPTIONS *: %v", err)
+	}
+	req := &http.Request{Method: http.MethodOptions, URL: &url.URL{Path: "*"}, Host: host}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		t.Fatalf("read OPTIONS * response: %v", err)
+	}
+	return resp, readBody(t, resp)
+}
 
 // checkAuthResponse asserts the status, the auth-listener headers and an
 // empty body (ruling R37).
@@ -890,6 +910,23 @@ func TestE2ESecurityHeaders(t *testing.T) {
 	authCheck("auth 404", resp, body, http.StatusNotFound)
 	resp, body = authGet(t, c, authURL, net.JoinHostPort(e2eBetaHost, w.authPort))
 	authCheck("auth 421", resp, body, http.StatusMisdirectedRequest)
+
+	// OPTIONS * is answered by net/http itself unless the server disables
+	// its general OPTIONS handler; then it reaches the listener's handler.
+	mainConn, err := net.DialTimeout("tcp", w.mainAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial main: %v", err)
+	}
+	resp, body = rawOptionsAsterisk(t, mainConn, w.mainAddr)
+	checks = append(checks, check{name: "OPTIONS * main", resp: resp, body: body, status: http.StatusBadRequest})
+	authConn, err := tls.DialWithDialer(&net.Dialer{Timeout: 5 * time.Second}, "tcp", w.authAddr, &tls.Config{
+		ServerName: e2eAlphaHost, RootCAs: w.pool, NextProtos: []string{"http/1.1"}, Certificates: []tls.Certificate{w.pki.leafTLS},
+	})
+	if err != nil {
+		t.Fatalf("dial auth: %v", err)
+	}
+	resp, body = rawOptionsAsterisk(t, authConn, net.JoinHostPort(e2eAlphaHost, w.authPort))
+	authCheck("OPTIONS * auth", resp, body, http.StatusNotFound)
 
 	for _, ch := range checks {
 		t.Run(ch.name, func(t *testing.T) {

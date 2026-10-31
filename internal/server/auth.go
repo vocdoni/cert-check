@@ -166,15 +166,18 @@ func (c *limitConn) Close() error {
 // newAuthServer returns the auth http.Server: HTTP/1.1 only (empty
 // TLSNextProto) and the spec timeouts. Its ErrorLog (TLS handshake errors,
 // mostly scanners on a public port) goes to slog at debug (ruling R61).
+// "OPTIONS *" reaches h (404 with the auth headers) instead of net/http's
+// header-less 200.
 func newAuthServer(h http.Handler, log *slog.Logger) *http.Server {
 	return &http.Server{
-		Handler:           h,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    16 << 10,
-		TLSNextProto:      map[string]func(*http.Server, *tls.Conn, http.Handler){},
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelDebug),
+		Handler:                      h,
+		DisableGeneralOptionsHandler: true,
+		ReadHeaderTimeout:            10 * time.Second,
+		ReadTimeout:                  30 * time.Second,
+		WriteTimeout:                 60 * time.Second,
+		IdleTimeout:                  30 * time.Second,
+		MaxHeaderBytes:               16 << 10,
+		TLSNextProto:                 map[string]func(*http.Server, *tls.Conn, http.Handler){},
+		ErrorLog:                     slog.NewLogLogger(log.Handler(), slog.LevelDebug),
 	}
 }
