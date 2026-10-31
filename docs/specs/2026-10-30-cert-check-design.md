@@ -761,8 +761,9 @@ is logged.
 
 ### Observability and privacy
 
-- `log/slog` JSON. Log lines carry request id, provider, profile id, outcome code and revocation
-  method/latency.
+- `log/slog` JSON. Log lines carry the diagnostic ID, provider, profile id, outcome code and
+  revocation method/latency. The diagnostic ID is the request id; no separate request-id
+  attribute (ruling R49).
 - **Never logged:** DNI/NIE, names, birth date, subject DN, certificate bytes or fingerprint,
   state, code or cookie values.
 - The diagnostic ID links the user's copied report to the server log line.

@@ -48,6 +48,12 @@ Providers: 6 verified (FNMT, idCAT, ACCV, DIGITEL, Bewor, Sectigo) and 8 beta (F
 public employee, Firmaprofesional, ANF, Uanataca, SIGNE, Lleidanet, DNIe). `GET /api/v1/providers`
 lists what the running registry enables.
 
+Two beta providers have revocation quirks. Lleidanet is CRL-only: the certificate of its OCSP
+responder (`ocsp2.esigna.es`) lacks id-pkix-ocsp-nocheck, so its answers are never acceptable, and the
+OCSP URL in the leaves is ignored. SIGNE is CRL-only too, and its `signe-subca.crl` answers 302 from
+`http://www.signe.es` to `https://crl.firmaprofesional.com`, which is allowlisted for SIGNE. The fetcher
+follows that `http`→`https` upgrade but never an `https`→`http` downgrade.
+
 ## 2. Local run with a static certificate
 
 Locally there is no ACME: give the auth listener a static wildcard certificate for
@@ -292,15 +298,36 @@ responder outage.
 
 ### Revocation reachability probe
 
-`cert-check probe` checks every default OCSP responder and CRL endpoint from the network the service
-runs in. It needs no configuration and starts no server. For each profile it asks the responder about
-a never-issued serial, parses the CRLs against the pinned anchors and checks their freshness window,
-and, for targets that carry a specimen certificate, runs the full check on it. It prints one line per endpoint
-(profile, method, host and path, HTTP status, milliseconds, outcome, responder subject, nonce echoed,
-`thisUpdate` and `nextUpdate`) and exits non-zero on any FAIL. `invalid_evidence` and `stale` are
-FAIL, `unavailable` is WARN.
+`cert-check probe [specimen-dir...]` checks every default OCSP responder and CRL endpoint from the
+network it runs in. It needs no configuration and starts no server. For each enabled profile it asks
+each responder about a never-issued serial (a nonce is always sent), and it fetches each CRL and checks
+its signature against the pinned CA and its freshness window. For DNIe that means the root's
+`CRL.crl` and `ARL.crl`, which together cover the pinned intermediates. Each `specimen-dir` argument
+is a directory of `*.pem` files. The known live specimens found there get the full revocation check and
+must come back `good`; other certificates are ignored. The DIGITEL specimen is committed in
+`certauth/testdata/specimens`. The Bewor and Sectigo specimens are withheld and kept outside the
+repository.
 
-Run it from the deployment network with a temporary service in the same project and repository:
+It prints one line per target: verdict, profile, method, host and path, HTTP status, milliseconds,
+outcome, responder or CRL issuer subject, nonce state, `thisUpdate` and `nextUpdate` (CRLs also print
+`bytes`), and a detail. The nonce state is `required/…` when the profile demands the echo and
+`optional/…` otherwise, followed by `echoed`, `absent` or `mismatch`. The last line is
+`summary: N ok, N warn, N fail`.
+
+- **OK**: evidence the checker accepts. Any certStatus for the random serial counts, as does a fresh,
+  correctly signed CRL or a specimen that comes back `good`.
+- **WARN**: `unavailable`. The endpoint could not be reached, or it answered with an HTTP error or a
+  non-successful OCSP `responseStatus`. The idCAT G3, Sectigo and Firmaprofesional responders answer
+  `responseStatus 6` (unauthorized) for a never-issued serial, so their lines are WARN by design.
+- **FAIL**: any other outcome. That is evidence the checker would reject (`invalid_evidence`,
+  `stale`, `unsupported_method`), or a specimen that comes back `revoked` or `unknown`.
+
+Exit codes: `0` when no line is FAIL. `1` when any line is FAIL, or when the probe cannot run (a
+specimen directory that cannot be read, a `*.pem` file without a certificate, an interrupted run); the
+reason goes to stderr.
+
+Run it from the deployment network with a temporary service in the same project and repository. The
+image carries no specimens, so this run covers the endpoints only:
 
 ```sh
 # create service "cert-check-probe" from the repository, then:
@@ -310,8 +337,32 @@ railway logs --service cert-check-probe       # read the report
 railway service delete --service cert-check-probe --environment production --yes
 ```
 
-A FAIL line blocks go-live. A WARN line is noted. From a workstation, `go run ./cmd/cert-check probe`
-shows reachability from that network only.
+A FAIL line blocks go-live. A WARN line is noted. From a workstation,
+`go run ./cmd/cert-check probe certauth/testdata/specimens ~/.cache/cert-check/live/specimens` shows
+reachability from that network only, with the specimens included.
+
+### Live tests
+
+Three tests sit behind the `live` build tag. They use the real network and inputs kept outside the
+repository:
+
+```sh
+CERTCHECK_LIVE_BEWOR_CERT=$HOME/.cache/cert-check/live/bewor/cert.pem \
+CERTCHECK_LIVE_BEWOR_KEY=$HOME/.cache/cert-check/live/bewor/key.pem \
+CERTCHECK_LIVE_SPECIMENS_DIR=$HOME/.cache/cert-check/live/specimens \
+go test -tags live -race -count=1 -run 'Live|Withheld' ./...
+```
+
+- `TestLiveBeworCredential` (`internal/server`) authenticates over loopback mTLS with the official
+  Bewor test credential: the published P12 converted to PEM certificate and key files. It runs
+  against the production providers and live OCSP. With the test markers emptied the result is
+  success; with the production registry it is `test_certificate`.
+- `TestLiveProbe` (`internal/probe`) runs the probe above, with the committed DIGITEL specimen and the
+  withheld Bewor and Sectigo specimens from `CERTCHECK_LIVE_SPECIMENS_DIR`. It fails on any FAIL line.
+- `TestWithheldSpecimensRejectedTwice` (`certauth`) checks that the withheld specimens are rejected
+  with the codes in `certauth/testdata/specimens/MANIFEST.md`.
+
+A missing variable fails the test; it never skips. Without `-tags live` none of these tests are built.
 
 ### Chrome restricted ports
 
