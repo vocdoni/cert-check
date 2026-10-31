@@ -1,1 +1,61 @@
-<!doctype html><title>Certificate Authentication Checker</title>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Certificate Authentication Checker</title>
+<link rel="icon" href="/favicon.ico">
+<link rel="stylesheet" href="/styles.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="site-header">
+  <img class="logo" src="/img/vocdoni-logo.svg" alt="Vocdoni" width="158" height="34">
+</header>
+<main id="main" class="page">
+  <noscript><p class="panel">This page needs JavaScript to check a certificate.</p></noscript>
+  <p id="status" class="sr-only" role="status" aria-live="polite"></p>
+
+  <section id="view-start" class="panel" hidden>
+    <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>Certificate check</p>
+    <h1 id="start-heading" tabindex="-1">Certificate Authentication Checker</h1>
+    <p class="lede">Check that your Spanish personal certificate works in this browser and see the identity data it carries.</p>
+    <div class="field">
+      <label for="provider">Certificate provider</label>
+      <div class="select-wrap"><select id="provider" aria-describedby="provider-hint" disabled></select></div>
+    </div>
+    <p id="provider-hint" class="hint" hidden>Requires a card reader and the DNIe software already working in this browser.</p>
+    <p id="start-message" class="message" hidden></p>
+    <button id="authenticate" class="pill primary" type="button" disabled>Authenticate</button>
+    <p class="note">Your browser will ask you to choose a certificate. Nothing is uploaded and your private key never leaves your device.</p>
+  </section>
+
+  <section id="view-working" class="panel" hidden>
+    <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>Certificate check</p>
+    <h1 id="working-heading" tabindex="-1"><span class="spinner" aria-hidden="true"></span><span id="working-text">Preparing…</span></h1>
+  </section>
+
+  <section id="view-success" class="panel" hidden>
+    <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>Result</p>
+    <h1 id="success-heading" tabindex="-1">Success</h1>
+    <p class="lede">Your certificate was accepted. This is the identity data it carries.</p>
+    <dl id="result-list" class="result-list"></dl>
+    <button id="again" class="pill" type="button">Check another certificate</button>
+  </section>
+
+  <section id="view-error" class="panel" hidden>
+    <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span>Problem</p>
+    <h1 id="error-heading" tabindex="-1">We could not authenticate this certificate</h1>
+    <p id="error-message" class="lede"></p>
+    <ul id="error-guidance" class="guidance"></ul>
+    <details id="tech"><summary>Technical details</summary><pre id="report" tabindex="0"></pre></details>
+    <div class="actions">
+      <button id="copy-report" class="pill" type="button">Copy diagnostic report</button>
+      <span id="copy-feedback" class="hint"></span>
+    </div>
+    <p class="notice">This report contains your certificate details (name and ID number). Share it only with Vocdoni support.</p>
+    <button id="retry" class="pill primary" type="button">Start again</button>
+  </section>
+</main>
+</body>
+</html>

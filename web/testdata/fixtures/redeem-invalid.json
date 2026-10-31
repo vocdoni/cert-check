@@ -1,0 +1,22 @@
+{
+  "status": "error",
+  "error": {
+    "code": "invalid_or_expired",
+    "message": "This authentication link is no longer valid. Please start again.",
+    "retryable": false
+  },
+  "diagnostics": {
+    "diagnosticId": "0f3d8b6a2c914e70a5d1b4e8c6937f20",
+    "time": "2026-10-31T09:18:30Z",
+    "serverVersion": "v0.1.0",
+    "provider": "",
+    "failedStep": "",
+    "code": "invalid_or_expired",
+    "technicalDetail": "code_unknown_or_expired",
+    "tls": null,
+    "certificate": null,
+    "chain": null,
+    "profileCandidates": null,
+    "revocationAttempts": null
+  }
+}
