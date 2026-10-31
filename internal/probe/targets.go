@@ -105,7 +105,6 @@ var endpoints = slices.Concat(
 	crl("uanataca-citizen-sw", "http://crl1.uanataca.com/public/pki/crl/2021CA2sub.crl", caUanatacaCA2v2021),
 	crl("signe-personal-otros-dispositivos", "http://www.signe.es/signe-ac/crl/signe-subca.crl", caSIGNESubCA2024),
 	crl("signe-personal-otros-dispositivos", "https://www.signe.es/signe-ac/crl/signe2020.crl", caSIGNE2020),
-	ocsp("lleidanet-natural-person-sw", "http://ocsp2.esigna.es", caInDenova003),
 	crl("lleidanet-natural-person-sw", "http://crl1.esigna.es/sub/indenova_pki_003.crl", caInDenova003),
 	ocsp("dnie-auth", "http://ocsp.dnie.es", caDNIe004, caDNIe005, caDNIe006),
 	crl("dnie-auth", "http://pki.policia.es/dnie/crls/CRL.crl", caDNIeRoot2),

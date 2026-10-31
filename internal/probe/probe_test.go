@@ -338,7 +338,7 @@ func TestDefaultTargets(t *testing.T) {
 		"anf-asociacion-class2-sw":     {1, 0}, "anf-sl-class2-sw": {1, 0},
 		"uanataca-citizen-sw":               {4, 4},
 		"signe-personal-otros-dispositivos": {0, 2},
-		"lleidanet-natural-person-sw":       {1, 1},
+		"lleidanet-natural-person-sw":       {0, 1},
 		"dnie-auth":                         {3, 2},
 	}
 	got := map[string]counts{}

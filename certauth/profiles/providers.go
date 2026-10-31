@@ -136,7 +136,6 @@ func idcat() Provider {
 		TestMarker{Subject: []AttributeMatch{{OID: identity.OIDGivenName, Value: "NOMDOS"}, {OID: identity.OIDSurname, Value: "ESPECIMENDOS ESPECIMENDOS"}},
 			Source: "AOC DPC v7.4 §1.1.3 production test certificate"},
 	)
-	p3.Algorithms = AlgPolicy{MinRSABits: 3072} // DPC v7.4 §6.1.5
 	return Provider{ID: "idcat", Name: "idCAT Certificat", Description: "Certificat idCAT del Consorci AOC",
 		Profiles: []Profile{p2, p3}}
 }
@@ -155,7 +154,6 @@ func accv() Provider {
 		},
 		[]string{"1.3.6.1.4.1.8149.3.7.8.0"}, a,
 		policy(true, []string{"ocsp.accv.es"}, []string{"www.accv.es"}))
-	p.Algorithms = AlgPolicy{MinRSABits: 3072} // CP-07 v8.0.4 §6.1.5
 	return Provider{ID: "accv", Name: "ACCV - Ciudadano (software)",
 		Description: "Certificado cualificado de Ciudadano en soporte software de la ACCV", Profiles: []Profile{p}}
 }
@@ -200,24 +198,26 @@ func sectigo() Provider {
 		)}}
 }
 
-// fnmtRepresentative (beta): digest A, three roles per CA generation.
+// fnmtRepresentative (beta): digest A, three roles per CA generation. The
+// responders echo the OCSP nonce (live probe, R65).
 func fnmtRepresentative() Provider {
 	a := identity.Adapter{Documents: idces, Surnames: identity.SurnamesFromSN, SAN: fnmtSAN(idces),
 		BirthDate: identity.BirthDateNone, Organization: identity.OrganizationFromSubject}
 	rsa := person("fnmt-representative-rsa", "fnmt-representative", "FNMT Representante (AC Representación)",
 		[]Anchor{anchor("8fd16a179944d5d1d420af09405eda7abf2a9c742883e8c2f89e0d90afaf754b", "da576c79f49f91353b1865dfcf889888f9ce50391b2a261d51a3c677676ef044")},
 		[]string{"1.3.6.1.4.1.5734.3.11.1", "1.3.6.1.4.1.5734.3.11.2", "1.3.6.1.4.1.5734.3.11.3"}, a,
-		policy(false, []string{"ocsprep.cert.fnmt.es"}, []string{"www.cert.fnmt.es"}))
+		policy(true, []string{"ocsprep.cert.fnmt.es"}, []string{"www.cert.fnmt.es"}))
 	g2 := person("fnmt-representative-g2", "fnmt-representative", "FNMT Representante (AC REPRESENTACIÓN G2)",
 		[]Anchor{anchor("0df2883b6074d5b7d7940b69ca658a3a9a747a8e171f653ad4ce0230087d9d64", "66f3f2da778bf26070b42bc7accd97d9f188d25a15f1e2575603042618c13502")},
 		[]string{"1.3.6.1.4.1.5734.3.21.1.0", "1.3.6.1.4.1.5734.3.21.2.0", "1.3.6.1.4.1.5734.3.21.3.0"}, a,
-		policy(false, []string{"ocsprepg2.cert.fnmt.es"}, []string{"www.cert.fnmt.es"}))
+		policy(true, []string{"ocsprepg2.cert.fnmt.es"}, []string{"www.cert.fnmt.es"}))
 	rsa.HolderRole, g2.HolderRole = RoleRepresentative, RoleRepresentative
 	return Provider{ID: "fnmt-representative", Name: "FNMT - Representante", Beta: true,
 		Description: "Certificado de Representante de la FNMT-RCM", Profiles: []Profile{rsa, g2}}
 }
 
-// fnmtEmployee (beta): digest A, software lanes only (17.2 and 23.1.0).
+// fnmtEmployee (beta): digest A, software lanes only (17.2 and 23.1.0). The
+// responders echo the OCSP nonce (live probe, R65).
 func fnmtEmployee() Provider {
 	n := func(i int) asn1.ObjectIdentifier { return oid(2, 16, 724, 1, 3, 5, 7, 2, i) }
 	a := identity.Adapter{Documents: idces, Surnames: identity.SurnamesFromSN,
@@ -226,11 +226,11 @@ func fnmtEmployee() Provider {
 	rsa := person("fnmt-employee-rsa", "fnmt-employee", "FNMT Empleado Público (AC Sector Público)",
 		[]Anchor{anchor("8265756dd5cd8a37ee61e40351288e4b16a89dd248c1ec4eba25aaf161abf498", "68de305107cbd1889d7a9b039fdca503c1a88ad1f45d1752df8f50c72969d915")},
 		[]string{"1.3.6.1.4.1.5734.3.17.2"}, a,
-		policy(false, []string{"ocspsp.cert.fnmt.es"}, []string{"www.cert.fnmt.es"}))
+		policy(true, []string{"ocspsp.cert.fnmt.es"}, []string{"www.cert.fnmt.es"}))
 	g2 := person("fnmt-employee-g2", "fnmt-employee", "FNMT Empleado Público (AC SECTOR PÚBLICO G2)",
 		[]Anchor{anchor("983329b00c3052d7eccd46bf2cf3e29d05ae93d1aa146bd5078c3726ae8271fe", "a1e3f004222a51998b97853b50fdbfbe9b3f932c3bd0b85737663bd19b33a906")},
 		[]string{"1.3.6.1.4.1.5734.3.23.1.0"}, a,
-		policy(false, []string{"ocspspg2.cert.fnmt.es"}, []string{"www.cert.fnmt.es"}))
+		policy(true, []string{"ocspspg2.cert.fnmt.es"}, []string{"www.cert.fnmt.es"}))
 	rsa.HolderRole, g2.HolderRole = RolePublicEmployee, RolePublicEmployee
 	return Provider{ID: "fnmt-employee", Name: "FNMT - Empleado Público", Beta: true,
 		Description: "Certificado de Empleado Público de la FNMT-RCM (software)", Profiles: []Profile{rsa, g2}}
@@ -251,21 +251,23 @@ func firmaprofesional() Provider {
 			policy(false, []string{"ocsp.firmaprofesional.com"}, []string{"crl.firmaprofesional.com"}))}}
 }
 
-// anf (beta): digest C, two legal providers, one anchor each; private SAN ignored.
+// anf (beta): digest C, two legal providers, one anchor each; private SAN
+// ignored. The responder echoes the OCSP nonce (live probe, R65).
 func anf() Provider {
 	asoc := person("anf-asociacion-class2-sw", "anf", "ANF AC Clase 2 Persona Física (Asociación)",
 		[]Anchor{anchor("b7cdf23a73a2da1b515a64403e90a3b90c45ddfbb2558bc1c12fb9bcfa2e5a23", "d1b4c6d6b4f387bd50f89359a11c3a07673effb796cbcecfd32219594362988c")},
 		[]string{"1.3.6.1.4.1.18332.3.4.1.2.22"}, plain(),
-		policy(false, []string{"ocsp.anf.es"}, []string{"crl.anf.es"}))
+		policy(true, []string{"ocsp.anf.es"}, []string{"crl.anf.es"}))
 	sl := person("anf-sl-class2-sw", "anf", "ANF Clase 2 Persona Física (S.L.)",
 		[]Anchor{anchor("5999789a17df8674d098db057df8ed3764e96529d4a0eb56246de3c46fb0e28a", "9992ddc44e5b001f31044fd4723e424e3e2509799b084211f660d321a2fea436")},
 		[]string{"1.3.6.1.4.1.49201.3.4.1.2.22"}, plain(),
-		policy(false, []string{"ocsp.anf.es"}, []string{"crl.anf.es"}))
+		policy(true, []string{"ocsp.anf.es"}, []string{"crl.anf.es"}))
 	return Provider{ID: "anf", Name: "ANF AC", Beta: true,
 		Description: "Certificado de Clase 2 de Persona Física (software)", Profiles: []Profile{asoc, sl}}
 }
 
-// uanataca (beta): digest C uanataca-citizen-sw, four issuing CAs.
+// uanataca (beta): digest C uanataca-citizen-sw, four issuing CAs. The
+// responders echo the OCSP nonce (live probe, R65).
 func uanataca() Provider {
 	return Provider{ID: "uanataca", Name: "Uanataca", Beta: true,
 		Description: "Certificado cualificado de Persona Física Ciudadano en software",
@@ -277,10 +279,11 @@ func uanataca() Provider {
 				anchor("15ceab339144d48d352eef1c227f4d2ef4fc1756dead602c22be32d52100e69a", "5f78b32f4a4770c8676ac81b467005ce22dde8f2613c5acca3612bcf6029a9b6"),
 			},
 			[]string{"1.3.6.1.4.1.47286.1.1.1.1"}, plain(),
-			policy(false, []string{"ocsp1.uanataca.com", "ocsp2.uanataca.com"}, []string{"crl1.uanataca.com", "crl2.uanataca.com"}))}}
+			policy(true, []string{"ocsp1.uanataca.com", "ocsp2.uanataca.com"}, []string{"crl1.uanataca.com", "crl2.uanataca.com"}))}}
 }
 
 // signe (beta): digest C; NIE as PNOES-<NIE> only here; leaf OCSP unknown, so CRL only.
+// signe-subca.crl answers 302 to https://crl.firmaprofesional.com (R64).
 func signe() Provider {
 	a := plain()
 	a.Documents = []identity.DocumentRule{
@@ -296,17 +299,19 @@ func signe() Provider {
 				anchor("244166240947c4074418df2606fc3ebf5a765f6b9692185fc091ea669986da35", "6a30d221e4acfdae38d34006418094fa8337da2f30b9a99c04cfe7d98317dd70"),
 			},
 			[]string{"1.3.6.1.4.1.36035.1.3.2"}, a,
-			policy(false, nil, []string{"www.signe.es"}))}}
+			policy(false, nil, []string{"www.signe.es", "crl.firmaprofesional.com"}))}}
 }
 
-// lleidanet (beta): digest C lleidanet-natural-person-sw.
+// lleidanet (beta): digest C lleidanet-natural-person-sw. CRL only (R63): the
+// ocsp2.esigna.es responder certificate lacks id-pkix-ocsp-nocheck, so its
+// answers are never acceptable; the leaves' AIA OCSP URL is ignored.
 func lleidanet() Provider {
 	return Provider{ID: "lleidanet", Name: "Lleidanet / inDenova", Beta: true,
 		Description: "Certificado de Persona Natural Software",
 		Profiles: []Profile{person("lleidanet-natural-person-sw", "lleidanet", "Lleidanet Persona Natural Software",
 			[]Anchor{anchor("3452e96743442607f21d85084c3db897e37549fed23f135cdbd202e690d52e25", "e0f0a51ac007c5ea964344e785c4ac005d8db0e8cd7a33943f726a46c0532d3e")},
 			[]string{"1.3.6.1.4.1.49959.1.1.1.1.1"}, plain(),
-			policy(false, []string{"ocsp2.esigna.es"}, []string{"crl1.esigna.es", "crl.esigna.es"}))}}
+			policy(false, nil, []string{"crl1.esigna.es", "crl.esigna.es"}))}}
 }
 
 // dnie (beta): digest A dnie-auth plus the fixture manifest answers (G1).

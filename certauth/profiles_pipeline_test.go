@@ -180,7 +180,17 @@ func ppShapes(t testing.TB) []ppShape {
 			subject: testpki.Name{ppC(), ppSN(), ppGN(), ppSerial("IDCES-" + ppNIE), ppCN()},
 			ku:      ppDSNR, eku: ppClientAuth, ocsp: []string{"http://ocsp.aoc.cat"}, cdp: ppCDP("http://epscd.aoc.cat/crl/casub-a2.crl"),
 			want: func() ppWant { w := nie; w.raw = "IDCES-" + ppNIE; return w }()},
+		{name: "aoc-idcat-g3-rsa-2048", profile: "aoc-idcat-g3", key: testpki.RSA2048,
+			subject: testpki.Name{ppC(), ppSN(), ppGN(), ppSerial("IDCES-" + ppNIE), ppCN()},
+			ku:      ppDSNR, eku: ppClientAuth, ocsp: []string{"http://ocsp.aoc.cat"}, cdp: ppCDP("http://epscd.aoc.cat/crl/casub-a2.crl"),
+			want: func() ppWant { w := nie; w.raw = "IDCES-" + ppNIE; return w }()},
 		{name: "accv-rsa", profile: "accv-citizen-software-current", anchor: 0, key: testpki.RSA3072,
+			subject: accvSubject, sanDirs: []testpki.Name{accvSAN}, ku: ppDSNRKE, eku: ppClientAuth, ekuOIDs: []asn1.ObjectIdentifier{ppOIDAdobe},
+			ocsp: []string{"http://ocsp.accv.es"}, cdp: ppCDP("http://www.accv.es/gestcert/accv_rsa1_cliente.crl"),
+			redirects: map[string]string{"http://www.accv.es/gestcert/accv_rsa1_cliente.crl": "/fileadmin/Archivos/certificados/accv_rsa1_cliente.crl"},
+			want:      ppDNIWant(ppDNI).split()},
+		// RSA-2048 leaves pass on the global floor (R73: no 3072 override).
+		{name: "accv-rsa-2048", profile: "accv-citizen-software-current", anchor: 0, key: testpki.RSA2048,
 			subject: accvSubject, sanDirs: []testpki.Name{accvSAN}, ku: ppDSNRKE, eku: ppClientAuth, ekuOIDs: []asn1.ObjectIdentifier{ppOIDAdobe},
 			ocsp: []string{"http://ocsp.accv.es"}, cdp: ppCDP("http://www.accv.es/gestcert/accv_rsa1_cliente.crl"),
 			redirects: map[string]string{"http://www.accv.es/gestcert/accv_rsa1_cliente.crl": "/fileadmin/Archivos/certificados/accv_rsa1_cliente.crl"},
@@ -253,8 +263,9 @@ func ppShapes(t testing.TB) []ppShape {
 		{name: "lleidanet-natural-person-sw", profile: "lleidanet-natural-person-sw", key: testpki.RSA4096,
 			subject: testpki.Name{ppC(), ppSerial("IDCES-" + ppDNI), ppGN(), ppSN(), ppCN(),
 				ppU(testpki.OIDDescription, "PERSONA NATURAL"), testpki.Tagged(testpki.OIDEmailAddress, testpki.TagIA5, ppEmail)},
-			ku: ppDSNR, eku: ppClientMail, ocsp: []string{"http://ocsp2.esigna.es"},
-			cdp: ppCDP("http://crl1.esigna.es/sub/indenova_pki_003.crl"), want: ppDNIWant("IDCES-" + ppDNI)},
+			ku: ppDSNR, eku: ppClientMail, ocsp: []string{"http://ocsp2.esigna.es"}, // AIA kept; the profile is CRL-only (R63)
+			cdp:  ppCDP("http://crl1.esigna.es/sub/indenova_pki_003.crl"),
+			want: func() ppWant { w := ppDNIWant("IDCES-" + ppDNI); w.method = revocation.MethodCRL; return w }()},
 		{name: "dnie-auth", profile: "dnie-auth", key: testpki.RSA2048,
 			subject: testpki.Name{ppC(), ppSerialP(ppDNI), ppU(testpki.OIDSurname, ppFirst), ppU(testpki.OIDGivenName, "JOSÉ"),
 				ppU(testpki.OIDCommonName, ppSurnames+", JOSÉ (AUTENTICACIÓN)")},
@@ -508,8 +519,8 @@ func TestProfilesPipeline(t *testing.T) {
 			}
 			ppAssertResult(t, res, prof, s.want, s.want.method)
 
-			if len(s.ocsp) == 0 {
-				return
+			if len(s.ocsp) == 0 || len(prof.Revocation.OCSPHosts) == 0 {
+				return // no OCSP to fall back from
 			}
 			// CRL fallback: OCSP 503, then the CRL decides (fail closed without one).
 			res, err = p.check(t, reg, s, leaf, ppOCSPDown, nil)
