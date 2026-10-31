@@ -239,7 +239,7 @@ type adapterCase struct {
 	wantErr error
 }
 
-func adapterCases() []adapterCase {
+func adapterCases(tb testing.TB) []adapterCase {
 	const (
 		num   = "12345678Z"
 		other = "87654321X" // a different valid DNI
@@ -485,6 +485,10 @@ func adapterCases() []adapterCase {
 			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), DateOfBirth: "19800101120000Z"}, want: ext(dnieBorn)},
 		{name: "dnie malformed birth date", adapter: shapeDNIe(),
 			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), DateOfBirth: "19800230120000Z"}, wantErr: invalid},
+		{name: "dnie SDA attribute with a trailing element", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), SDARaw: sdaTrailingDOB(tb, []byte{0x05, 0x00})}, wantErr: invalid},
+		{name: "dnie SDA attribute with empty values", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), SDARaw: sdaEmptyResidence(tb)}, wantErr: invalid},
 		{name: "dnie CN does not start with SN", adapter: shapeDNIe(),
 			spec: testpki.CertSpec{Subject: dnieSubject(num, "LÓPEZ GARCÍA, JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
 		{name: "dnie CN surname only shares a prefix with SN", adapter: shapeDNIe(),
@@ -514,6 +518,10 @@ func adapterCases() []adapterCase {
 			want: ext(plainIdentity(dniDoc(num, idces), "JOS\u00c9 MAR\u00cdA", sn))},
 		{name: "plain malformed SDA noted", adapter: shapePlain(),
 			spec: testpki.CertSpec{Subject: person(idces, gn, sn), DateOfBirth: "19800230120000Z"}, want: malformedNote},
+		{name: "plain SDA attribute with a trailing element noted", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, gn, sn), SDARaw: sdaTrailingDOB(tb, []byte{0x05, 0x00})}, want: malformedNote},
+		{name: "plain SDA attribute with empty values noted", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, gn, sn), SDARaw: sdaEmptyResidence(tb)}, want: malformedNote},
 		{name: "plain valid SDA ignored", adapter: shapePlain(),
 			spec: testpki.CertSpec{Subject: person(idces, gn, sn), DateOfBirth: "19800101120000Z"}, want: ext(plainIdentity(dniDoc(num, idces), gn, sn))},
 		{name: "plain BMPString GN rejected", adapter: shapePlain(),
@@ -562,7 +570,7 @@ func adapterCases() []adapterCase {
 
 func TestAdapterExtract(t *testing.T) {
 	ca := testpki.NewRoot(t, "identity-root", testpki.CertSpec{})
-	for _, tc := range adapterCases() {
+	for _, tc := range adapterCases(t) {
 		t.Run(tc.name, func(t *testing.T) {
 			leaf := ca.Leaf(t, tc.spec)
 			got, err := tc.adapter.Extract(leaf.Cert)
@@ -745,7 +753,7 @@ func TestErrorsCarryNoValues(t *testing.T) {
 
 	t.Run("Adapter.Extract", func(t *testing.T) {
 		ca := testpki.NewRoot(t, "leak-root", testpki.CertSpec{})
-		for _, tc := range adapterCases() {
+		for _, tc := range adapterCases(t) {
 			if tc.wantErr == nil {
 				continue
 			}

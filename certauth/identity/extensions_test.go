@@ -200,7 +200,38 @@ func dateOfBirthCases(tb testing.TB) []sdaCase {
 		{name: "trailing bytes", der: append(testpki.DateOfBirthSDA("19800101120000Z"), 0x00), wantErr: true},
 		{name: "not a SEQUENCE", der: setDER(dobAttr(tb, dob, gt("19800101120000Z"))), wantErr: true},
 		{name: "empty input", der: nil, wantErr: true},
+
+		// R52 extended to the SDA: Attribute ::= SEQUENCE { type, values SET SIZE (1..MAX) },
+		// nothing after values, in the dateOfBirth attribute and in any other.
+		{name: "three values", der: seqDER(dobAttr(tb, dob, gt("19800101120000Z"), gt("19800101120000Z"), gt("19800101120000Z"))), wantErr: true, values: []string{"19800101120000Z"}},
+		{name: "dateOfBirth with a trailing element", der: sdaTrailingDOB(tb, tlv(asn1.TagUTF8String, []byte("EXTRA"))), wantErr: true, values: []string{"19800101120000Z"}},
+		{name: "dateOfBirth with a trailing NULL", der: sdaTrailingDOB(tb, []byte{asn1.TagNull, 0x00}), wantErr: true, values: []string{"19800101120000Z"}},
+		{name: "dateOfBirth with a trailing byte", der: sdaTrailingDOB(tb, []byte{0x00}), wantErr: true, values: []string{"19800101120000Z"}},
+		{name: "dateOfBirth with a second values SET", der: sdaTrailingDOB(tb, setDER(gt("19800102120000Z"))), wantErr: true, values: []string{"19800101120000Z", "19800102120000Z"}},
+		{name: "other attribute with a trailing element", der: seqDER(seqDER(oidDER(tb, testpki.OIDAttrCountryOfResidence), setDER(tlv(asn1.TagPrintableString, []byte("ES"))), []byte{asn1.TagNull, 0x00}), dobAttr(tb, dob, gt("19800101120000Z"))), wantErr: true},
+		{name: "other attribute with empty values", der: sdaEmptyResidence(tb), wantErr: true},
+		{name: "other attribute without values", der: seqDER(seqDER(oidDER(tb, testpki.OIDAttrCountryOfResidence)), dobAttr(tb, dob, gt("19800101120000Z"))), wantErr: true},
+		{name: "attribute is an empty SEQUENCE", der: seqDER(seqDER(), dobAttr(tb, dob, gt("19800101120000Z"))), wantErr: true},
+		{name: "attribute is a SET", der: seqDER(setDER(oidDER(tb, dob), setDER(gt("19800101120000Z")))), wantErr: true},
+		{name: "attribute type is not an OID", der: seqDER(seqDER(tlv(asn1.TagUTF8String, []byte("1.3.6.1.5.5.7.9.1")), setDER(gt("19800101120000Z")))), wantErr: true},
+		{name: "values context-specific", der: seqDER(seqDER(oidDER(tb, dob), tlv(0xa0, gt("19800101120000Z")))), wantErr: true},
+		{name: "values primitive SET tag", der: seqDER(seqDER(oidDER(tb, dob), tlv(0x11, gt("19800101120000Z")))), wantErr: true},
+		{name: "value truncated inside values", der: seqDER(seqDER(oidDER(tb, dob), setDER([]byte{tagGeneralizedTime, 0x0f, '1', '9'}))), wantErr: true},
 	}
+}
+
+// sdaTrailingDOB is an SDA whose dateOfBirth Attribute carries extra after
+// its values SET.
+func sdaTrailingDOB(tb testing.TB, extra []byte) []byte {
+	tb.Helper()
+	return seqDER(seqDER(oidDER(tb, testpki.OIDAttrDateOfBirth), setDER(tlv(tagGeneralizedTime, []byte("19800101120000Z"))), extra))
+}
+
+// sdaEmptyResidence is an SDA with a valid dateOfBirth and a
+// countryOfResidence Attribute whose values SET is empty.
+func sdaEmptyResidence(tb testing.TB) []byte {
+	tb.Helper()
+	return seqDER(seqDER(oidDER(tb, testpki.OIDAttrCountryOfResidence), setDER()), dobAttr(tb, testpki.OIDAttrDateOfBirth, tlv(tagGeneralizedTime, []byte("19800101120000Z"))))
 }
 
 func TestDateOfBirth(t *testing.T) {

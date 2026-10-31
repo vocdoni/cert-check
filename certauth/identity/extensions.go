@@ -86,23 +86,26 @@ func DateOfBirth(cert *x509.Certificate) (d Date, found bool, err error) {
 }
 
 // ParseDateOfBirth parses a SubjectDirectoryAttributes extension value.
+// Every Attribute must be exactly SEQUENCE { type, values } with a non-empty
+// values SET (ruling R52, extended to the SDA).
 func ParseDateOfBirth(der []byte) (d Date, found bool, err error) {
-	var attrs []struct {
-		Type   asn1.ObjectIdentifier
-		Values []asn1.RawValue `asn1:"set"`
-	}
+	var attrs []asn1.RawValue
 	rest, err := asn1.Unmarshal(der, &attrs)
 	if err != nil || len(rest) != 0 {
 		return Date{}, false, invalidf("sda: malformed attributes")
 	}
-	for _, a := range attrs {
-		if !a.Type.Equal(oidAttrDateOfBirth) {
+	for _, raw := range attrs {
+		typ, values, ok := parseSDAAttribute(raw)
+		if !ok {
+			return Date{}, false, invalidf("sda: malformed attribute")
+		}
+		if !typ.Equal(oidAttrDateOfBirth) {
 			continue
 		}
-		if found || len(a.Values) != 1 {
+		if found || len(values) != 1 {
 			return Date{}, true, invalidf("sda: dateOfBirth must have exactly one value")
 		}
-		v := a.Values[0]
+		v := values[0]
 		if v.Class != asn1.ClassUniversal || v.Tag != asn1.TagGeneralizedTime || v.IsCompound {
 			return Date{}, true, invalidf("sda: dateOfBirth is not GeneralizedTime")
 		}
@@ -113,6 +116,34 @@ func ParseDateOfBirth(der []byte) (d Date, found bool, err error) {
 		d, found = Date{Year: t.Year(), Month: t.Month(), Day: t.Day()}, true
 	}
 	return d, found, nil
+}
+
+// parseSDAAttribute reads Attribute ::= SEQUENCE { type OID, values SET SIZE
+// (1..MAX) OF ANY } and rejects an empty values SET or any element after it;
+// encoding/asn1 struct decoding would silently accept trailing elements.
+func parseSDAAttribute(raw asn1.RawValue) (asn1.ObjectIdentifier, []asn1.RawValue, bool) {
+	if raw.Class != asn1.ClassUniversal || raw.Tag != asn1.TagSequence || !raw.IsCompound {
+		return nil, nil, false
+	}
+	var typ asn1.ObjectIdentifier
+	rest, err := asn1.Unmarshal(raw.Bytes, &typ)
+	if err != nil {
+		return nil, nil, false
+	}
+	var set asn1.RawValue
+	rest, err = asn1.Unmarshal(rest, &set)
+	if err != nil || len(rest) != 0 || set.Class != asn1.ClassUniversal || set.Tag != asn1.TagSet || !set.IsCompound || len(set.Bytes) == 0 {
+		return nil, nil, false
+	}
+	var values []asn1.RawValue
+	for inner := set.Bytes; len(inner) > 0; {
+		var v asn1.RawValue
+		if inner, err = asn1.Unmarshal(inner, &v); err != nil {
+			return nil, nil, false
+		}
+		values = append(values, v)
+	}
+	return typ, values, true
 }
 
 func findExtension(cert *x509.Certificate, oid asn1.ObjectIdentifier) ([]byte, bool) {
