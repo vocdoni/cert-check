@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/url"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/vocdoni/cert-check/certauth/revocation"
@@ -190,9 +191,9 @@ func reportAttempts(in []revocation.Attempt) []RevocationAttempt {
 }
 
 // LogAttrs returns the non-PII fields allowed in logs: id, code, step,
-// provider, candidates, issuer DN, policy OIDs, revocation host/status/
-// duration, TLS version/cipher. Never subject, names, document, serial,
-// leaf hash, URL paths or technicalDetail.
+// provider, candidates (x509 error class only, see logSafe), issuer DN,
+// policy OIDs, revocation host/status/duration, TLS version/cipher. Never
+// subject, names, document, serial, leaf hash, URL paths or technicalDetail.
 func (d Diagnostics) LogAttrs() []slog.Attr {
 	attrs := []slog.Attr{
 		slog.String("diagnosticId", d.DiagnosticID),
@@ -202,7 +203,7 @@ func (d Diagnostics) LogAttrs() []slog.Attr {
 	}
 	var cands []string
 	for _, c := range d.ProfileCandidates {
-		cands = append(cands, c.ProfileID+":"+c.Result)
+		cands = append(cands, c.ProfileID+":"+logSafe(c.Result))
 	}
 	attrs = append(attrs, slog.Any("candidates", cands))
 	if d.Certificate != nil {
@@ -221,4 +222,15 @@ func (d Diagnostics) LogAttrs() []slog.Attr {
 		attrs = append(attrs, slog.String("tlsVersion", d.TLS.Version), slog.String("cipher", d.TLS.CipherSuite))
 	}
 	return attrs
+}
+
+// logSafe keeps the x509 error class and drops Go's detail suffixes, which
+// can quote names from the leaf (name-constraint errors) or the CA.
+func logSafe(res string) string {
+	res, _, _ = strings.Cut(res, " (possibly because of")
+	if rest, ok := strings.CutPrefix(res, "x509: "); ok {
+		class, _, _ := strings.Cut(rest, ": ")
+		return "x509: " + class
+	}
+	return res
 }

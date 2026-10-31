@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -144,6 +145,40 @@ func TestLogAttrsNoPII(t *testing.T) {
 			}
 		})
 	}
+
+	// Go's x509 errors can quote names: name-constraint errors quote the
+	// leaf SAN value, "possibly because of" quotes a candidate CA. The log
+	// keeps the error class only; the diagnostics keep the full text.
+	t.Run("x509 error details trimmed", func(t *testing.T) {
+		d := Diagnostics{DiagnosticID: NewDiagnosticID(), ProfileCandidates: []CandidateResult{
+			{ProfileID: "alpha-a", Result: `x509: a root or intermediate certificate is not authorized to sign for this name: email "juan@example.org" is excluded by constraint "x"`},
+			{ProfileID: "alpha-b", Result: `x509: certificate signed by unknown authority (possibly because of "crypto/rsa: verification error" while trying to verify candidate authority certificate "JUAN GARCIA LOPEZ")`},
+			{ProfileID: "beta", Result: "x509: certificate has expired or is not yet valid: current time 2026-10-31T12:00:00Z is after 2026-10-30T12:00:00Z"},
+			{ProfileID: "gamma", Result: "path ok"},
+		}}
+		var buf bytes.Buffer
+		slog.New(slog.NewJSONHandler(&buf, nil)).LogAttrs(t.Context(), slog.LevelInfo, "certauth outcome", d.LogAttrs()...)
+		var line struct {
+			Candidates []string `json:"candidates"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &line); err != nil {
+			t.Fatalf("log line %s: %v", buf.Bytes(), err)
+		}
+		want := []string{
+			"alpha-a:x509: a root or intermediate certificate is not authorized to sign for this name",
+			"alpha-b:x509: certificate signed by unknown authority",
+			"beta:x509: certificate has expired or is not yet valid",
+			"gamma:path ok",
+		}
+		if !slices.Equal(line.Candidates, want) {
+			t.Errorf("candidates = %q, want %q", line.Candidates, want)
+		}
+		for _, pii := range []string{"juan@example.org", "JUAN GARCIA LOPEZ"} {
+			if strings.Contains(buf.String(), pii) {
+				t.Errorf("log line contains %q:\n%s", pii, buf.String())
+			}
+		}
+	})
 }
 
 func TestDescribeTLS(t *testing.T) {
