@@ -1,0 +1,103 @@
+{
+  "status": "success",
+  "result": {
+    "provider": {"id": "fnmt", "name": "FNMT - Persona Física"},
+    "profile": {"id": "fnmt-citizen-rsa", "name": "FNMT Persona Física (AC FNMT Usuarios)", "holderRole": "natural_person"},
+    "identity": {
+      "document": {"type": "DNI", "country": "ES", "number": "12345679S", "raw": "IDCES-12345679S", "source": "subject.2.5.4.5"},
+      "givenNames": "JUAN",
+      "surnames": "GARCÍA LÓPEZ",
+      "firstSurname": "",
+      "secondSurname": "",
+      "fullName": "JUAN GARCÍA LÓPEZ",
+      "birthDate": null,
+      "sources": {
+        "document": "subject.2.5.4.5",
+        "givenNames": "subject.2.5.4.42",
+        "surnames": "subject.2.5.4.4"
+      }
+    },
+    "organization": null,
+    "certificate": {
+      "subject": "CN=GARCÍA LÓPEZ JUAN - 12345679S,SERIALNUMBER=IDCES-12345679S,GIVENNAME=JUAN,SURNAME=GARCÍA LÓPEZ,C=ES",
+      "issuer": "AC FNMT Usuarios",
+      "serialHex": "3c6e1f0b94a7d2582e41b0c9a7d35f18",
+      "notBefore": "2024-03-14T11:41:27Z",
+      "notAfter": "2028-03-14T11:41:27Z",
+      "sha256": "9d4f21c7b8e03a65f1d2c49b7a0e8d36c5b1f4a2e97d03c8b6a15f2e4d70c913",
+      "keyAlgorithm": "RSA-2048"
+    },
+    "revocation": {
+      "status": "good",
+      "method": "ocsp",
+      "checkedAt": "2026-10-31T09:12:41Z",
+      "thisUpdate": "2026-10-31T09:12:00Z",
+      "nextUpdate": null,
+      "source": "ocspusu.cert.fnmt.es"
+    },
+    "validatedAt": "2026-10-31T09:12:41Z",
+    "diagnostics": {
+      "diagnosticId": "e21a9c4d70b34f58a6d13c0b8e47f952",
+      "time": "2026-10-31T09:12:41Z",
+      "serverVersion": "v0.1.0",
+      "provider": "fnmt",
+      "failedStep": "",
+      "code": "",
+      "technicalDetail": "",
+      "tls": {
+        "version": "TLS 1.2",
+        "cipherSuite": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        "sni": "fnmt.auth.cert-check.vocdoni.dev",
+        "clientCertificatePresented": true,
+        "chainLength": 2
+      },
+      "certificate": {
+        "subject": "CN=GARCÍA LÓPEZ JUAN - 12345679S,SERIALNUMBER=IDCES-12345679S,GIVENNAME=JUAN,SURNAME=GARCÍA LÓPEZ,C=ES",
+        "issuer": "CN=AC FNMT Usuarios,OU=Ceres,O=FNMT-RCM,C=ES",
+        "serialHex": "3c6e1f0b94a7d2582e41b0c9a7d35f18",
+        "notBefore": "2024-03-14T11:41:27Z",
+        "notAfter": "2028-03-14T11:41:27Z",
+        "sha256": "9d4f21c7b8e03a65f1d2c49b7a0e8d36c5b1f4a2e97d03c8b6a15f2e4d70c913",
+        "keyAlgorithm": "RSA-2048",
+        "signatureAlgorithm": "SHA256-RSA",
+        "keyUsage": ["digitalSignature", "keyEncipherment"],
+        "extKeyUsage": ["clientAuth", "emailProtection"],
+        "policyOids": ["1.3.6.1.4.1.5734.3.10.1"],
+        "criticalExtensions": ["2.5.29.15"],
+        "ocspUrls": ["http://ocspusu.cert.fnmt.es/ocspusu/OcspResponder"],
+        "caIssuerUrls": ["http://www.cert.fnmt.es/certs/ACUSUARIOS.crt"],
+        "cdpUrls": ["http://www.cert.fnmt.es/crlsusu/crl1.crl"]
+      },
+      "chain": [
+        {
+          "subject": "CN=GARCÍA LÓPEZ JUAN - 12345679S,SERIALNUMBER=IDCES-12345679S,GIVENNAME=JUAN,SURNAME=GARCÍA LÓPEZ,C=ES",
+          "issuer": "CN=AC FNMT Usuarios,OU=Ceres,O=FNMT-RCM,C=ES"
+        },
+        {
+          "subject": "CN=AC FNMT Usuarios,OU=Ceres,O=FNMT-RCM,C=ES",
+          "issuer": "CN=AC RAIZ FNMT-RCM,OU=AC RAIZ FNMT-RCM,O=FNMT-RCM,C=ES"
+        }
+      ],
+      "profileCandidates": [
+        {"profileId": "fnmt-citizen-rsa", "result": "ok"}
+      ],
+      "revocationAttempts": [
+        {
+          "method": "ocsp",
+          "url": "http://ocspusu.cert.fnmt.es/ocspusu/OcspResponder",
+          "httpStatus": 200,
+          "durationMs": 287,
+          "outcome": "good",
+          "detail": "good",
+          "fromCache": false,
+          "producedAt": "2026-10-31T09:12:00Z",
+          "thisUpdate": "2026-10-31T09:12:00Z",
+          "nextUpdate": null,
+          "responderSubject": "CN=OCSP AC FNMT Usuarios,OU=Ceres,O=FNMT-RCM,C=ES",
+          "nonceSent": true,
+          "nonceEchoed": true
+        }
+      ]
+    }
+  }
+}

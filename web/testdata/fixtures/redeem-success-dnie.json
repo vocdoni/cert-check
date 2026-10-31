@@ -1,0 +1,106 @@
+{
+  "status": "success",
+  "result": {
+    "provider": {"id": "dnie", "name": "DNIe (requires card reader)"},
+    "profile": {"id": "dnie-auth", "name": "DNIe authentication", "holderRole": "natural_person"},
+    "identity": {
+      "document": {"type": "DNI", "country": "ES", "number": "12345679S", "raw": "12345679S", "source": "subject.2.5.4.5"},
+      "givenNames": "JUAN",
+      "surnames": "GARCÍA LÓPEZ",
+      "firstSurname": "GARCÍA",
+      "secondSurname": "LÓPEZ",
+      "fullName": "JUAN GARCÍA LÓPEZ",
+      "birthDate": "1985-07-23",
+      "sources": {
+        "document": "subject.2.5.4.5",
+        "givenNames": "subject.2.5.4.42",
+        "surnames": "subject.2.5.4.3 (DNIe CN grammar)",
+        "firstSurname": "subject.2.5.4.4",
+        "secondSurname": "subject.2.5.4.3 (DNIe CN grammar)",
+        "birthDate": "san.sda.dateOfBirth"
+      }
+    },
+    "organization": null,
+    "certificate": {
+      "subject": "CN=GARCÍA LÓPEZ\\, JUAN (AUTENTICACIÓN),SERIALNUMBER=12345679S,SURNAME=GARCÍA,GIVENNAME=JUAN,C=ES",
+      "issuer": "AC DNIE 004",
+      "serialHex": "6a0d3f81c25e47b9",
+      "notBefore": "2023-09-05T08:30:00Z",
+      "notAfter": "2028-09-05T08:30:00Z",
+      "sha256": "41b7c09e5d2a8f63e1074b9d5c2a86f30e7d1b4a9c58f26d03e7a1b9c4f58d02",
+      "keyAlgorithm": "RSA-2048"
+    },
+    "revocation": {
+      "status": "good",
+      "method": "ocsp",
+      "checkedAt": "2026-10-31T09:14:08Z",
+      "thisUpdate": "2026-10-31T09:14:05Z",
+      "nextUpdate": "2026-10-31T21:14:05Z",
+      "source": "ocsp.dnie.es"
+    },
+    "validatedAt": "2026-10-31T09:14:08Z",
+    "diagnostics": {
+      "diagnosticId": "5c08d3a1fe6b4927b0e4a7c2d91f3860",
+      "time": "2026-10-31T09:14:08Z",
+      "serverVersion": "v0.1.0",
+      "provider": "dnie",
+      "failedStep": "",
+      "code": "",
+      "technicalDetail": "",
+      "tls": {
+        "version": "TLS 1.2",
+        "cipherSuite": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        "sni": "dnie.auth.cert-check.vocdoni.dev",
+        "clientCertificatePresented": true,
+        "chainLength": 2
+      },
+      "certificate": {
+        "subject": "CN=GARCÍA LÓPEZ\\, JUAN (AUTENTICACIÓN),SERIALNUMBER=12345679S,SURNAME=GARCÍA,GIVENNAME=JUAN,C=ES",
+        "issuer": "CN=AC DNIE 004,OU=DNIE,O=DIRECCION GENERAL DE LA POLICIA,C=ES",
+        "serialHex": "6a0d3f81c25e47b9",
+        "notBefore": "2023-09-05T08:30:00Z",
+        "notAfter": "2028-09-05T08:30:00Z",
+        "sha256": "41b7c09e5d2a8f63e1074b9d5c2a86f30e7d1b4a9c58f26d03e7a1b9c4f58d02",
+        "keyAlgorithm": "RSA-2048",
+        "signatureAlgorithm": "SHA256-RSA",
+        "keyUsage": ["digitalSignature"],
+        "extKeyUsage": [],
+        "policyOids": ["2.16.724.1.2.2.2.4"],
+        "criticalExtensions": ["2.5.29.15"],
+        "ocspUrls": ["http://ocsp.dnie.es"],
+        "caIssuerUrls": [],
+        "cdpUrls": []
+      },
+      "chain": [
+        {
+          "subject": "CN=GARCÍA LÓPEZ\\, JUAN (AUTENTICACIÓN),SERIALNUMBER=12345679S,SURNAME=GARCÍA,GIVENNAME=JUAN,C=ES",
+          "issuer": "CN=AC DNIE 004,OU=DNIE,O=DIRECCION GENERAL DE LA POLICIA,C=ES"
+        },
+        {
+          "subject": "CN=AC DNIE 004,OU=DNIE,O=DIRECCION GENERAL DE LA POLICIA,C=ES",
+          "issuer": "CN=AC RAIZ DNIE 2,OU=DNIE,O=DIRECCION GENERAL DE LA POLICIA,C=ES"
+        }
+      ],
+      "profileCandidates": [
+        {"profileId": "dnie-auth", "result": "ok"}
+      ],
+      "revocationAttempts": [
+        {
+          "method": "ocsp",
+          "url": "http://ocsp.dnie.es",
+          "httpStatus": 200,
+          "durationMs": 412,
+          "outcome": "good",
+          "detail": "good",
+          "fromCache": false,
+          "producedAt": "2026-10-31T09:14:05Z",
+          "thisUpdate": "2026-10-31T09:14:05Z",
+          "nextUpdate": "2026-10-31T21:14:05Z",
+          "responderSubject": "CN=OCSP AC DNIE 004,OU=DNIE,O=DIRECCION GENERAL DE LA POLICIA,C=ES",
+          "nonceSent": false,
+          "nonceEchoed": false
+        }
+      ]
+    }
+  }
+}

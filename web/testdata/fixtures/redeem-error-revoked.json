@@ -1,0 +1,87 @@
+{
+  "status": "error",
+  "error": {
+    "code": "revoked",
+    "message": "The certificate has been revoked or suspended.",
+    "retryable": false
+  },
+  "diagnostics": {
+    "diagnosticId": "7b1e4c0a92d84f36a5c1e0d3b8f26a49",
+    "time": "2026-10-31T09:12:44Z",
+    "serverVersion": "v0.1.0",
+    "provider": "fnmt",
+    "failedStep": "revocation",
+    "code": "revoked",
+    "technicalDetail": "crl http://www.cert.fnmt.es/crlsusu/crl1.crl: serial listed (earlier: ocsp http://ocspusu.cert.fnmt.es/ocspusu/OcspResponder HTTP 503 after 4.9s)",
+    "tls": {
+      "version": "TLS 1.2",
+      "cipherSuite": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+      "sni": "fnmt.auth.cert-check.vocdoni.dev",
+      "clientCertificatePresented": true,
+      "chainLength": 2
+    },
+    "certificate": {
+      "subject": "CN=GARCÍA LÓPEZ JUAN - 12345679S,SERIALNUMBER=IDCES-12345679S,GIVENNAME=JUAN,SURNAME=GARCÍA LÓPEZ,C=ES",
+      "issuer": "CN=AC FNMT Usuarios,OU=Ceres,O=FNMT-RCM,C=ES",
+      "serialHex": "3c6e1f0b94a7d2582e41b0c9a7d35f18",
+      "notBefore": "2024-03-14T11:41:27Z",
+      "notAfter": "2028-03-14T11:41:27Z",
+      "sha256": "9d4f21c7b8e03a65f1d2c49b7a0e8d36c5b1f4a2e97d03c8b6a15f2e4d70c913",
+      "keyAlgorithm": "RSA-2048",
+      "signatureAlgorithm": "SHA256-RSA",
+      "keyUsage": ["digitalSignature", "keyEncipherment"],
+      "extKeyUsage": ["clientAuth", "emailProtection"],
+      "policyOids": ["1.3.6.1.4.1.5734.3.10.1"],
+      "criticalExtensions": ["2.5.29.15"],
+      "ocspUrls": ["http://ocspusu.cert.fnmt.es/ocspusu/OcspResponder"],
+      "caIssuerUrls": ["http://www.cert.fnmt.es/certs/ACUSUARIOS.crt"],
+      "cdpUrls": ["http://www.cert.fnmt.es/crlsusu/crl1.crl"]
+    },
+    "chain": [
+      {
+        "subject": "CN=GARCÍA LÓPEZ JUAN - 12345679S,SERIALNUMBER=IDCES-12345679S,GIVENNAME=JUAN,SURNAME=GARCÍA LÓPEZ,C=ES",
+        "issuer": "CN=AC FNMT Usuarios,OU=Ceres,O=FNMT-RCM,C=ES"
+      },
+      {
+        "subject": "CN=AC FNMT Usuarios,OU=Ceres,O=FNMT-RCM,C=ES",
+        "issuer": "CN=AC RAIZ FNMT-RCM,OU=AC RAIZ FNMT-RCM,O=FNMT-RCM,C=ES"
+      }
+    ],
+    "profileCandidates": [
+      {"profileId": "fnmt-citizen-rsa", "result": "ok"},
+      {"profileId": "fnmt-citizen-g2", "result": "path: x509: certificate signed by unknown authority"}
+    ],
+    "revocationAttempts": [
+      {
+        "method": "ocsp",
+        "url": "http://ocspusu.cert.fnmt.es/ocspusu/OcspResponder",
+        "httpStatus": 503,
+        "durationMs": 4912,
+        "outcome": "unavailable",
+        "detail": "HTTP 503 after 4.9s",
+        "fromCache": false,
+        "producedAt": null,
+        "thisUpdate": null,
+        "nextUpdate": null,
+        "responderSubject": "",
+        "nonceSent": true,
+        "nonceEchoed": false
+      },
+      {
+        "method": "crl",
+        "url": "http://www.cert.fnmt.es/crlsusu/crl1.crl",
+        "httpStatus": 200,
+        "durationMs": 1384,
+        "outcome": "revoked",
+        "detail": "serial listed",
+        "fromCache": false,
+        "producedAt": null,
+        "thisUpdate": "2026-10-31T06:00:00Z",
+        "nextUpdate": "2026-11-01T06:00:00Z",
+        "responderSubject": "",
+        "nonceSent": false,
+        "nonceEchoed": false
+      }
+    ]
+  }
+}
