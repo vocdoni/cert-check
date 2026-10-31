@@ -194,7 +194,7 @@ func TestRequiredText(t *testing.T) {
 		`<dl id="result-list"`,
 		`id="again" class="pill"`,
 		`>Check another certificate</button>`,
-		`>We could not authenticate this certificate</h2>`,
+		`>We could not authenticate this certificate</h1>`,
 		`id="error-message"`,
 		`id="error-guidance"`,
 		`<details id="tech"><summary>Technical details</summary><pre id="report"`,
@@ -215,6 +215,19 @@ func TestRequiredText(t *testing.T) {
 	for _, id := range []string{"view-start", "view-working", "view-success", "view-error"} {
 		if !regexp.MustCompile(`<section id="` + id + `"[^>]*>`).MatchString(html) {
 			t.Errorf("index.html lacks <section id=%q>", id)
+		}
+	}
+	// Every view has exactly one h1 (axe page-has-heading-one) and no other heading level.
+	for _, id := range []string{"view-start", "view-working", "view-success", "view-error"} {
+		section := regexp.MustCompile(`(?s)<section id="` + id + `"[^>]*>(.*?)</section>`).FindStringSubmatch(html)
+		if section == nil {
+			continue // reported above
+		}
+		if n := strings.Count(section[1], "<h1 "); n != 1 {
+			t.Errorf("%s has %d h1 elements, want exactly 1", id, n)
+		}
+		if strings.Contains(section[1], "<h2") {
+			t.Errorf("%s contains an h2, want a single h1 heading", id)
 		}
 	}
 	if n := strings.Count(html, `tabindex="-1"`); n < 4 {
