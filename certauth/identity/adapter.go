@@ -90,20 +90,21 @@ type Adapter struct {
 	Organization         OrganizationRule
 }
 
-// Validate checks the adapter declaration.
+// Validate checks the adapter declaration. Every returned error wraps
+// ErrInvalid (ruling R54).
 func (a Adapter) Validate() error {
 	var errs []error
 	if len(a.Documents) == 0 {
-		errs = append(errs, errors.New("identity: adapter has no document rules"))
+		errs = append(errs, invalidf("adapter has no document rules"))
 	}
 	if a.Surnames == 0 || a.SAN.Kind == 0 || a.BirthDate == 0 || a.Organization == 0 {
-		errs = append(errs, errors.New("identity: adapter has unset rules"))
+		errs = append(errs, invalidf("adapter has unset rules"))
 	}
 	if a.SAN.Kind == SANPipeCN && a.SAN.DocumentOID == nil {
-		errs = append(errs, errors.New("identity: SANPipeCN needs DocumentOID"))
+		errs = append(errs, invalidf("adapter SANPipeCN needs DocumentOID"))
 	}
 	if a.SAN.DocumentOID != nil && len(a.SAN.DocumentRules) == 0 {
-		errs = append(errs, errors.New("identity: SAN document without rules"))
+		errs = append(errs, invalidf("adapter SAN document without rules"))
 	}
 	return errors.Join(errs...)
 }

@@ -292,7 +292,7 @@ func adapterCases() []adapterCase {
 	bmpKinds := shapePlain()
 	bmpKinds.Kinds = identity.KindSet{identity.KindUTF8, identity.KindPrintable, identity.KindBMP}
 
-	return []adapterCase{
+	cases := []adapterCase{
 		// FNMT citizen, AC FNMT Usuarios (RSA): IDCES- or bare, SAN 5734.1.4 bare.
 		{name: "fnmt-rsa IDCES, SAN descending", adapter: rsa,
 			spec: testpki.CertSpec{Subject: person(idces, gn, sn), SANDirNames: san(fnmtDir(num, gn, sn1, sn2))}, want: ext(fnmtOK)},
@@ -535,7 +535,29 @@ func adapterCases() []adapterCase {
 				{OID: identity.OIDSurname, Value: sn},
 			}}},
 			want: ext(plainIdentity(dniDoc(num, idces), gn, sn))},
+
+		// R53 control: Spanish and Catalan names pass on both paths.
+		{name: "plain Spanish and Catalan names", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, "MARÍA ÀNGELS", "D'ARBÓS-GÜELL COL·L PEÑA ÇALÓ")},
+			want: ext(plainIdentity(dniDoc(num, idces), "MARÍA ÀNGELS", "D'ARBÓS-GÜELL COL·L PEÑA ÇALÓ"))},
+		{name: "fnmt-rsa Spanish and Catalan names", adapter: rsa,
+			spec: testpki.CertSpec{Subject: person(idces, "MARÍA ÀNGELS", "D'ARBÓS-GÜELL COL·L PEÑA"),
+				SANDirNames: san(fnmtDir(num, "MARÍA ÀNGELS", "D'ARBÓS-GÜELL", "COL·L PEÑA"))},
+			want: ext(fnmtIdentity(dniDoc(num, idces), "MARÍA ÀNGELS", "D'ARBÓS-GÜELL COL·L PEÑA", "D'ARBÓS-GÜELL", "COL·L PEÑA"))},
 	}
+	// R53: each rejected class, in a subject attribute and in a SAN
+	// dirName attribute. NBSP and the other spaces matter most here: before
+	// R53, NormalizeName folded them into an agreeing value.
+	for _, ic := range invisibleChars {
+		bad := "JU" + string(ic.r) + "AN"
+		cases = append(cases,
+			adapterCase{name: "plain subject GN " + ic.name, adapter: shapePlain(),
+				spec: testpki.CertSpec{Subject: person(idces, bad, sn)}, wantErr: invalid},
+			adapterCase{name: "fnmt-rsa SAN given name " + ic.name, adapter: rsa,
+				spec: testpki.CertSpec{Subject: person(idces, gn, sn), SANDirNames: san(fnmtDir(num, bad, sn1, sn2))}, wantErr: invalid},
+		)
+	}
+	return cases
 }
 
 func TestAdapterExtract(t *testing.T) {
@@ -618,8 +640,16 @@ func TestAdapterValidate(t *testing.T) {
 			if !tc.wantErr {
 				return
 			}
-			if _, xerr := tc.adapter.Extract(leaf.Cert); xerr == nil || xerr.Error() != err.Error() {
+			// R54: configuration errors wrap ErrInvalid like every other error.
+			if !errors.Is(err, identity.ErrInvalid) || errors.Is(err, identity.ErrUnsupportedDocument) {
+				t.Errorf("Validate err = %v, want ErrInvalid only", err)
+			}
+			_, xerr := tc.adapter.Extract(leaf.Cert)
+			if xerr == nil || xerr.Error() != err.Error() {
 				t.Errorf("Extract err = %v, want the Validate error %v", xerr, err)
+			}
+			if !errors.Is(xerr, identity.ErrInvalid) {
+				t.Errorf("Extract err = %v, want ErrInvalid", xerr)
 			}
 		})
 	}

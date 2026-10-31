@@ -4,6 +4,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/vocdoni/cert-check/certauth/identity"
@@ -145,6 +146,7 @@ type fieldCase struct {
 	want    string
 	found   bool
 	wantErr error
+	rule    string   // when set, the error must name this rule
 	values  []string // input values an error must not echo
 }
 
@@ -158,6 +160,9 @@ func runFieldCases(t *testing.T, cases []fieldCase) {
 				t.Fatalf("Field err = %v, want %v", err, tc.wantErr)
 			}
 			if err != nil {
+				if tc.rule != "" && !strings.Contains(err.Error(), tc.rule) {
+					t.Errorf("Field err = %q, want it to name the rule %q", err, tc.rule)
+				}
 				return
 			}
 			if got != tc.want || found != tc.found {
@@ -216,7 +221,7 @@ func nameFieldTextCases(tb testing.TB) []fieldCase {
 	}
 	k := identity.DefaultKinds
 	all := identity.KindSet{identity.KindUTF8, identity.KindPrintable, identity.KindBMP, identity.KindTeletex, identity.KindIA5}
-	return []fieldCase{
+	cases := []fieldCase{
 		{name: "clean utf8", der: utf8("JOSÉ MARÍA"), oid: oidGN, kinds: k, want: "JOSÉ MARÍA", found: true},
 		{name: "clean printable", der: printable("O'NEIL-SMITH (JR.)"), oid: oidGN, kinds: k, want: "O'NEIL-SMITH (JR.)", found: true},
 		{name: "bell U+0007", der: utf8("JU\u0007AN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, values: []string{"JU\u0007AN"}},
@@ -237,7 +242,68 @@ func nameFieldTextCases(tb testing.TB) []fieldCase {
 		{name: "bmp control", der: bmp('J', 0x0007), oid: oidGN, kinds: all, wantErr: identity.ErrInvalid},
 		{name: "teletex C1 control", der: nameDER(atvDER(tb, oidGN, testpki.TagTeletex, []byte("JUAN\x85"))), oid: oidGN, kinds: all, wantErr: identity.ErrInvalid},
 		{name: "ia5 high byte", der: nameDER(atvDER(tb, oidGN, asn1.TagIA5String, []byte("JUAN\x80"))), oid: oidGN, kinds: all, wantErr: identity.ErrInvalid, values: []string{"JUAN\x80"}},
+
+		// R53 in the other string kinds.
+		{name: "bmp soft hyphen", der: bmp('J', 0x00ad, 'N'), oid: oidGN, kinds: all, wantErr: identity.ErrInvalid, rule: "format character"},
+		{name: "bmp noncharacter U+FFFE", der: bmp('J', 0xfffe), oid: oidGN, kinds: all, wantErr: identity.ErrInvalid, rule: "noncharacter"},
+		{name: "bmp private use", der: bmp('J', 0xe000), oid: oidGN, kinds: all, wantErr: identity.ErrInvalid, rule: "private-use character"},
+		{name: "teletex NBSP", der: nameDER(atvDER(tb, oidGN, testpki.TagTeletex, []byte("JU\xa0AN"))), oid: oidGN, kinds: all, wantErr: identity.ErrInvalid, rule: "space other than U+0020"},
+		{name: "teletex soft hyphen", der: nameDER(atvDER(tb, oidGN, testpki.TagTeletex, []byte("JU\xadAN"))), oid: oidGN, kinds: all, wantErr: identity.ErrInvalid, rule: "format character"},
+
+		// Spanish and Catalan names keep passing: Ñ, Ç, À, Ü, the Catalan
+		// middle dot, apostrophe, hyphen, lower case and combining marks.
+		{name: "Spanish and Catalan letters", der: utf8(spanishNames), oid: oidGN, kinds: k, want: spanishNames, found: true},
+		{name: "Spanish lower case", der: utf8("Peña Çabrera Àlvarez Güell"), oid: oidGN, kinds: k, want: "Peña Çabrera Àlvarez Güell", found: true},
+		{name: "decomposed accents", der: utf8("PEN\u0303A GU\u0308ELL"), oid: oidGN, kinds: k, want: "PEN\u0303A GU\u0308ELL", found: true},
+		{name: "teletex Latin-1 letters", der: nameDER(atvDER(tb, oidGN, testpki.TagTeletex, []byte("PE\xd1A \xc7\xc0\xdc\xb7L'O-K"))), oid: oidGN, kinds: all, want: "PEÑA ÇÀÜ·L'O-K", found: true},
+		{name: "bmp Spanish letters", der: bmp('P', 'E', 0x00d1, 'A', ' ', 0x00b7), oid: oidGN, kinds: all, want: "PEÑA ·", found: true},
 	}
+	for _, ic := range invisibleChars {
+		v := "JU" + string(ic.r) + "AN"
+		cases = append(cases, fieldCase{name: ic.name, der: utf8(v), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: ic.rule, values: []string{v}})
+	}
+	return cases
+}
+
+// spanishNames exercises every non-ASCII letter class a Spanish or Catalan
+// name uses; ruling R53 must keep accepting it.
+const spanishNames = "MARÍA ÀNGELS D'ARBÓS-GÜELL PEÑA COL·LEGI ÇALÓ"
+
+// invisibleChars has at least one code point per class rejected by ruling
+// R53, with the rule its error must name.
+var invisibleChars = []struct {
+	name string
+	r    rune
+	rule string
+}{
+	{"Cf soft hyphen U+00AD", 0x00ad, "format character"},
+	{"Cf zero width space U+200B", 0x200b, "format character"},
+	{"Cf zero width non-joiner U+200C", 0x200c, "format character"},
+	{"Cf zero width joiner U+200D", 0x200d, "format character"},
+	{"Cf word joiner U+2060", 0x2060, "format character"},
+	{"Cf invisible plus U+2064", 0x2064, "format character"},
+	{"Cf byte order mark U+FEFF", 0xfeff, "format character"},
+	{"Cf Arabic number sign U+0600", 0x0600, "format character"},
+	{"Cf language tag U+E0001", 0xe0001, "format character"},
+	{"Zl line separator U+2028", 0x2028, "line or paragraph separator"},
+	{"Zp paragraph separator U+2029", 0x2029, "line or paragraph separator"},
+	{"Co private use U+E000", 0xe000, "private-use character"},
+	{"Co private use U+F8FF", 0xf8ff, "private-use character"},
+	{"Co plane 15 U+F0000", 0xf0000, "private-use character"},
+	{"Co plane 16 U+10FFFD", 0x10fffd, "private-use character"},
+	{"noncharacter U+FDD0", 0xfdd0, "noncharacter"},
+	{"noncharacter U+FDEF", 0xfdef, "noncharacter"},
+	{"noncharacter U+FFFE", 0xfffe, "noncharacter"},
+	{"noncharacter U+FFFF", 0xffff, "noncharacter"},
+	{"noncharacter U+1FFFE", 0x1fffe, "noncharacter"},
+	{"noncharacter U+10FFFF", 0x10ffff, "noncharacter"},
+	{"Zs no-break space U+00A0", 0x00a0, "space other than U+0020"},
+	{"Zs ogham space U+1680", 0x1680, "space other than U+0020"},
+	{"Zs en quad U+2000", 0x2000, "space other than U+0020"},
+	{"Zs hair space U+200A", 0x200a, "space other than U+0020"},
+	{"Zs narrow no-break space U+202F", 0x202f, "space other than U+0020"},
+	{"Zs medium math space U+205F", 0x205f, "space other than U+0020"},
+	{"Zs ideographic space U+3000", 0x3000, "space other than U+0020"},
 }
 
 func TestNameFieldText(t *testing.T) { runFieldCases(t, nameFieldTextCases(t)) }
@@ -314,6 +380,14 @@ func malformedNameCases(tb testing.TB) []malformedNameCase {
 		{"empty SET", seqDER(setDER())},
 		{"ATV is not a SEQUENCE", seqDER(setDER(setDER(oidDER(tb, oidGN), tlv(asn1.TagUTF8String, []byte("JUAN")))))},
 		{"ATV without value", seqDER(setDER(seqDER(oidDER(tb, oidGN))))},
+		{"ATV empty SEQUENCE", seqDER(setDER(seqDER()))},
+		// R52: nothing may follow the value.
+		{"ATV with a trailing extra element", seqDER(setDER(seqDER(oidDER(tb, oidGN), tlv(asn1.TagUTF8String, []byte("JUAN")), tlv(asn1.TagUTF8String, []byte("PEDRO")))))},
+		{"ATV with a trailing NULL", seqDER(setDER(seqDER(oidDER(tb, oidGN), tlv(asn1.TagUTF8String, []byte("JUAN")), []byte{asn1.TagNull, 0x00})))},
+		{"ATV with a trailing byte", seqDER(setDER(seqDER(oidDER(tb, oidGN), tlv(asn1.TagUTF8String, []byte("JUAN")), []byte{0x00})))},
+		{"second ATV in an RDN with a trailing element", seqDER(setDER(gnATV, seqDER(oidDER(tb, oidSN), tlv(asn1.TagUTF8String, []byte("GARCIA")), tlv(asn1.TagUTF8String, []byte("LOPEZ")))))},
+		{"ATV context-specific constructed", seqDER(setDER(tlv(0xb0, oidDER(tb, oidGN), tlv(asn1.TagUTF8String, []byte("JUAN")))))},
+		{"ATV primitive with the SEQUENCE tag number", seqDER(setDER(tlv(0x10, oidDER(tb, oidGN), tlv(asn1.TagUTF8String, []byte("JUAN")))))},
 		{"ATV type is not an OID", seqDER(setDER(seqDER(tlv(asn1.TagUTF8String, []byte("2.5.4.42")), tlv(asn1.TagUTF8String, []byte("JUAN")))))},
 		{"ATV value truncated", seqDER(setDER(seqDER(oidDER(tb, oidGN), []byte{asn1.TagUTF8String, 0x05, 'J'})))},
 		{"non-minimal length", append([]byte{tagSequence, 0x81, byte(len(good) - 2)}, good[2:]...)},

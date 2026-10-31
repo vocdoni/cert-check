@@ -4,6 +4,7 @@ import (
 	"encoding/asn1"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +59,9 @@ func TestParseSANDirectoryNames(t *testing.T) {
 		{name: "dirName holds a malformed Name", der: seqDER(generalName(4, true, seqDER(setDER()))), wantErr: true},
 		{name: "dirName holds trailing bytes", der: seqDER(generalName(4, true, append(first.DER(), 0x00))), wantErr: true},
 		{name: "dirName holds two Names", der: seqDER(generalName(4, true, append(first.DER(), second.DER()...))), wantErr: true},
+		{name: "dirName ATV with a trailing extra element (R52)", der: seqDER(generalName(4, true, seqDER(setDER(seqDER(
+			oidDER(t, identity.OIDGivenName), tlv(asn1.TagUTF8String, []byte("JUAN")), tlv(asn1.TagUTF8String, []byte("PEDRO"))))))), wantErr: true},
+		{name: "dirName ATV without value (R52)", der: seqDER(generalName(4, true, seqDER(setDER(seqDER(oidDER(t, identity.OIDGivenName)))))), wantErr: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -97,6 +101,37 @@ func TestParseSANDirectoryNames(t *testing.T) {
 			}
 		})
 	}
+
+	// R53 through the SAN path: the dirName parses, reading the attribute fails.
+	t.Run("dirName attribute text", func(t *testing.T) {
+		read := func(t *testing.T, v string) (string, error) {
+			t.Helper()
+			fnmtGiven := asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 5734, 1, 1}
+			names, err := identity.ParseSANDirectoryNames(seqDER(email, dirNameGN(testpki.Name{testpki.UTF8(fnmtGiven, v)})))
+			if err != nil || len(names) != 1 {
+				t.Fatalf("ParseSANDirectoryNames = %d names, %v; want 1, nil", len(names), err)
+			}
+			got, _, err := names[0].Field(fnmtGiven, identity.DefaultKinds)
+			return got, err
+		}
+		for _, ic := range invisibleChars {
+			t.Run(ic.name, func(t *testing.T) {
+				v := "JU" + string(ic.r) + "AN"
+				_, err := read(t, v)
+				if !errors.Is(err, identity.ErrInvalid) || !strings.Contains(err.Error(), ic.rule) {
+					t.Fatalf("Field err = %v, want ErrInvalid naming %q", err, ic.rule)
+				}
+				if strings.Contains(err.Error(), v) {
+					t.Errorf("error %q echoes the value", err)
+				}
+			})
+		}
+		t.Run("Spanish and Catalan letters", func(t *testing.T) {
+			if got, err := read(t, spanishNames); err != nil || got != spanishNames {
+				t.Errorf("Field = (%q, %v), want (%q, nil)", got, err, spanishNames)
+			}
+		})
+	})
 
 	t.Run("certificate", func(t *testing.T) {
 		ca := testpki.NewRoot(t, "san-root", testpki.CertSpec{})

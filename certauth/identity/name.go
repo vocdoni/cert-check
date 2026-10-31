@@ -10,6 +10,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -94,21 +95,42 @@ func ParseName(der []byte) (Name, error) {
 			return Name{}, invalidf("name: RDN %d is empty", i)
 		}
 		for len(inner) > 0 {
-			var atv struct {
-				Type  asn1.ObjectIdentifier
-				Value asn1.RawValue
-			}
+			var atv asn1.RawValue
 			inner, err = asn1.Unmarshal(inner, &atv)
 			if err != nil {
+				return Name{}, invalidf("name: RDN %d: malformed attribute", i)
+			}
+			oid, value, ok := parseATV(atv)
+			if !ok {
 				return Name{}, invalidf("name: RDN %d: malformed attribute", i)
 			}
 			if len(out.Attributes) == maxNameAttributes {
 				return Name{}, invalidf("name: too many attributes")
 			}
-			out.Attributes = append(out.Attributes, decodeAttribute(atv.Type, atv.Value, i))
+			out.Attributes = append(out.Attributes, decodeAttribute(oid, value, i))
 		}
 	}
 	return out, nil
+}
+
+// parseATV reads AttributeTypeAndValue ::= SEQUENCE { type OID, value ANY }
+// and rejects a missing value or any element after it (ruling R52);
+// encoding/asn1 struct decoding would silently accept trailing elements.
+func parseATV(atv asn1.RawValue) (asn1.ObjectIdentifier, asn1.RawValue, bool) {
+	if atv.Class != asn1.ClassUniversal || atv.Tag != asn1.TagSequence || !atv.IsCompound {
+		return nil, asn1.RawValue{}, false
+	}
+	var oid asn1.ObjectIdentifier
+	rest, err := asn1.Unmarshal(atv.Bytes, &oid)
+	if err != nil {
+		return nil, asn1.RawValue{}, false
+	}
+	var value asn1.RawValue
+	rest, err = asn1.Unmarshal(rest, &value)
+	if err != nil || len(rest) != 0 {
+		return nil, asn1.RawValue{}, false
+	}
+	return oid, value, true
 }
 
 func decodeAttribute(oid asn1.ObjectIdentifier, v asn1.RawValue, rdn int) Attribute {
@@ -209,7 +231,11 @@ func (n Name) Field(oid asn1.ObjectIdentifier, kinds KindSet) (value string, fou
 	return value, found, nil
 }
 
-// checkText rejects control characters, U+FFFD and bidi controls.
+// checkText rejects control characters, U+FFFD, bidi controls and, per
+// ruling R53, every other invisible or ambiguous code point: format
+// characters (Cf), line and paragraph separators, private-use code points,
+// noncharacters and any space other than U+0020. The errors name the rule,
+// never the character.
 func checkText(s string) error {
 	for _, r := range s {
 		switch {
@@ -219,6 +245,16 @@ func checkText(s string) error {
 			return errors.New("replacement character")
 		case r == 0x061c, r == 0x200e, r == 0x200f, r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069:
 			return errors.New("bidi control")
+		case unicode.Is(unicode.Cf, r):
+			return errors.New("format character")
+		case unicode.In(r, unicode.Zl, unicode.Zp):
+			return errors.New("line or paragraph separator")
+		case unicode.Is(unicode.Co, r):
+			return errors.New("private-use character")
+		case r >= 0xfdd0 && r <= 0xfdef, r&0xfffe == 0xfffe:
+			return errors.New("noncharacter")
+		case r != ' ' && unicode.Is(unicode.Zs, r):
+			return errors.New("space other than U+0020")
 		}
 	}
 	return nil
