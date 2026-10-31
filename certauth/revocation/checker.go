@@ -1,0 +1,282 @@
+package revocation
+
+import (
+	"cmp"
+	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/url"
+	"time"
+)
+
+// Options configures a Checker.
+type Options struct {
+	UserAgent        string           // "cert-check/<version>"
+	DialContext      DialFunc         // tests only; nil = address-checking dialer
+	Now              func() time.Time // nil = time.Now
+	CRLCacheBytes    int64            // 0 = DefaultCRLCacheBytes
+	OCSPCacheEntries int              // 0 = DefaultOCSPCacheEntries
+	Logger           *slog.Logger     // nil = slog.Default()
+	OCSPTimeout      time.Duration    // 0 = OCSPTimeout (5 s); tests shorten it
+	CRLTimeout       time.Duration    // 0 = CRLTimeout (15 s)
+}
+
+// Checker checks revocation status. It is safe for concurrent use.
+type Checker struct {
+	fetcher *Fetcher
+	now     func() time.Time
+	crls    *crlCache
+	ocsp    *ocspCache
+	log     *slog.Logger
+	ocspTO  time.Duration
+	crlTO   time.Duration
+}
+
+// NewChecker builds a Checker.
+func NewChecker(o Options) (*Checker, error) {
+	c := &Checker{
+		fetcher: NewFetcher(FetcherOptions{UserAgent: o.UserAgent, DialContext: o.DialContext}),
+		now:     o.Now,
+		crls:    newCRLCache(o.CRLCacheBytes),
+		ocsp:    newOCSPCache(o.OCSPCacheEntries),
+		log:     o.Logger,
+		ocspTO:  cmp.Or(o.OCSPTimeout, OCSPTimeout),
+		crlTO:   cmp.Or(o.CRLTimeout, CRLTimeout),
+	}
+	if c.now == nil {
+		c.now = time.Now
+	}
+	if o.CRLCacheBytes == 0 {
+		c.crls.limit = DefaultCRLCacheBytes
+	}
+	if o.OCSPCacheEntries == 0 {
+		c.ocsp.limit = DefaultOCSPCacheEntries
+	}
+	if c.log == nil {
+		c.log = slog.Default()
+	}
+	return c, nil
+}
+
+// Check returns the revocation status of cert, issued by issuer, under
+// policy p. issuer must come from the caller's verified chain. A CA
+// certificate (pinned intermediate) is checked with CA scope (ARLs with
+// onlyContainsCACerts accepted). The error is non-nil only for misuse.
+func (c *Checker) Check(ctx context.Context, cert, issuer *x509.Certificate, p Policy) (Result, error) {
+	if cert == nil || issuer == nil {
+		return Result{}, errors.New("revocation: nil certificate or issuer")
+	}
+	if err := p.Validate(); err != nil {
+		return Result{}, err
+	}
+	now := c.now()
+	res := Result{CheckedAt: now, Reason: -1}
+	scope := ScopeLeaf
+	if cert.BasicConstraintsValid && cert.IsCA {
+		scope = ScopeCA
+	}
+
+	ocspStatus := c.checkOCSP(ctx, cert, issuer, p, now, &res)
+	switch ocspStatus {
+	case StatusGood, StatusRevoked, StatusUnknown:
+		res.Status, res.Method = ocspStatus, MethodOCSP
+		return res, nil
+	}
+	crlStatus := StatusUnsupportedMethod
+	if p.AllowCRL {
+		crlStatus = c.checkCRL(ctx, cert, issuer, p, scope, now, &res)
+		if crlStatus == StatusGood || crlStatus == StatusRevoked {
+			res.Status, res.Method = crlStatus, MethodCRL
+			return res, nil
+		}
+	}
+	res.Status = worstFailure(ocspStatus, crlStatus)
+	if res.Status == StatusInvalidEvidence {
+		c.log.Warn("revocation evidence rejected", "issuer", issuer.Subject.String(), "detail", res.Detail)
+	}
+	return res, nil
+}
+
+// worstFailure folds two failed methods into one status: invalid evidence
+// first (it is logged), then stale, otherwise unavailable. Neither method
+// usable is unavailable.
+func worstFailure(a, b Status) Status {
+	switch {
+	case a == StatusInvalidEvidence || b == StatusInvalidEvidence:
+		return StatusInvalidEvidence
+	case a == StatusStale || b == StatusStale:
+		return StatusStale
+	}
+	return StatusUnavailable
+}
+
+func (c *Checker) checkOCSP(ctx context.Context, cert, issuer *x509.Certificate, p Policy, now time.Time, res *Result) Status {
+	var urls []string
+	for _, s := range cert.OCSPServer {
+		if u, err := url.Parse(s); err == nil && hostAllowed(u, p.OCSPHosts) {
+			urls = append(urls, s)
+		}
+	}
+	if len(urls) == 0 {
+		res.Attempts = append(res.Attempts, Attempt{Method: MethodOCSP, Outcome: StatusUnsupportedMethod, Detail: "no allowlisted OCSP URL"})
+		res.Detail = "no allowlisted OCSP URL"
+		return StatusUnsupportedMethod
+	}
+	key := issuerKey(issuer) + " " + SerialKey(cert.SerialNumber)
+	if it, ok := c.ocsp.get(key, now); ok {
+		c.fillOCSP(res, it.ev, it.source)
+		res.Attempts = append(res.Attempts, Attempt{Method: MethodOCSP, URL: it.source, Outcome: it.status, FromCache: true,
+			ThisUpdate: it.ev.Single.ThisUpdate, NextUpdate: it.ev.Single.NextUpdate, ResponderSubject: it.ev.ResponderSubject})
+		return it.status
+	}
+	id, err := NewCertID(crypto.SHA1, cert, issuer)
+	if err != nil {
+		res.Detail = err.Error()
+		return StatusInvalidEvidence
+	}
+	last := StatusUnavailable
+	for _, u := range urls {
+		st, ev := c.ocspOnce(ctx, u, id, issuer, p, now, res)
+		switch st {
+		case StatusGood, StatusRevoked, StatusUnknown:
+			c.ocsp.put(ocspItem{key: key, ev: ev, status: st, source: hostOf(u)}) // put ignores unknown
+			return st
+		}
+		last = worstFailure(last, st)
+	}
+	return last
+}
+
+func (c *Checker) ocspOnce(ctx context.Context, u string, id CertID, issuer *x509.Certificate, p Policy, now time.Time, res *Result) (Status, OCSPEvidence) {
+	var nonce []byte
+	if p.OCSPNonce {
+		nonce = make([]byte, NonceLength)
+		if _, err := rand.Read(nonce); err != nil {
+			res.Detail = "nonce generation failed"
+			return StatusUnavailable, OCSPEvidence{}
+		}
+	}
+	reqDER, nonceExt, err := MarshalRequest(id, nonce)
+	if err != nil {
+		res.Detail = err.Error()
+		return StatusUnavailable, OCSPEvidence{}
+	}
+	at := Attempt{Method: MethodOCSP, URL: u, NonceSent: nonce != nil}
+	fr, err := c.fetcher.Fetch(ctx, FetchRequest{
+		URL: u, Body: reqDER, ContentType: "application/ocsp-request", Accept: "application/ocsp-response",
+		MaxBytes: MaxOCSPResponse, Timeout: c.ocspTO, AllowedHosts: p.AllHosts(),
+	})
+	at.HTTPStatus, at.Duration = fr.StatusCode, fr.Duration
+	record := func(st Status, detail string) Status {
+		at.Outcome, at.Detail = st, detail
+		res.Attempts = append(res.Attempts, at)
+		res.Detail = fmt.Sprintf("OCSP %s: %s", u, detail)
+		return st
+	}
+	if err != nil {
+		return record(StatusUnavailable, err.Error()), OCSPEvidence{}
+	}
+	resp, err := ParseResponse(fr.Body)
+	if err != nil {
+		return record(StatusInvalidEvidence, err.Error()), OCSPEvidence{}
+	}
+	ev, st, detail := VerifyOCSP(OCSPInput{Response: resp, Want: id, Issuer: issuer, Nonce: nonceExt, Now: now, MaxAge: p.MaxAge()})
+	at.ProducedAt, at.ThisUpdate, at.NextUpdate = ev.ProducedAt, ev.Single.ThisUpdate, ev.Single.NextUpdate
+	at.ResponderSubject, at.NonceEchoed = ev.ResponderSubject, ev.NonceEchoed
+	st = record(st, detail)
+	if st == StatusGood || st == StatusRevoked || st == StatusUnknown {
+		c.fillOCSP(res, ev, hostOf(u))
+	}
+	return st, ev
+}
+
+func (c *Checker) fillOCSP(res *Result, ev OCSPEvidence, source string) {
+	res.ThisUpdate, res.NextUpdate, res.Source = ev.Single.ThisUpdate, ev.Single.NextUpdate, source
+	if ev.Single.Status == CertRevoked {
+		res.RevokedAt, res.Reason = ev.Single.RevokedAt, ev.Single.Reason
+	}
+}
+
+func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, p Policy, scope Scope, now time.Time, res *Result) Status {
+	dps, err := ParseCRLDistributionPoints(cert)
+	if err != nil {
+		res.Attempts = append(res.Attempts, Attempt{Method: MethodCRL, Outcome: StatusUnsupportedMethod, Detail: err.Error()})
+		return StatusUnsupportedMethod
+	}
+	last, tried := StatusUnsupportedMethod, false
+	for _, dp := range usableDistributionPoints(dps, issuer) {
+		for _, gn := range dp.FullName {
+			raw, ok := gn.URI()
+			if !ok {
+				continue
+			}
+			u, err := url.Parse(raw)
+			if err != nil || !hostAllowed(u, p.CRLHosts) {
+				continue
+			}
+			tried = true
+			st := c.crlOnce(ctx, raw, cert, issuer, dp, p, scope, now, res)
+			if st == StatusGood || st == StatusRevoked {
+				return st
+			}
+			last = worstFailure(last, st)
+		}
+	}
+	if !tried {
+		res.Attempts = append(res.Attempts, Attempt{Method: MethodCRL, Outcome: StatusUnsupportedMethod, Detail: "no usable allowlisted CDP URL"})
+		return StatusUnsupportedMethod
+	}
+	return last
+}
+
+func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Certificate, dp DistributionPoint, p Policy, scope Scope, now time.Time, res *Result) Status {
+	key := issuerKey(issuer) + " " + u
+	load := c.crls.load(ctx, key, now, c.crlTO, func(fctx context.Context) crlLoad {
+		at := Attempt{Method: MethodCRL, URL: u}
+		fr, err := c.fetcher.Fetch(fctx, FetchRequest{URL: u, MaxBytes: MaxCRLResponse, Timeout: c.crlTO, AllowedHosts: p.AllHosts()})
+		at.HTTPStatus, at.Duration = fr.StatusCode, fr.Duration
+		if err != nil {
+			return crlLoad{status: StatusUnavailable, err: err, attempt: at}
+		}
+		parsed, st, err := ParseCRL(fr.Body, issuer)
+		if err != nil {
+			return crlLoad{status: st, err: err, attempt: at}
+		}
+		parsed.URL = u
+		return crlLoad{crl: parsed, status: StatusGood, attempt: at}
+	})
+	at := load.attempt
+	if at.URL == "" {
+		at.URL = u
+	}
+	if load.err != nil {
+		at.Outcome, at.Detail = load.status, load.err.Error()
+		res.Attempts = append(res.Attempts, at)
+		res.Detail = fmt.Sprintf("CRL %s: %s", u, at.Detail)
+		return load.status
+	}
+	st, rec, detail := EvaluateCRL(load.crl, cert, dp, scope, now)
+	at.Outcome, at.Detail = st, detail
+	at.ThisUpdate, at.NextUpdate = load.crl.List.ThisUpdate, load.crl.List.NextUpdate
+	res.Attempts = append(res.Attempts, at)
+	res.Detail = fmt.Sprintf("CRL %s: %s", u, detail)
+	if st == StatusGood || st == StatusRevoked {
+		res.ThisUpdate, res.NextUpdate, res.Source = load.crl.List.ThisUpdate, load.crl.List.NextUpdate, hostOf(u)
+		if st == StatusRevoked {
+			res.RevokedAt, res.Reason = rec.RevokedAt, rec.Reason
+		}
+	}
+	return st
+}
+
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
