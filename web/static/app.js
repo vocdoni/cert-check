@@ -32,6 +32,7 @@
   const LINK_EXPIRED = ['The link has expired. Start again.'];
   const CHOOSE_CERTIFICATE = [
     'When your browser asks, choose a certificate.',
+    'Browsers only list certificates that are still valid and were issued by the selected provider. If no list appeared, check the expiry date of your certificate in the browser certificate manager.',
     'Browsers may remember an earlier choice. Close all browser windows and try again.',
   ];
 
