@@ -1,6 +1,6 @@
 # Certificate Authentication Checker: design
 
-Status: audited (2026-10-30)   Class: architectural
+Status: approved (2026-10-31)   Class: architectural
 Owner decisions so far:
 - 2026-10-30 (request): Go backend + very simple Vocdoni-branded web UI. One page titled
   "Certificate Authentication Checker", a selector of supported certificates and an
@@ -19,6 +19,7 @@ Owner decisions so far:
   Sectigo) plus a "Beta" group (FNMT representative/employee, Firmaprofesional, ANF, Uanataca,
   SIGNE, Lleidanet, DNIe).
 - 2026-10-30 (Q3): auth listener TLS 1.2 by default (D2), switch for 1.3.
+- 2026-10-31: spec approved; Cloudflare token scope = zone-wide `vocdoni.dev` (risk accepted, delegation not used).
 - 2026-10-30 (mid-audit request): on error, show a detailed diagnostic report that is easy to copy/paste for Vocdoni support.
 
 ## Problem
