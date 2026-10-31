@@ -36,8 +36,25 @@ type Checker struct {
 	crlTO   time.Duration
 }
 
-// NewChecker builds a Checker.
+// NewChecker builds a Checker. Zero cache bounds and timeouts take the
+// defaults; negative ones are an error.
 func NewChecker(o Options) (*Checker, error) {
+	var errs []error
+	if o.CRLCacheBytes < 0 {
+		errs = append(errs, errors.New("revocation: negative CRLCacheBytes"))
+	}
+	if o.OCSPCacheEntries < 0 {
+		errs = append(errs, errors.New("revocation: negative OCSPCacheEntries"))
+	}
+	if o.OCSPTimeout < 0 {
+		errs = append(errs, errors.New("revocation: negative OCSPTimeout"))
+	}
+	if o.CRLTimeout < 0 {
+		errs = append(errs, errors.New("revocation: negative CRLTimeout"))
+	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
 	c := &Checker{
 		fetcher: NewFetcher(FetcherOptions{UserAgent: o.UserAgent, DialContext: o.DialContext}),
 		now:     o.Now,

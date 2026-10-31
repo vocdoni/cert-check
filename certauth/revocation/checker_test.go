@@ -946,6 +946,35 @@ func TestCheckMisuse(t *testing.T) {
 	}
 }
 
+func TestNewCheckerOptions(t *testing.T) {
+	cases := []struct {
+		name    string
+		opts    Options
+		wantErr string // "" = accepted
+	}{
+		{"zero values take the defaults", Options{}, ""},
+		{"positive values", Options{CRLCacheBytes: 1, OCSPCacheEntries: 1, OCSPTimeout: time.Millisecond, CRLTimeout: time.Millisecond}, ""},
+		{"negative CRLCacheBytes", Options{CRLCacheBytes: -1}, "CRLCacheBytes"},
+		{"negative OCSPCacheEntries", Options{OCSPCacheEntries: -1}, "OCSPCacheEntries"},
+		{"negative OCSPTimeout", Options{OCSPTimeout: -time.Second}, "OCSPTimeout"},
+		{"negative CRLTimeout", Options{CRLTimeout: -time.Second}, "CRLTimeout"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := NewChecker(tc.opts)
+			if tc.wantErr == "" {
+				if err != nil || c == nil {
+					t.Fatalf("NewChecker(%+v) = %v, %v, want a Checker and nil", tc.opts, c, err)
+				}
+				return
+			}
+			if err == nil || c != nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("NewChecker(%+v) = %v, %v, want nil and an error naming %s", tc.opts, c, err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestCheckConcurrent(t *testing.T) {
 	f := chkTNewFixture(t)
 	f.serve(t, chkTOCSPHost, f.ocsp.Handler(t))
