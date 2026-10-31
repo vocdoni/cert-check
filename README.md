@@ -185,7 +185,7 @@ CERTCHECK_PUBLIC_URL=https://cert-check.vocdoni.dev
 CERTCHECK_AUTH_DOMAIN=auth.cert-check.vocdoni.dev
 CERTCHECK_ACME_EMAIL=<ops mailbox>
 CERTCHECK_ACME_CA=staging          # first issuance, then production
-CERTCHECK_TRUSTED_PROXY_HOPS=1
+CERTCHECK_TRUSTED_PROXY_HOPS=2   # Railway edge: XFF = "<client>, <railway hop>" (confirmed 2026-10-31)
 CERTCHECK_LOG_LEVEL=info
 ```
 

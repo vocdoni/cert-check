@@ -661,11 +661,14 @@ otherwise).
   - Lifetime: 5 min from creation. A completed result is kept until redeemed or expired.
   - A janitor runs every 30 s.
   - Capacity 10 000 transactions → 503 when full.
-- **Rate limiting.** Client IP on the main listener = the rightmost `X-Forwarded-For` entry,
-  which is the one appended by the Railway edge; `CERTCHECK_TRUSTED_PROXY_HOPS` (default `1`)
-  selects it, and the header the edge actually sets (`X-Forwarded-For`, `X-Real-IP`,
-  `X-Envoy-External-Address`) is confirmed during rollout step 4 and recorded here. The leftmost
-  entry is never used. Without any forwarded header (local run) the TCP remote address is used.
+- **Rate limiting.** Client IP on the main listener = the `X-Forwarded-For` entry
+  `CERTCHECK_TRUSTED_PROXY_HOPS` places from the right (default `1`). Confirmed at rollout
+  (2026-10-31): the Railway edge strips any client-supplied `X-Forwarded-For` and sends exactly
+  two entries, `<client>, <railway hop>` (a spoofed header still arrives as two entries;
+  Railway staff: "the first value of the X-Forwarded-For is the real connecting IP"). Production
+  therefore runs with `CERTCHECK_TRUSTED_PROXY_HOPS=2`, which selects the client. `X-Real-IP` is
+  also set by the edge but not used. Without any forwarded header (local run) the TCP remote
+  address is used.
   Limits: 20 transaction creations and 60 redeems per minute per IP → 429 with `Retry-After`.
   IPv6 clients are keyed by their /64 (one allocation), IPv4 clients by address.
   The auth listener caps concurrent connections at 512 (listener-level semaphore; excess
