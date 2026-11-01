@@ -61,7 +61,7 @@ type App struct {
 	redeemLimiter *ipLimiter
 	mainConns     int                // MainMaxConns; tests shorten it
 	shutdownWait  time.Duration      // shutdownTimeout; tests shorten it
-	stopService   context.CancelFunc // cancels auth.service when shutdown starts
+	stopService   context.CancelFunc // cancels auth.service when the shutdown drain expires
 	mainUp        atomic.Bool
 	authUp        atomic.Bool
 	authTLS       *tls.Config
@@ -140,10 +140,10 @@ func newMainServer(h http.Handler, log *slog.Logger) *http.Server {
 // Run serves both listeners until ctx ends, then shuts down gracefully.
 // mainLn is plain TCP (the platform edge terminates TLS), wrapped with the
 // MainMaxConns cap; authLn is wrapped with the 512-connection cap and TLS
-// here, and served once the certificate is ready. Shutdown cancels the
-// in-flight validations, drains both servers concurrently for up to 15 s and
-// then closes the connections left. Both listeners are closed when Run
-// returns. Run is called once per App.
+// here, and served once the certificate is ready. Shutdown drains both
+// servers concurrently for up to 15 s; when that expires it cancels the
+// validations still running and closes the connections left. Both listeners
+// are closed when Run returns. Run is called once per App.
 func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 	mainSrv := newMainServer(a.MainHandler(), a.log)
 	authSrv := newAuthServer(a.auth, a.log)
@@ -182,14 +182,17 @@ func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 	}
 	a.mainUp.Store(false)
 	a.authUp.Store(false)
-	a.stopService() // in-flight validations end now, so their requests finish within the drain
 	shutdownCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), a.shutdownWait)
 	defer stop()
+	// In-flight validations may finish within the drain (a redeploy should
+	// not fail them); those still running when it expires are cancelled.
+	defer context.AfterFunc(shutdownCtx, a.stopService)()
 	errs := make(chan error, 2)
 	for _, srv := range []*http.Server{mainSrv, authSrv} {
 		go func() { errs <- shutdown(shutdownCtx, srv) }()
 	}
 	runErr = errors.Join(runErr, <-errs, <-errs)
+	a.stopService() // nothing outlives Run
 	cancel()
 	wg.Wait()
 	return runErr

@@ -35,7 +35,7 @@ type authHandler struct {
 	slots     chan struct{}
 	slotWait  time.Duration   // ValidationSlotWait; tests shorten it
 	budget    time.Duration   // ValidationBudget; tests shorten it
-	service   context.Context // parent of every validation; cancelled when shutdown starts
+	service   context.Context // parent of every validation; cancelled when the shutdown drain expires
 	log       *slog.Logger
 	version   string
 	now       func() time.Time // diagnostics time of server-made errors
@@ -81,7 +81,8 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // validate runs the checker in a bounded slot with a 40 s budget on the
-// service context: detached from client disconnects, cancelled by shutdown.
+// service context: detached from client disconnects, cancelled when the
+// shutdown drain expires.
 // A missed slot or the budget yields internal (retryable).
 func (a *authHandler) validate(r *http.Request, provider string) Outcome {
 	wait := time.NewTimer(a.slotWait)
