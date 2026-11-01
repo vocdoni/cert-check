@@ -46,6 +46,7 @@ var (
 	ocspTOIDExtA        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 1}
 	ocspTOIDExtB        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 2}
 	ocspTOIDExtC        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 3}
+	ocspTOIDKeyUsage    = asn1.ObjectIdentifier{2, 5, 29, 15}
 	ocspTDERNull        = []byte{0x05, 0x00}
 )
 

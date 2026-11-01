@@ -30,6 +30,12 @@ type ocspTVerifyFixture struct {
 	rsa1024Resp    *testpki.Responder
 	p224Resp       *testpki.Responder
 	criticalResp   *testpki.Responder // unknown critical extension
+	kuCritResp     *testpki.Responder // critical KeyUsage keyEncipherment
+	kuNonCritResp  *testpki.Responder // non-critical KeyUsage keyEncipherment
+	kuEmptyResp    *testpki.Responder // KeyUsage with no bit set
+	noKUResp       *testpki.Responder // no KeyUsage extension
+	issuerNameResp *testpki.Responder // the issuer's subject, its own key
+	selfResp       *testpki.Responder // the serial of the checked leaf
 }
 
 func ocspTRespName(cn string) testpki.Name {
@@ -84,6 +90,28 @@ func ocspTNewVerifyFixture(tb testing.TB) *ocspTVerifyFixture {
 	f.criticalResp = ca.OCSPResponder(tb, testpki.CertSpec{
 		Now: now, Subject: ocspTRespName("ocspT critical OCSP"),
 		ExtraExtensions: []pkix.Extension{{Id: ocspTOIDExtA, Critical: true, Value: ocspTDERNull}},
+	})
+	f.kuCritResp = ca.OCSPResponder(tb, testpki.CertSpec{
+		Now: now, Subject: ocspTRespName("ocspT KU critical OCSP"), KeyUsage: x509.KeyUsageKeyEncipherment,
+	})
+	f.kuNonCritResp = ca.OCSPResponder(tb, testpki.CertSpec{
+		Now: now, Subject: ocspTRespName("ocspT KU non-critical OCSP"), NoKeyUsage: true,
+		ExtraExtensions: []pkix.Extension{{Id: ocspTOIDKeyUsage, Value: []byte{0x03, 0x02, 0x05, 0x20}}}, // keyEncipherment
+	})
+	f.kuEmptyResp = ca.OCSPResponder(tb, testpki.CertSpec{
+		Now: now, Subject: ocspTRespName("ocspT KU empty OCSP"), NoKeyUsage: true,
+		ExtraExtensions: []pkix.Extension{{Id: ocspTOIDKeyUsage, Critical: true, Value: []byte{0x03, 0x01, 0x00}}},
+	})
+	f.noKUResp = ca.OCSPResponder(tb, testpki.CertSpec{
+		Now: now, Subject: ocspTRespName("ocspT no KU OCSP"), NoKeyUsage: true,
+	})
+	f.issuerNameResp = ca.OCSPResponder(tb, testpki.CertSpec{Now: now, Subject: issuerName})
+	if !bytes.Equal(f.issuerNameResp.Cert.RawSubject, p.ca.Cert.RawSubject) {
+		tb.Fatal("issuer-named responder subject differs from the issuer subject")
+	}
+	f.selfResp = ca.OCSPResponder(tb, testpki.CertSpec{
+		Now: now, Subject: ocspTRespName("ocspT self-attesting leaf"), Serial: p.leaf.Cert.SerialNumber,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageOCSPSigning},
 	})
 	return f
 }
@@ -231,6 +259,36 @@ func ocspTVerifyCases() []ocspTVerifyCase {
 			wantDetail: "unhandled critical",
 		},
 		{
+			name:       "responder with a critical KeyUsage without digitalSignature",
+			edit:       signer(func(f *ocspTVerifyFixture) *testpki.Responder { return f.kuCritResp }),
+			want:       StatusInvalidEvidence,
+			wantDetail: "KeyUsage lacks digitalSignature",
+		},
+		{
+			name:       "responder with a non-critical KeyUsage without digitalSignature",
+			edit:       signer(func(f *ocspTVerifyFixture) *testpki.Responder { return f.kuNonCritResp }),
+			want:       StatusInvalidEvidence,
+			wantDetail: "KeyUsage lacks digitalSignature",
+		},
+		{
+			name:       "responder with an empty KeyUsage",
+			edit:       signer(func(f *ocspTVerifyFixture) *testpki.Responder { return f.kuEmptyResp }),
+			want:       StatusInvalidEvidence,
+			wantDetail: "KeyUsage lacks digitalSignature",
+		},
+		{
+			name:       "responder without KeyUsage",
+			edit:       signer(func(f *ocspTVerifyFixture) *testpki.Responder { return f.noKUResp }),
+			want:       StatusGood,
+			wantSigner: func(f *ocspTVerifyFixture) *x509.Certificate { return f.noKUResp.Cert },
+		},
+		{
+			name:       "responder is the certificate being checked",
+			edit:       signer(func(f *ocspTVerifyFixture) *testpki.Responder { return f.selfResp }),
+			want:       StatusInvalidEvidence,
+			wantDetail: "responder is the certificate being checked",
+		},
+		{
 			name:       "ResponderID byName of another certificate",
 			edit:       func(f *ocspTVerifyFixture, s *testpki.OCSPSpec) { s.ResponderIDOf = f.otherResp.Cert },
 			want:       StatusInvalidEvidence,
@@ -247,6 +305,28 @@ func ocspTVerifyCases() []ocspTVerifyCase {
 		{
 			name:       "ResponderID names the issuer, delegated responder signs",
 			edit:       func(f *ocspTVerifyFixture, s *testpki.OCSPSpec) { s.ResponderIDOf = f.ca.Cert },
+			want:       StatusInvalidEvidence,
+			wantDetail: "signature by the issuer does not verify",
+		},
+		{
+			name:       "delegated responder with the issuer's name and another key",
+			edit:       signer(func(f *ocspTVerifyFixture) *testpki.Responder { return f.issuerNameResp }),
+			want:       StatusGood,
+			wantSigner: func(f *ocspTVerifyFixture) *x509.Certificate { return f.issuerNameResp.Cert },
+		},
+		{
+			name: "delegated responder with the issuer's name, corrupt signature",
+			edit: func(f *ocspTVerifyFixture, s *testpki.OCSPSpec) {
+				s.Signer, s.CorruptSignature = f.issuerNameResp, true
+			},
+			want:       StatusInvalidEvidence,
+			wantDetail: "signature by the responder does not verify",
+		},
+		{
+			name: "ResponderID names the issuer, issuer embedded, delegated responder signs",
+			edit: func(f *ocspTVerifyFixture, s *testpki.OCSPSpec) {
+				s.ResponderIDOf, s.Certs = f.ca.Cert, []*x509.Certificate{f.ca.Cert, f.resp.Cert}
+			},
 			want:       StatusInvalidEvidence,
 			wantDetail: "signature by the issuer does not verify",
 		},
@@ -360,12 +440,65 @@ func ocspTVerifyCases() []ocspTVerifyCase {
 			want: StatusGood,
 		},
 		{
+			name: "window of exactly 10 days",
+			edit: func(_ *ocspTVerifyFixture, s *testpki.OCSPSpec) {
+				s.ThisUpdate, s.NextUpdate = now.Add(-time.Hour), now.Add(240*time.Hour-time.Hour)
+			},
+			want: StatusGood,
+		},
+		{
+			name: "window of 10 days and 1s",
+			edit: func(_ *ocspTVerifyFixture, s *testpki.OCSPSpec) {
+				s.ThisUpdate, s.NextUpdate = now.Add(-time.Hour), now.Add(240*time.Hour-time.Hour+time.Second)
+			},
+			want:       StatusInvalidEvidence,
+			wantDetail: "validity window longer than 10 days",
+		},
+		{
+			name: "window of 11 years",
+			edit: func(_ *ocspTVerifyFixture, s *testpki.OCSPSpec) {
+				s.ThisUpdate, s.NextUpdate = now.Add(-365*24*time.Hour), now.Add(10*365*24*time.Hour)
+			},
+			want:       StatusInvalidEvidence,
+			wantDetail: "validity window longer than 10 days",
+		},
+		{
+			name:       "producedAt 6m in the future",
+			edit:       func(_ *ocspTVerifyFixture, s *testpki.OCSPSpec) { s.ProducedAt = now.Add(6 * time.Minute) },
+			want:       StatusStale,
+			wantDetail: "producedAt in the future",
+		},
+		{
+			name: "producedAt 4m in the future",
+			edit: func(_ *ocspTVerifyFixture, s *testpki.OCSPSpec) { s.ProducedAt = now.Add(4 * time.Minute) },
+			want: StatusGood,
+		},
+		{
 			name: "revoked but nextUpdate in the past",
 			edit: func(_ *ocspTVerifyFixture, s *testpki.OCSPSpec) {
-				s.Status, s.ThisUpdate, s.NextUpdate = testpki.Revoked, now.Add(-2*time.Hour), now.Add(-time.Minute)
+				s.Status, s.Reason = testpki.Revoked, 1
+				s.ThisUpdate, s.NextUpdate = now.Add(-2*time.Hour), now.Add(-time.Minute)
 			},
-			want:       StatusStale,
-			wantDetail: "nextUpdate",
+			want:       StatusRevoked,
+			wantDetail: "revoked (reason 1)",
+		},
+		{
+			name: "revoked without nextUpdate, thisUpdate older than the maximum age",
+			edit: func(_ *ocspTVerifyFixture, s *testpki.OCSPSpec) {
+				s.Status, s.Reason = testpki.Revoked, 1
+				s.ThisUpdate, s.NextUpdate = now.Add(-time.Hour), time.Time{}
+			},
+			want:       StatusRevoked,
+			wantDetail: "revoked (reason 1)",
+		},
+		{
+			name: "revoked with a window of 11 years",
+			edit: func(_ *ocspTVerifyFixture, s *testpki.OCSPSpec) {
+				s.Status, s.Reason = testpki.Revoked, 1
+				s.ThisUpdate, s.NextUpdate = now.Add(-365*24*time.Hour), now.Add(10*365*24*time.Hour)
+			},
+			want:       StatusRevoked,
+			wantDetail: "revoked (reason 1)",
 		},
 		{name: "nonce sent and echoed", sendNonce: true, want: StatusGood, wantEchoed: true},
 		{

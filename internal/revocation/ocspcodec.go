@@ -19,6 +19,7 @@ var (
 	oidOCSPBasic   = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 1}
 	oidOCSPNonce   = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 2}
 	oidOCSPNoCheck = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 5}
+	oidExtKeyUsage = asn1.ObjectIdentifier{2, 5, 29, 15}
 	oidHashSHA1    = asn1.ObjectIdentifier{1, 3, 14, 3, 2, 26}
 	oidHashSHA256  = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 2, 1}
 )
