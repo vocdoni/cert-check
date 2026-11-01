@@ -236,6 +236,11 @@ func TestCheckOCSPStatuses(t *testing.T) {
 		{"revoked without reason", chkTWith(func(now time.Time, s *testpki.OCSPSpec) {
 			s.Status, s.RevokedAt, s.OmitReason = testpki.Revoked, now.Add(-48*time.Hour), true
 		}), StatusRevoked, -1},
+		// Revocation is final: a stale revoked answer must not fall back to the CRL's good.
+		{"revoked with nextUpdate in the past", chkTWith(func(now time.Time, s *testpki.OCSPSpec) {
+			s.Status, s.RevokedAt, s.Reason = testpki.Revoked, now.Add(-48*time.Hour), 1
+			s.ThisUpdate, s.NextUpdate = now.Add(-2*time.Hour), now.Add(-time.Hour)
+		}), StatusRevoked, 1},
 		{"unknown", chkTWith(func(_ time.Time, s *testpki.OCSPSpec) { s.Status = testpki.Unknown }), StatusUnknown, -1},
 	}
 	for _, tc := range cases {

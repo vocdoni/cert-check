@@ -8,10 +8,15 @@ import (
 	"crypto/rsa"
 	"crypto/sha1" //nolint:gosec // ResponderID byKey is defined with SHA-1
 	"crypto/x509"
+	"encoding/asn1"
 	"fmt"
 	"slices"
 	"time"
 )
+
+// MaxOCSPWindow bounds nextUpdate − thisUpdate of an accepted response
+// (CA/B Forum BR §4.9.10; observed responders use 5 min to 48 h).
+const MaxOCSPWindow = 10 * 24 * time.Hour
 
 // OCSPInput is everything VerifyOCSP needs. Issuer is chain[i+1] of the
 // verified chain, never a client-supplied certificate.
@@ -35,9 +40,11 @@ type OCSPEvidence struct {
 
 // VerifyOCSP applies the acceptance checks in order: response status,
 // critical extensions, signer authorization and ResponderID binding,
-// signature, CertID match, nonce, freshness. It returns StatusGood,
-// StatusRevoked or StatusUnknown only for an accepted response; otherwise
-// StatusUnavailable, StatusInvalidEvidence or StatusStale with a detail.
+// signature, CertID match, nonce, freshness. A revoked answer that passes
+// the checks up to the nonce is final and skips freshness. It returns
+// StatusGood, StatusRevoked or StatusUnknown only for an accepted response;
+// otherwise StatusUnavailable, StatusInvalidEvidence or StatusStale with a
+// detail.
 func VerifyOCSP(in OCSPInput) (OCSPEvidence, Status, string) {
 	r := in.Response
 	ev := OCSPEvidence{ProducedAt: r.ProducedAt}
@@ -98,12 +105,23 @@ func VerifyOCSP(in OCSPInput) (OCSPEvidence, Status, string) {
 		ev.NonceEchoed = true
 	}
 
+	// Revocation is final: freshness only guards against a stale good (or
+	// unknown), and a stale revoked must not fall back to a CRL good.
+	if match.Status == CertRevoked {
+		return ev, StatusRevoked, fmt.Sprintf("revoked (reason %d)", match.Reason)
+	}
 	if match.ThisUpdate.After(in.Now.Add(ClockSkew)) {
 		return ev, StatusStale, "thisUpdate in the future"
+	}
+	if r.ProducedAt.After(in.Now.Add(ClockSkew)) {
+		return ev, StatusStale, "producedAt in the future"
 	}
 	if !match.NextUpdate.IsZero() {
 		if match.NextUpdate.Before(in.Now) || match.NextUpdate.Before(match.ThisUpdate) {
 			return ev, StatusStale, "nextUpdate in the past"
+		}
+		if match.NextUpdate.Sub(match.ThisUpdate) > MaxOCSPWindow {
+			return ev, StatusInvalidEvidence, "validity window longer than 10 days"
 		}
 	} else if match.ThisUpdate.Before(in.Now.Add(-in.MaxAge)) {
 		return ev, StatusStale, "no nextUpdate and thisUpdate older than the maximum age"
@@ -112,8 +130,6 @@ func VerifyOCSP(in OCSPInput) (OCSPEvidence, Status, string) {
 	switch match.Status {
 	case CertGood:
 		return ev, StatusGood, "good"
-	case CertRevoked:
-		return ev, StatusRevoked, fmt.Sprintf("revoked (reason %d)", match.Reason)
 	case CertUnknown:
 		return ev, StatusUnknown, "unknown"
 	}
@@ -121,30 +137,37 @@ func VerifyOCSP(in OCSPInput) (OCSPEvidence, Status, string) {
 }
 
 // authorizedSigner returns the certificate that is identified by the
-// ResponderID, authorized for the issuer, and verifies the signature.
+// ResponderID, authorized for the issuer, and verifies the signature. A
+// delegated responder may carry the issuer's name, so when the issuer is
+// identified but its signature does not verify the embedded certificates are
+// still tried.
 func authorizedSigner(in OCSPInput) (*x509.Certificate, string) {
 	r, issuer := in.Response, in.Issuer
-	if identifiedBy(r, issuer) {
-		if err := issuer.CheckSignature(r.SignatureAlgorithm, r.TBSResponseData, r.Signature); err != nil {
-			return nil, "signature by the issuer does not verify"
-		}
-		return issuer, ""
-	}
 	detail := "no embedded certificate matches the ResponderID"
+	if identifiedBy(r, issuer) {
+		if issuer.CheckSignature(r.SignatureAlgorithm, r.TBSResponseData, r.Signature) == nil {
+			return issuer, ""
+		}
+		detail = "signature by the issuer does not verify"
+	}
 	for _, c := range r.Certificates {
-		if !identifiedBy(r, c) {
+		if !identifiedBy(r, c) || c.Equal(issuer) {
 			continue
 		}
 		switch {
 		case !bytes.Equal(c.RawIssuer, issuer.RawSubject) || c.CheckSignatureFrom(issuer) != nil:
 			detail = "responder not issued by the certificate issuer"
+		case c.SerialNumber != nil && in.Want.SerialNumber != nil && c.SerialNumber.Cmp(in.Want.SerialNumber) == 0:
+			detail = "responder is the certificate being checked"
 		case !slices.Contains(c.ExtKeyUsage, x509.ExtKeyUsageOCSPSigning):
 			detail = "responder lacks id-kp-OCSPSigning"
+		case hasExtension(c, oidExtKeyUsage) && c.KeyUsage&x509.KeyUsageDigitalSignature == 0:
+			detail = "responder KeyUsage lacks digitalSignature"
 		case in.Now.Before(c.NotBefore) || in.Now.After(c.NotAfter):
 			detail = "responder certificate not valid now"
 		case !onlyNoCheckUnhandled(c):
 			detail = "responder has unhandled critical extensions"
-		case !hasNoCheck(c):
+		case !hasExtension(c, oidOCSPNoCheck):
 			detail = "responder lacks id-pkix-ocsp-nocheck"
 		case !strongKey(c):
 			detail = "responder key too weak"
@@ -169,9 +192,9 @@ func identifiedBy(r *Response, c *x509.Certificate) bool {
 	return bytes.Equal(r.ResponderKeyHash, h[:])
 }
 
-func hasNoCheck(c *x509.Certificate) bool {
+func hasExtension(c *x509.Certificate, oid asn1.ObjectIdentifier) bool {
 	for _, e := range c.Extensions {
-		if e.Id.Equal(oidOCSPNoCheck) {
+		if e.Id.Equal(oid) {
 			return true
 		}
 	}

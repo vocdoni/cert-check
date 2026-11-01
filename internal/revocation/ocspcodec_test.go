@@ -3,6 +3,7 @@ package revocation
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"crypto"
 	"crypto/sha256"
 	"crypto/x509"
@@ -45,6 +46,7 @@ var (
 	ocspTOIDExtA        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 1}
 	ocspTOIDExtB        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 2}
 	ocspTOIDExtC        = asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 3}
+	ocspTOIDKeyUsage    = asn1.ObjectIdentifier{2, 5, 29, 15}
 	ocspTDERNull        = []byte{0x05, 0x00}
 )
 
@@ -279,6 +281,70 @@ func ocspTMutate(edit func(tb testing.TB, p *ocspTPKI, parts *ocspTParts)) func(
 	}
 }
 
+// ocspTGenTime encodes a GeneralizedTime element with the raw content s.
+func ocspTGenTime(tb testing.TB, s string) []byte {
+	tb.Helper()
+	return ocspTDER(tb, func(b *cryptobyte.Builder) {
+		b.AddASN1(cbasn1.GeneralizedTime, func(c *cryptobyte.Builder) { c.AddBytes([]byte(s)) })
+	})
+}
+
+// ocspTCtx encodes a constructed context-specific [n] element around inner.
+func ocspTCtx(tb testing.TB, n uint8, inner ...[]byte) []byte {
+	tb.Helper()
+	return ocspTDER(tb, func(b *cryptobyte.Builder) {
+		b.AddASN1(cbasn1.Tag(n).Constructed().ContextSpecific(), func(c *cryptobyte.Builder) {
+			for _, e := range inner {
+				c.AddBytes(e)
+			}
+		})
+	})
+}
+
+// ocspTExtensions encodes Extensions with one non-critical NULL-valued
+// extension per OID (no duplicate check).
+func ocspTExtensions(tb testing.TB, oids ...asn1.ObjectIdentifier) []byte {
+	tb.Helper()
+	return ocspTDER(tb, func(b *cryptobyte.Builder) {
+		b.AddASN1(cbasn1.SEQUENCE, func(exts *cryptobyte.Builder) {
+			for _, oid := range oids {
+				exts.AddASN1(cbasn1.SEQUENCE, func(e *cryptobyte.Builder) {
+					e.AddASN1ObjectIdentifier(oid)
+					e.AddASN1OctetString(ocspTDERNull)
+				})
+			}
+		})
+	})
+}
+
+// ocspTEditSingle builds the base response and rewrites the elements of its
+// SingleResponse: certID, certStatus, thisUpdate and [0] nextUpdate.
+func ocspTEditSingle(edit func(tb testing.TB, elems [][]byte) [][]byte) func(testing.TB, *ocspTPKI) []byte {
+	return ocspTMutate(func(tb testing.TB, _ *ocspTPKI, parts *ocspTParts) {
+		in := cryptobyte.String(parts.singles[0])
+		var single cryptobyte.String
+		if !in.ReadASN1(&single, cbasn1.SEQUENCE) {
+			tb.Fatal("ocspTEditSingle: cannot read SingleResponse")
+		}
+		var elems [][]byte
+		for !single.Empty() {
+			var el cryptobyte.String
+			var tag cbasn1.Tag
+			if !single.ReadAnyASN1Element(&el, &tag) {
+				tb.Fatal("ocspTEditSingle: cannot read element")
+			}
+			elems = append(elems, el)
+		}
+		parts.singles[0] = ocspTDER(tb, func(b *cryptobyte.Builder) {
+			b.AddASN1(cbasn1.SEQUENCE, func(c *cryptobyte.Builder) {
+				for _, e := range edit(tb, elems) {
+					c.AddBytes(e)
+				}
+			})
+		})
+	})
+}
+
 // ocspTSpec builds the response to the plain request with edit applied.
 func ocspTSpec(edit func(p *ocspTPKI, s *testpki.OCSPSpec)) func(testing.TB, *ocspTPKI) []byte {
 	return func(tb testing.TB, p *ocspTPKI) []byte {
@@ -406,9 +472,55 @@ func ocspTParseCases() []ocspTParseCase {
 	status := func(n int) func(testing.TB, *ocspTPKI) []byte {
 		return ocspTSpec(func(_ *ocspTPKI, s *testpki.OCSPSpec) { s.ResponseStatus = n })
 	}
+	raw := func(b ...byte) func(testing.TB, *ocspTPKI) []byte {
+		return func(testing.TB, *ocspTPKI) []byte { return b }
+	}
+	nExts := func(n int) []pkix.Extension {
+		exts := make([]pkix.Extension, n)
+		for i := range exts {
+			exts[i] = pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 10, i}, Value: ocspTDERNull}
+		}
+		return exts
+	}
+	nRespExts := func(n int) func(testing.TB, *ocspTPKI) []byte {
+		return ocspTSpec(func(_ *ocspTPKI, s *testpki.OCSPSpec) { s.ResponseExtensions = nExts(n) })
+	}
+	nSingleExts := func(n int) func(testing.TB, *ocspTPKI) []byte {
+		return ocspTSpec(func(_ *ocspTPKI, s *testpki.OCSPSpec) { s.SingleExtensions = nExts(n) })
+	}
+	checkExts := func(resp, single int) func(*testing.T, *ocspTPKI, *Response) {
+		return func(t *testing.T, _ *ocspTPKI, r *Response) {
+			if len(r.Extensions) != resp || len(r.Responses[0].Extensions) != single {
+				t.Errorf("extensions = %d response, %d single, want %d and %d",
+					len(r.Extensions), len(r.Responses[0].Extensions), resp, single)
+			}
+		}
+	}
+	producedAt := func(s string) func(testing.TB, *ocspTPKI) []byte {
+		return ocspTMutate(func(tb testing.TB, _ *ocspTPKI, parts *ocspTParts) {
+			parts.producedAt = ocspTGenTime(tb, s)
+		})
+	}
+	// singleElem replaces element i of the SingleResponse (1 certStatus,
+	// 2 thisUpdate, 3 nextUpdate).
+	singleElem := func(i int, el func(testing.TB) []byte) func(testing.TB, *ocspTPKI) []byte {
+		return ocspTEditSingle(func(tb testing.TB, elems [][]byte) [][]byte {
+			elems[i] = el(tb)
+			return elems
+		})
+	}
+	thisUpdate := func(s string) func(testing.TB, *ocspTPKI) []byte {
+		return singleElem(2, func(tb testing.TB) []byte { return ocspTGenTime(tb, s) })
+	}
+	nextUpdate := func(s string) func(testing.TB, *ocspTPKI) []byte {
+		return singleElem(3, func(tb testing.TB) []byte { return ocspTCtx(tb, 0, ocspTGenTime(tb, s)) })
+	}
+	revocationTime := func(s string) func(testing.TB, *ocspTPKI) []byte {
+		return singleElem(1, func(tb testing.TB) []byte { return ocspTCtx(tb, 1, ocspTGenTime(tb, s)) })
+	}
 	revokedAt := time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 
-	return []ocspTParseCase{
+	cases := []ocspTParseCase{
 		{
 			name:    "good",
 			der:     ocspTSpec(nil),
@@ -669,7 +781,122 @@ func ocspTParseCases() []ocspTParseCase {
 			}),
 			wantErr: ocspTMalformed,
 		},
+
+		// Non-successful statuses carry nothing else and only defined values.
+		{name: "tryLater with a trailing NULL", der: raw(0x30, 0x05, 0x0a, 0x01, 0x03, 0x05, 0x00), wantErr: ocspTMalformed},
+		{name: "tryLater with trailing junk", der: raw(0x30, 0x07, 0x0a, 0x01, 0x03, 0xde, 0xad, 0xbe, 0xef), wantErr: ocspTMalformed},
+		{name: "tryLater with responseBytes", der: raw(0x30, 0x07, 0x0a, 0x01, 0x03, 0xa0, 0x02, 0x30, 0x00), wantErr: ocspTMalformed},
+		{name: "undefined status 4", der: raw(0x30, 0x03, 0x0a, 0x01, 0x04), wantErr: ocspTMalformed},
+		{name: "undefined status 99", der: raw(0x30, 0x03, 0x0a, 0x01, 0x63), wantErr: ocspTMalformed},
+		{name: "negative status -1", der: raw(0x30, 0x03, 0x0a, 0x01, 0xff), wantErr: ocspTMalformed},
+
+		// Extension lists are bounded.
+		{name: "16 response extensions", der: nRespExts(16), wantErr: ocspTNoErr, check: checkExts(16, 0)},
+		{name: "17 response extensions", der: nRespExts(17), wantErr: ocspTMalformed},
+		{name: "16 single extensions", der: nSingleExts(16), wantErr: ocspTNoErr, check: checkExts(0, 16)},
+		{name: "17 single extensions", der: nSingleExts(17), wantErr: ocspTMalformed},
+
+		// GeneralizedTime: DER form YYYYMMDDHHMMSSZ only, never the zero time.
+		{
+			name:    "revocationTime in the DER form",
+			der:     revocationTime("20260102030405Z"),
+			wantErr: ocspTNoErr,
+			check: func(t *testing.T, _ *ocspTPKI, r *Response) {
+				ocspTCheckSingle(t, r, CertRevoked, -1)
+				if got := r.Responses[0].RevokedAt; !got.Equal(revokedAt) {
+					t.Errorf("RevokedAt = %v, want %v", got, revokedAt)
+				}
+			},
+		},
+		{name: "revocationTime with an offset", der: revocationTime("20260102030405+0100"), wantErr: ocspTMalformed},
+		{name: "thisUpdate with an offset", der: thisUpdate("20261030115900+0100"), wantErr: ocspTMalformed},
+		{name: "nextUpdate with an offset", der: nextUpdate("20261030125900-0130"), wantErr: ocspTMalformed},
+		{name: "nextUpdate 00010101000000Z (the zero time)", der: nextUpdate("00010101000000Z"), wantErr: ocspTMalformed},
+
+		// Tag form and BER encodings are rejected.
+		{name: "certStatus good sent constructed", der: singleElem(1, func(testing.TB) []byte { return []byte{0xa0, 0x00} }), wantErr: ocspTMalformed},
+		{
+			name: "certStatus revoked sent primitive",
+			der: singleElem(1, func(tb testing.TB) []byte {
+				return ocspTDER(tb, func(b *cryptobyte.Builder) {
+					b.AddASN1(cbasn1.Tag(1).ContextSpecific(), func(c *cryptobyte.Builder) {
+						c.AddBytes(ocspTGenTime(tb, "20260102030405Z"))
+					})
+				})
+			}),
+			wantErr: ocspTMalformed,
+		},
+		{name: "certStatus with a high tag number", der: singleElem(1, func(testing.TB) []byte { return []byte{0x9f, 0x1f, 0x00} }), wantErr: ocspTMalformed},
+		{
+			name: "BER indefinite length",
+			der: func(tb testing.TB, p *ocspTPKI) []byte {
+				in := cryptobyte.String(p.build(tb, p.req, nil))
+				var content cryptobyte.String
+				if !in.ReadASN1(&content, cbasn1.SEQUENCE) {
+					tb.Fatal("cannot read the base response")
+				}
+				return slices.Concat([]byte{0x30, 0x80}, content, []byte{0x00, 0x00})
+			},
+			wantErr: ocspTMalformed,
+		},
+		{
+			name: "non-minimal long-form length",
+			der: ocspTMutate(func(_ testing.TB, _ *ocspTPKI, parts *ocspTParts) {
+				parts.producedAt = append([]byte{0x18, 0x81, 0x0f}, "20261030115900Z"...)
+			}),
+			wantErr: ocspTMalformed,
+		},
+		{
+			name: "critical BOOLEAN encoded as 01",
+			der: ocspTMutate(func(tb testing.TB, _ *ocspTPKI, parts *ocspTParts) {
+				parts.respExts = ocspTCtx(tb, 1, ocspTDER(tb, func(b *cryptobyte.Builder) {
+					b.AddASN1(cbasn1.SEQUENCE, func(exts *cryptobyte.Builder) {
+						exts.AddASN1(cbasn1.SEQUENCE, func(e *cryptobyte.Builder) {
+							e.AddASN1ObjectIdentifier(ocspTOIDExtA)
+							e.AddBytes([]byte{0x01, 0x01, 0x01})
+							e.AddASN1OctetString(ocspTDERNull)
+						})
+					})
+				}))
+			}),
+			wantErr: ocspTMalformed,
+		},
+		{
+			name: "nextUpdate sent twice",
+			der: ocspTEditSingle(func(_ testing.TB, elems [][]byte) [][]byte {
+				return append(elems, elems[3])
+			}),
+			wantErr: ocspTMalformed,
+		},
+		{
+			name: "singleExtensions sent twice",
+			der: ocspTEditSingle(func(tb testing.TB, elems [][]byte) [][]byte {
+				exts := ocspTCtx(tb, 1, ocspTExtensions(tb, ocspTOIDExtA))
+				return append(elems, exts, exts)
+			}),
+			wantErr: ocspTMalformed,
+		},
+		{
+			name: "responderID sent twice",
+			der: ocspTMutate(func(_ testing.TB, _ *ocspTPKI, parts *ocspTParts) {
+				parts.responderID = slices.Concat(parts.responderID, parts.responderID)
+			}),
+			wantErr: ocspTMalformed,
+		},
 	}
+	for _, bad := range []struct{ name, s string }{
+		{"offset +0100", "20261030115900+0100"},
+		{"offset -0130", "20261030115900-0130"},
+		{"fractional seconds", "20261030115900.5Z"},
+		{"zero fractional seconds", "20261030115900.000Z"},
+		{"without seconds", "202610301159Z"},
+		{"without zone", "20261030115900"},
+		{"year 0000", "00000101000000Z"},
+		{"second 60", "20261030115960Z"},
+	} {
+		cases = append(cases, ocspTParseCase{name: "producedAt " + bad.name, der: producedAt(bad.s), wantErr: ocspTMalformed})
+	}
+	return cases
 }
 
 func TestParseResponse(t *testing.T) {
@@ -708,9 +935,12 @@ func TestNewCertID(t *testing.T) {
 	p := ocspTNewPKI(t)
 	badSPKI := *p.ca.Cert
 	badSPKI.RawSubjectPublicKeyInfo = []byte{0x30, 0x01, 0x00}
+	noSerial := *p.leaf.Cert
+	noSerial.SerialNumber = nil
 	cases := []struct {
 		name    string
 		h       crypto.Hash
+		cert    *x509.Certificate // nil: the leaf
 		issuer  *x509.Certificate
 		wantOID asn1.ObjectIdentifier
 		wantErr bool
@@ -720,10 +950,12 @@ func TestNewCertID(t *testing.T) {
 		{name: "md5", h: crypto.MD5, issuer: p.ca.Cert, wantErr: true},
 		{name: "sha384", h: crypto.SHA384, issuer: p.ca.Cert, wantErr: true},
 		{name: "malformed issuer SPKI", h: crypto.SHA1, issuer: &badSPKI, wantErr: true},
+		{name: "certificate without serial", h: crypto.SHA1, cert: &noSerial, issuer: p.ca.Cert, wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			id, err := NewCertID(tc.h, p.leaf.Cert, tc.issuer)
+			cert := cmp.Or(tc.cert, p.leaf.Cert)
+			id, err := NewCertID(tc.h, cert, tc.issuer)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("NewCertID(%v) error = nil, want an error", tc.h)
@@ -858,6 +1090,29 @@ func TestMarshalRequest(t *testing.T) {
 			}
 			if !bytes.Equal(req.Nonce, ext) {
 				t.Errorf("request nonce = %x, want %x", req.Nonce, ext)
+			}
+		})
+	}
+}
+
+func TestMarshalRequestIncompleteCertID(t *testing.T) {
+	p := ocspTNewPKI(t)
+	cases := []struct {
+		name string
+		edit func(*CertID)
+	}{
+		{"nil serial", func(id *CertID) { id.SerialNumber = nil }},
+		{"no hash algorithm", func(id *CertID) { id.HashAlgorithm = nil }},
+		{"nil issuerNameHash", func(id *CertID) { id.IssuerNameHash = nil }},
+		{"nil issuerKeyHash", func(id *CertID) { id.IssuerKeyHash = nil }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id := p.want
+			tc.edit(&id)
+			der, ext, err := MarshalRequest(id, bytes.Repeat([]byte{0xc3}, NonceLength))
+			if err == nil || der != nil || ext != nil {
+				t.Errorf("MarshalRequest = %x, %x, %v; want an error and no output", der, ext, err)
 			}
 		})
 	}
