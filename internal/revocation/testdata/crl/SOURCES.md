@@ -1,7 +1,7 @@
 # CRL samples: SOURCES
 
 Real CRLs and the CA certificates needed to check them, used by `TestRealCRLs`
-(`certauth/revocation/crl_test.go`). Every file is a byte-identical copy of the source below.
+(`internal/revocation/crl_test.go`). Every file is a byte-identical copy of the source below.
 The test recomputes the SHA-256 of each file, compares it with the table, and fails on any file
 in this directory that the table does not list.
 

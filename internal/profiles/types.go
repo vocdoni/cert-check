@@ -10,8 +10,8 @@ import (
 	"encoding/asn1"
 	"encoding/hex"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/identity"
+	"github.com/vocdoni/cert-check/internal/revocation"
 )
 
 // Role is the holder role of a profile.

@@ -14,7 +14,7 @@ import (
 	"slices"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
+	"github.com/vocdoni/cert-check/internal/identity"
 )
 
 //go:embed anchors/*.pem
@@ -73,7 +73,7 @@ var (
 
 // Default loads the production registry from the embedded anchors.
 func Default(now time.Time, logger *slog.Logger) (*Registry, error) {
-	return New(Config{Providers: DefaultProviders(), Reserved: identity.DefaultReserved(), Now: now, Logger: logger})
+	return New(Config{Providers: All(), Reserved: identity.DefaultReserved(), Now: now, Logger: logger})
 }
 
 // New validates and loads a registry. A pin mismatch, a non-CA anchor or an

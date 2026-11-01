@@ -18,9 +18,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
-	"github.com/vocdoni/cert-check/certauth/profiles"
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/identity"
+	"github.com/vocdoni/cert-check/internal/profiles"
+	"github.com/vocdoni/cert-check/internal/revocation"
 	"github.com/vocdoni/cert-check/internal/testpki"
 )
 
@@ -299,7 +299,7 @@ func ppShapeNamed(t testing.TB, name string) ppShape {
 	return ppShape{}
 }
 
-// ppPKI is DefaultProviders with every anchor replaced by a testpki CA of
+// ppPKI is profiles.All with every anchor replaced by a testpki CA of
 // the same key family and the DNIe intermediates replaced by one testpki
 // intermediate whose CDP names the root CRL and then the ARL (AC DNIE
 // 005/006 shape).
@@ -317,7 +317,7 @@ type ppPKI struct {
 
 func newPPPKI(t testing.TB, now time.Time) *ppPKI {
 	t.Helper()
-	p := &ppPKI{now: now, providers: profiles.DefaultProviders(), profiles: map[string]profiles.Profile{},
+	p := &ppPKI{now: now, providers: profiles.All(), profiles: map[string]profiles.Profile{},
 		anchors: map[string][]*testpki.CA{}, responders: map[*testpki.CA]*testpki.Responder{}, crls: map[*testpki.CA][]byte{}}
 	var cas []*testpki.CA
 	for pi := range p.providers {

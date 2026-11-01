@@ -13,13 +13,13 @@ import (
 	"time"
 
 	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/certauth/identity"
-	"github.com/vocdoni/cert-check/certauth/profiles"
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/identity"
+	"github.com/vocdoni/cert-check/internal/profiles"
+	"github.com/vocdoni/cert-check/internal/revocation"
 )
 
 // beworSpecimenSHA256 is the official Bewor test identity
-// (certauth/testdata/specimens/MANIFEST.md, withheld per ruling R30).
+// (testdata/specimens/MANIFEST.md, withheld per ruling R30).
 const beworSpecimenSHA256 = "da5f38fbaa6afdeca3666108eb24e6e6355b5558ab5e36c5a555e262da0bc8ab"
 
 // TestLiveBeworCredential (AC8) authenticates over loopback mTLS with the
@@ -42,7 +42,7 @@ func TestLiveBeworCredential(t *testing.T) {
 	}
 
 	t.Run("markers emptied: success", func(t *testing.T) {
-		providers := profiles.DefaultProviders()
+		providers := profiles.All()
 		for i := range providers {
 			for j := range providers[i].Profiles {
 				providers[i].Profiles[j].TestMarkers = nil

@@ -3,7 +3,7 @@ package identity_test
 import (
 	"testing"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
+	"github.com/vocdoni/cert-check/internal/identity"
 )
 
 func extracted(doc, given, surnames string, org *identity.Organization) identity.Extracted {

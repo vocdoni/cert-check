@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/revocation"
 )
 
 // TestLiveProbe (AC8) probes every enabled profile's OCSP responders and
@@ -26,7 +26,7 @@ func TestLiveProbe(t *testing.T) {
 		t.Fatalf("DefaultTargets: %v", err)
 	}
 	found := map[string]bool{}
-	for _, d := range []string{"../../certauth/testdata/specimens", dir} {
+	for _, d := range []string{"../../testdata/specimens", dir} {
 		sp, err := LoadSpecimens(os.DirFS(d))
 		if err != nil {
 			t.Fatalf("LoadSpecimens(%s): %v", d, err)

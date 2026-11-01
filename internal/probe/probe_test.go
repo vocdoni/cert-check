@@ -20,8 +20,8 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/profiles"
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/profiles"
+	"github.com/vocdoni/cert-check/internal/revocation"
 	"github.com/vocdoni/cert-check/internal/testpki"
 )
 
@@ -343,7 +343,7 @@ func TestDefaultTargets(t *testing.T) {
 	}
 	got := map[string]counts{}
 	pinned := map[string][]string{} // profile -> SHA-256 of its anchors and pinned intermediates
-	for _, p := range profiles.DefaultProviders() {
+	for _, p := range profiles.All() {
 		for _, pr := range p.Profiles {
 			for _, a := range slices.Concat(pr.Anchors, pr.Intermediates) {
 				pinned[pr.ID] = append(pinned[pr.ID], a.SHA256)
@@ -393,7 +393,7 @@ func TestDefaultTargets(t *testing.T) {
 }
 
 func TestLoadSpecimens(t *testing.T) {
-	targets, err := LoadSpecimens(os.DirFS("../../certauth/testdata/specimens"))
+	targets, err := LoadSpecimens(os.DirFS("../../testdata/specimens"))
 	if err != nil {
 		t.Fatalf("LoadSpecimens: %v", err)
 	}

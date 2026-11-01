@@ -44,15 +44,15 @@ jobs:
       - name: fuzz smoke (30 s per target)
         run: |
           for t in FuzzParseName FuzzParseSANDirectoryNames FuzzParseDateOfBirth FuzzParseDocument FuzzDateUnmarshalJSON; do
-            go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./certauth/identity || exit 1
+            go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/identity || exit 1
           done
           for t in FuzzParseResponse FuzzParseIDP FuzzParseCDP; do
-            go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./certauth/revocation || exit 1
+            go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/revocation || exit 1
           done
           go test -run '^$' -fuzz '^FuzzParseQCStatements$' -fuzztime 30s ./certauth || exit 1
       - name: AC12 certauth has no app dependencies
         run: |
-          if go list -deps ./certauth/... | grep -E 'github.com/vocdoni/cert-check/(internal|web)'; then exit 1; fi
+          if go list -deps ./certauth/... | grep -E 'github.com/vocdoni/cert-check/(internal/(server|acme|config|probe)|web)'; then exit 1; fi
           if go list -f '{{.ImportPath}}: {{join .Imports " "}}' ./... | grep -v '^github.com/vocdoni/cert-check/internal/testpki' | grep 'internal/testpki'; then exit 1; fi
       - name: docker build
         run: |

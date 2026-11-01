@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
+	"github.com/vocdoni/cert-check/internal/identity"
 )
 
 var (

@@ -1,7 +1,6 @@
-certauth/profiles/anchors/** -text
-certauth/testdata/** -text
-certauth/revocation/testdata/** -text
-certauth/profiles/testdata/** -text
+internal/profiles/anchors/** -text
+internal/revocation/testdata/** -text
+internal/profiles/testdata/** -text
 web/static/fonts/** -text
 web/static/favicon.ico -text
 testdata/** -text

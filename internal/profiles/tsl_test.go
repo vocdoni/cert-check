@@ -11,7 +11,7 @@ import (
 	"slices"
 	"testing"
 
-	"github.com/vocdoni/cert-check/certauth/profiles"
+	"github.com/vocdoni/cert-check/internal/profiles"
 )
 
 const (
@@ -107,7 +107,7 @@ func TestAnchorsGrantedInTSL(t *testing.T) {
 	idx := tslTLoad(t)
 	pinnedAnchors := map[string]string{} // DER -> SPKI
 	pinnedInter := map[string]bool{}     // DER
-	for _, p := range profiles.DefaultProviders() {
+	for _, p := range profiles.All() {
 		for _, prof := range p.Profiles {
 			for _, a := range prof.Anchors {
 				pinnedAnchors[a.SHA256] = a.SPKISHA256

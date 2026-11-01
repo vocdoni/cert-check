@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
+	"github.com/vocdoni/cert-check/internal/identity"
 )
 
 // allKinds accepts every string kind, so Field exercises the text checks.

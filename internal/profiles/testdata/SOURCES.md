@@ -1,4 +1,4 @@
-# certauth/profiles/testdata: SOURCES
+# internal/profiles/testdata: SOURCES
 
 Files here are byte-for-byte copies (`cp`) of research-bundle files. `TestTSLInventorySource`
 (`../tsl_test.go`) recomputes the SHA-256 below; `TestAnchorsGrantedInTSL` reads the inventory to

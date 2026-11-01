@@ -12,12 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
-	"github.com/vocdoni/cert-check/certauth/profiles"
+	"github.com/vocdoni/cert-check/internal/identity"
+	"github.com/vocdoni/cert-check/internal/profiles"
 )
 
 // specTDir holds the CA-published specimen leaves and their MANIFEST.md.
-const specTDir = "../testdata/specimens"
+const specTDir = "../../testdata/specimens"
 
 // specTRow is one MANIFEST.md row.
 type specTRow struct {

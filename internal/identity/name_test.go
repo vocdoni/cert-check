@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
+	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/testpki"
 )
 

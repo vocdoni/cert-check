@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
+	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/testpki"
 )
 

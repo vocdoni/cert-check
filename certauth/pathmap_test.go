@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
-	"github.com/vocdoni/cert-check/certauth/profiles"
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/identity"
+	"github.com/vocdoni/cert-check/internal/profiles"
+	"github.com/vocdoni/cert-check/internal/revocation"
 	"github.com/vocdoni/cert-check/internal/testpki"
 )
 
@@ -239,7 +239,7 @@ func TestPathPriority(t *testing.T) {
 // specimens (real issuer bytes).
 func specimenQCStatements(t testing.TB) map[string][]byte {
 	t.Helper()
-	files, err := filepath.Glob(filepath.Join("testdata", "specimens", "*.pem"))
+	files, err := filepath.Glob(filepath.Join("..", "testdata", "specimens", "*.pem"))
 	if err != nil || len(files) == 0 {
 		t.Fatalf("specimens: %v (%d files)", err, len(files))
 	}

@@ -9,11 +9,11 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
+	"github.com/vocdoni/cert-check/internal/identity"
 )
 
 // specimenDir holds the CA-published test leaves (see its MANIFEST.md).
-const specimenDir = "../testdata/specimens"
+const specimenDir = "../../testdata/specimens"
 
 func loadSpecimen(tb testing.TB, file string) *x509.Certificate {
 	tb.Helper()

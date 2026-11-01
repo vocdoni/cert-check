@@ -19,7 +19,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/revocation"
 )
 
 // Kind is what a Target probes.

@@ -5,7 +5,7 @@ import (
 	"encoding/asn1"
 	"testing"
 
-	"github.com/vocdoni/cert-check/certauth/profiles"
+	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/testpki"
 )
 

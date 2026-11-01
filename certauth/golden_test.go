@@ -17,9 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
-	"github.com/vocdoni/cert-check/certauth/profiles"
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/identity"
+	"github.com/vocdoni/cert-check/internal/profiles"
+	"github.com/vocdoni/cert-check/internal/revocation"
 	"github.com/vocdoni/cert-check/internal/testpki"
 )
 
@@ -28,7 +28,7 @@ import (
 // provider, and the full Result JSON of every synthetic profile fixture.
 const (
 	goldenDir         = "../testdata/golden"
-	goldenSpecimenDir = "testdata/specimens"
+	goldenSpecimenDir = "../testdata/specimens"
 )
 
 var (
@@ -142,7 +142,7 @@ func TestGoldenSpecimens(t *testing.T) {
 		clock := leaf.NotBefore.Add(30 * time.Minute)
 		now := func() time.Time { return clock }
 		for _, run := range []string{"markers", "emptied"} {
-			decls, reserved := profiles.DefaultProviders(), identity.DefaultReserved()
+			decls, reserved := profiles.All(), identity.DefaultReserved()
 			if run == "emptied" {
 				for i := range decls {
 					for j := range decls[i].Profiles {
@@ -163,7 +163,7 @@ func TestGoldenSpecimens(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, d := range profiles.DefaultProviders() {
+			for _, d := range profiles.All() {
 				res, err := chk.Check(t.Context(), d.ID, []*x509.Certificate{leaf})
 				e, ok := errors.AsType[*Error](err)
 				if !ok || res != nil {

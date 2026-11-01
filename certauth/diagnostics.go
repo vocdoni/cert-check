@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/revocation"
 )
 
 // Diagnostics is the session-bound support report. It contains certificate

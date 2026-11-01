@@ -14,9 +14,9 @@ import (
 	"time"
 
 	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/certauth/identity"
-	"github.com/vocdoni/cert-check/certauth/profiles"
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/identity"
+	"github.com/vocdoni/cert-check/internal/profiles"
+	"github.com/vocdoni/cert-check/internal/revocation"
 )
 
 // specPipeProviders maps a specimen file prefix to the provider it is
@@ -96,7 +96,7 @@ func TestSpecimensRejectedTwice(t *testing.T) {
 				{"run 2 markers emptied", false, run2},
 			} {
 				t.Run(run.name, func(t *testing.T) {
-					providers := profiles.DefaultProviders()
+					providers := profiles.All()
 					if !run.markers {
 						for i := range providers {
 							for j := range providers[i].Profiles {

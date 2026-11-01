@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
-	"github.com/vocdoni/cert-check/certauth/profiles"
-	"github.com/vocdoni/cert-check/certauth/revocation"
+	"github.com/vocdoni/cert-check/internal/identity"
+	"github.com/vocdoni/cert-check/internal/profiles"
+	"github.com/vocdoni/cert-check/internal/revocation"
 )
 
 // provTSourceRow is one row of anchors/SOURCES.md.
@@ -70,7 +70,7 @@ func provTHex(b []byte) string {
 // TestAnchorFiles (AC5) checks every embedded anchor file and every pin.
 func TestAnchorFiles(t *testing.T) {
 	refs := map[string]int{} // anchor file -> number of pins referencing it
-	for _, p := range profiles.DefaultProviders() {
+	for _, p := range profiles.All() {
 		for _, prof := range p.Profiles {
 			for _, a := range slices.Concat(prof.Anchors, prof.Intermediates) {
 				refs[a.File]++
@@ -392,7 +392,7 @@ func provTAnchorPins(as []profiles.Anchor) [][2]string {
 
 func TestProfilesTable(t *testing.T) {
 	var got []profiles.Profile
-	for _, p := range profiles.DefaultProviders() {
+	for _, p := range profiles.All() {
 		for _, prof := range p.Profiles {
 			if prof.ProviderID != p.ID {
 				t.Errorf("%s: ProviderID %q inside provider %q", prof.ID, prof.ProviderID, p.ID)
@@ -477,7 +477,7 @@ func TestExcludedOIDsAbsent(t *testing.T) {
 	}
 	// Historical AOC policies 15096.1.3.1.* are excluded as a whole arc.
 	const historicalAOC = "1.3.6.1.4.1.15096.1.3.1."
-	for _, p := range profiles.DefaultProviders() {
+	for _, p := range profiles.All() {
 		for _, prof := range p.Profiles {
 			for _, o := range prof.PolicyOIDs {
 				if slices.Contains(excluded, o) {
@@ -502,7 +502,7 @@ func TestSpecimenMarkers(t *testing.T) {
 	}
 	owners := map[string][]string{} // sha256 -> profile IDs
 	sources := map[string]string{}  // sha256 -> marker source
-	for _, p := range profiles.DefaultProviders() {
+	for _, p := range profiles.All() {
 		for _, prof := range p.Profiles {
 			for _, m := range prof.TestMarkers {
 				if m.SHA256 == "" {
@@ -527,7 +527,7 @@ func TestSpecimenMarkers(t *testing.T) {
 			if len(ids) != 1 {
 				t.Fatalf("fingerprint %s is a marker of %v, want exactly one profile", r.sha256, ids)
 			}
-			if want := "certauth/testdata/specimens/" + r.file; sources[r.sha256] != want {
+			if want := "testdata/specimens/" + r.file; sources[r.sha256] != want {
 				t.Errorf("marker source = %q, want %q", sources[r.sha256], want)
 			}
 			if want, ok := specTExpected[r.file]; ok && ids[0] != want.profile {
@@ -555,4 +555,34 @@ func TestSpecimenMarkers(t *testing.T) {
 	if len(owners) != len(rows) {
 		t.Errorf("%d fingerprint markers, %d manifest rows", len(owners), len(rows))
 	}
+}
+
+func TestAllAndByID(t *testing.T) {
+	all := profiles.All()
+	if len(all) == 0 {
+		t.Fatal("All() returned no providers")
+	}
+	for _, want := range all {
+		t.Run(want.ID, func(t *testing.T) {
+			got, ok := profiles.ByID(want.ID)
+			if !ok {
+				t.Fatalf("ByID(%q) found = false, want true", want.ID)
+			}
+			if got.ID != want.ID {
+				t.Errorf("ByID(%q).ID = %q", want.ID, got.ID)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("ByID(%q) differs from the All() entry", want.ID)
+			}
+		})
+	}
+	t.Run("unknown id", func(t *testing.T) {
+		got, ok := profiles.ByID("nope")
+		if ok {
+			t.Errorf("ByID(%q) found = true, want false", "nope")
+		}
+		if got.ID != "" || len(got.Profiles) != 0 {
+			t.Errorf("ByID(%q) = %+v, want the zero Provider", "nope", got)
+		}
+	})
 }

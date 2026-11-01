@@ -15,7 +15,7 @@ import (
 )
 
 // specimenDir holds the CA-published test leaves and their MANIFEST.md.
-const specimenDir = "testdata/specimens"
+const specimenDir = "../testdata/specimens"
 
 // specimenStatus is the MANIFEST.md "status" column.
 type specimenStatus string

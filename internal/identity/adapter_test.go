@@ -9,12 +9,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
+	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/testpki"
 )
 
 // Adapter shapes, copied from the per-profile declarations of Task 6
-// (certauth/profiles/providers.go). Keep them in sync.
+// (internal/profiles). Keep them in sync.
 
 func fnmt5734(n int) asn1.ObjectIdentifier {
 	return asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 5734, 1, n}

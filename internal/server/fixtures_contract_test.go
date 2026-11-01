@@ -10,7 +10,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/vocdoni/cert-check/certauth/identity"
+	"github.com/vocdoni/cert-check/internal/identity"
 )
 
 // fixturesDir holds the UI's redeem fixtures (Task 11, ruling R38).

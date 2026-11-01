@@ -11,10 +11,10 @@ import (
 	"slices"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth/profiles"
+	"github.com/vocdoni/cert-check/internal/profiles"
 )
 
-// Pinned CAs (DER SHA-256, as in certauth/profiles/providers.go) that issue
+// Pinned CAs (DER SHA-256, as in internal/profiles) that issue
 // the probed certificates (OCSP) or sign the probed CRLs.
 const (
 	caFNMTUsuarios       = "601293ca20b09a03295d196256c6953ff9eba811db8e3ce140413c1bffe9a869" // AC FNMT Usuarios
@@ -112,7 +112,7 @@ var endpoints = slices.Concat(
 )
 
 // specimens are live CA-published test certificates whose revocation status
-// is expected to be good (fingerprints from certauth/testdata/specimens/MANIFEST.md;
+// is expected to be good (fingerprints from testdata/specimens/MANIFEST.md;
 // the Bewor and Sectigo files are withheld from the repository, ruling R30).
 var specimens = map[string]string{
 	"fed45259637950d331447a9e4d12c20ae95411cb8553c7f3dd02fc7df54e8ec8": "digitel-citizen-sw-g1",
@@ -138,7 +138,7 @@ func enabledProfiles() (map[string]*profiles.Enabled, error) {
 
 // DefaultTargets returns the OCSP and CRL targets of every enabled
 // production profile, with the issuers taken from the pinned anchors and
-// intermediates of profiles.DefaultProviders. A row naming an unknown
+// intermediates of profiles.All. A row naming an unknown
 // profile or a CA the profile does not pin is an error.
 func DefaultTargets() ([]Target, error) {
 	enabled, err := enabledProfiles()
@@ -146,7 +146,7 @@ func DefaultTargets() ([]Target, error) {
 		return nil, err
 	}
 	known := map[string]bool{}
-	for _, p := range profiles.DefaultProviders() {
+	for _, p := range profiles.All() {
 		for _, pr := range p.Profiles {
 			known[pr.ID] = true
 		}
