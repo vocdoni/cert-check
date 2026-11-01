@@ -1,9 +1,12 @@
 package certcheck_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"errors"
 	"fmt"
 	"net/http"
@@ -263,5 +266,216 @@ func TestHandlerAuthWithoutTLS(t *testing.T) {
 				t.Errorf("Diagnostics = %+v, want empty", e.Diagnostics)
 			}
 		})
+	}
+}
+
+func TestHandlerVerifySelectsByIssuer(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	res, err := w.h.Verify(t.Context(), []*x509.Certificate{w.leaf(t, w.rootA, hPolicyA, nil)})
+	if err != nil {
+		t.Fatalf("Verify(alpha leaf) = %v, want success", err)
+	}
+	if want := (certcheck.ProviderRef{ID: "alpha", Name: "ALPHA"}); res.Provider != want {
+		t.Errorf("Result.Provider = %+v, want %+v", res.Provider, want)
+	}
+	if doc := res.Identity.Document; doc.Type != certcheck.DocumentDNI || doc.Number != "12345679S" {
+		t.Errorf("Result.Identity.Document = %s %q, want %s %q", doc.Type, doc.Number, certcheck.DocumentDNI, "12345679S")
+	}
+	// beta's leaf goes to beta, whose OCSP host has no responder for rootB.
+	_, err = w.h.Verify(t.Context(), []*x509.Certificate{w.leaf(t, w.rootB, hPolicyB, nil)})
+	e := hErr(t, err)
+	if e.Code != certcheck.CodeRevocationUnavailable || e.Diagnostics.Provider != "beta" || e.Diagnostics.FailedStep != certcheck.StepRevocation {
+		t.Errorf("Verify(beta leaf) = %s at %q by %q, want %s at %q by beta", e.Code, e.Diagnostics.FailedStep, e.Diagnostics.Provider,
+			certcheck.CodeRevocationUnavailable, certcheck.StepRevocation)
+	}
+}
+
+func TestHandlerVerifyNoCandidate(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	leaf := w.leaf(t, w.rootU, hPolicyA, nil)
+	res, err := w.h.Verify(t.Context(), []*x509.Certificate{leaf, w.rootU.Cert})
+	e := hErr(t, err)
+	d := e.Diagnostics
+	if res != nil || e.Code != certcheck.CodeUntrustedIssuer || e.Retryable || d.FailedStep != certcheck.StepPath {
+		t.Fatalf("got (%v, %s, retryable %v) at %q, want (nil, %s, false) at %q", res, e.Code, e.Retryable, d.FailedStep,
+			certcheck.CodeUntrustedIssuer, certcheck.StepPath)
+	}
+	if want := "no provider advertises the leaf's issuer"; e.Detail != want {
+		t.Errorf("Detail = %q, want %q", e.Detail, want)
+	}
+	if d.Code != e.Code || d.TechnicalDetail != e.Detail {
+		t.Errorf("Diagnostics code %s, technical detail %q; want %s and %q", d.Code, d.TechnicalDetail, e.Code, e.Detail)
+	}
+	if !hDiagIDRe.MatchString(d.DiagnosticID) || !d.Time.Equal(w.now) || d.ServerVersion != hVersion || d.Provider != "" {
+		t.Errorf("diagnostics id %q, time %v, version %q, provider %q; want 32 hex, %v, %q, empty",
+			d.DiagnosticID, d.Time, d.ServerVersion, d.Provider, w.now, hVersion)
+	}
+	if len(d.Chain) != 2 || d.Certificate == nil || d.Certificate.SHA256 != testpki.SHA256Hex(leaf.Raw) {
+		t.Errorf("chain %d entries, certificate %+v; want 2 and the leaf described", len(d.Chain), d.Certificate)
+	}
+	for _, tc := range []struct {
+		name  string
+		chain []*x509.Certificate
+	}{
+		{"nil chain", nil},
+		{"nil leaf", []*x509.Certificate{nil}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := w.h.Verify(t.Context(), tc.chain)
+			e := hErr(t, err)
+			if res != nil || e.Code != certcheck.CodeNoCertificate || e.Diagnostics.FailedStep != certcheck.StepBounds || e.Detail != "no client certificate" {
+				t.Errorf("got (%v, %s at %q, %q), want (nil, %s at %q, %q)", res, e.Code, e.Diagnostics.FailedStep, e.Detail,
+					certcheck.CodeNoCertificate, certcheck.StepBounds, "no client certificate")
+			}
+		})
+	}
+}
+
+func TestHandlerVerifyAs(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	alphaLeaf := w.leaf(t, w.rootA, hPolicyA, nil)
+	unknownCritical := func(s *testpki.CertSpec) {
+		s.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 7, 1}, Critical: true, Value: asn1.NullBytes}}
+	}
+	const unknownAuthority = "x509: certificate signed by unknown authority"
+	for _, tc := range []struct {
+		name     string
+		provider string
+		leaf     *x509.Certificate
+		code     certcheck.ErrorCode
+		step     certcheck.Step
+		detail   string
+	}{
+		{"unknown provider", "nope", alphaLeaf, certcheck.CodeProviderMismatch, certcheck.StepBounds, "unknown provider"},
+		{"another provider's leaf", "beta", alphaLeaf, certcheck.CodeProviderMismatch, certcheck.StepPath, unknownAuthority},
+		{"unhandled critical extension under another provider", "beta", w.leaf(t, w.rootA, hPolicyA, unknownCritical), certcheck.CodeProviderMismatch, certcheck.StepPath, unknownAuthority},
+		{"unknown CA", "beta", w.leaf(t, w.rootU, hPolicyB, nil), certcheck.CodeUntrustedIssuer, certcheck.StepPath, unknownAuthority},
+		// The re-classification clears critical extensions only to build a path.
+		{"unknown CA with an unhandled critical extension", "beta", w.leaf(t, w.rootU, hPolicyB, unknownCritical), certcheck.CodeUntrustedIssuer, certcheck.StepPath, unknownAuthority},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := w.h.VerifyAs(t.Context(), tc.provider, []*x509.Certificate{tc.leaf})
+			e := hErr(t, err)
+			d := e.Diagnostics
+			if res != nil || e.Code != tc.code || d.Code != tc.code || d.FailedStep != tc.step || e.Retryable {
+				t.Errorf("got (%v, %s, diagnostics %s, retryable %v) at %q; want (nil, %s, %s, false) at %q",
+					res, e.Code, d.Code, e.Retryable, d.FailedStep, tc.code, tc.code, tc.step)
+			}
+			if e.Detail != tc.detail || d.TechnicalDetail != tc.detail {
+				t.Errorf("detail %q, technical detail %q; want %q", e.Detail, d.TechnicalDetail, tc.detail)
+			}
+			if d.Provider != tc.provider || !hDiagIDRe.MatchString(d.DiagnosticID) || d.ServerVersion != hVersion {
+				t.Errorf("diagnostics provider %q, id %q, version %q; want %q, 32 hex, %q", d.Provider, d.DiagnosticID, d.ServerVersion, tc.provider, hVersion)
+			}
+			if tc.step == certcheck.StepPath && (len(d.ProfileCandidates) != 1 || d.ProfileCandidates[0].ProfileID != tc.provider+"-a") {
+				t.Errorf("profile candidates %+v, want the single profile %s-a of the named provider", d.ProfileCandidates, tc.provider)
+			}
+		})
+	}
+	// A standalone Provider knows no other provider: the same leaf is untrusted_issuer.
+	_, err := w.beta.Verify(t.Context(), []*x509.Certificate{alphaLeaf})
+	if e := hErr(t, err); e.Code != certcheck.CodeUntrustedIssuer || e.Diagnostics.FailedStep != certcheck.StepPath {
+		t.Errorf("beta.Verify(alpha leaf) = %s at %q, want %s at %q", e.Code, e.Diagnostics.FailedStep, certcheck.CodeUntrustedIssuer, certcheck.StepPath)
+	}
+}
+
+// TestHandlerAuthAs covers Auth and AuthAs on real providers. A request
+// without TLS state is TestHandlerAuthWithoutTLS; providers that break the
+// Provider contract are TestHandlerProviderErrors.
+func TestHandlerAuthAs(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	request := func(state *tls.ConnectionState) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "https://alpha.auth.test/login", nil)
+		r.TLS = state
+		return r
+	}
+	handshake := func(leaf *x509.Certificate) *tls.ConnectionState {
+		return &tls.ConnectionState{Version: tls.VersionTLS12, CipherSuite: tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			ServerName: "alpha.auth.test", PeerCertificates: []*x509.Certificate{leaf}}
+	}
+	good, bad := handshake(w.leaf(t, w.rootA, hPolicyA, nil)), handshake(w.leaf(t, w.rootU, hPolicyA, nil))
+	for _, tc := range []struct {
+		name        string
+		auth        func(*http.Request) (*certcheck.Result, error)
+		badProvider string // Diagnostics.Provider of the rootU failure
+	}{
+		{"Auth", w.h.Auth, ""},
+		{"AuthAs", func(r *http.Request) (*certcheck.Result, error) { return w.h.AuthAs(r, "alpha") }, "alpha"},
+	} {
+		t.Run(tc.name+"/success", func(t *testing.T) {
+			res, err := tc.auth(request(good))
+			if err != nil {
+				t.Fatalf("error = %v, want success", err)
+			}
+			if want := certcheck.DescribeTLS(good); res.Provider.ID != "alpha" || res.Diagnostics.TLS == nil || *res.Diagnostics.TLS != *want {
+				t.Errorf("provider %q, Diagnostics.TLS = %+v; want alpha and %+v", res.Provider.ID, res.Diagnostics.TLS, want)
+			}
+		})
+		t.Run(tc.name+"/failure", func(t *testing.T) {
+			res, err := tc.auth(request(bad))
+			e := hErr(t, err)
+			if res != nil || e.Code != certcheck.CodeUntrustedIssuer || e.Diagnostics.Provider != tc.badProvider {
+				t.Errorf("got (%v, %s by %q), want (nil, %s by %q)", res, e.Code, e.Diagnostics.Provider, certcheck.CodeUntrustedIssuer, tc.badProvider)
+			}
+			if want := certcheck.DescribeTLS(bad); e.Diagnostics.TLS == nil || *e.Diagnostics.TLS != *want {
+				t.Errorf("Diagnostics.TLS = %+v, want %+v", e.Diagnostics.TLS, want)
+			}
+		})
+	}
+}
+
+func TestHandlerCAs(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	check := func(t *testing.T, h *certcheck.Handler, want []*x509.Certificate) {
+		t.Helper()
+		got := h.Certificates()
+		if !slices.EqualFunc(got, want, func(der []byte, c *x509.Certificate) bool { return bytes.Equal(der, c.Raw) }) {
+			t.Errorf("Certificates() = %d entries, want the DER of %d CAs in provider order", len(got), len(want))
+		}
+		pool := x509.NewCertPool()
+		for _, c := range want {
+			if !h.CertificateCheck(c.RawSubject) {
+				t.Errorf("CertificateCheck(%s) = false, want true", c.Subject)
+			}
+			pool.AddCert(c)
+		}
+		if !h.ClientCAs().Equal(pool) {
+			t.Error("ClientCAs() differs from the pool of the advertised CAs")
+		}
+	}
+	check(t, w.h, []*x509.Certificate{w.rootA.Cert, w.rootB.Cert})
+	if w.h.CertificateCheck(w.rootU.Cert.RawSubject) {
+		t.Error("CertificateCheck(unpinned root) = true, want false")
+	}
+	// A CA advertised twice by one provider is listed once.
+	dup, err := certcheck.NewHandler([]certcheck.Provider{w.alpha, fakeProvider{id: "dup", cas: []*x509.Certificate{w.rootU.Cert, w.rootU.Cert}}})
+	if err != nil {
+		t.Fatalf("NewHandler(alpha, dup) = %v", err)
+	}
+	check(t, dup, []*x509.Certificate{w.rootA.Cert, w.rootU.Cert})
+
+	// Returned slices are copies.
+	want := [][]byte{bytes.Clone(w.rootA.Cert.Raw), bytes.Clone(w.rootB.Cert.Raw)}
+	certs := w.h.Certificates()
+	certs[0][0] ^= 0xff
+	certs[1] = nil
+	if got := w.h.Certificates(); !slices.EqualFunc(got, want, bytes.Equal) {
+		t.Error("mutating the Certificates() result changed the handler")
+	}
+	ps := w.h.Providers()
+	if len(ps) != 2 || ps[0] != w.alpha || ps[1] != w.beta {
+		t.Fatalf("Providers() = %v, want [alpha beta]", ps)
+	}
+	ps[0] = nil
+	if got := w.h.Providers(); got[0] != w.alpha {
+		t.Error("mutating the Providers() result changed the handler")
+	}
+	if w.h.Name() != "certcheck" || !w.h.RequireCertificate() {
+		t.Errorf("Name() = %q, RequireCertificate() = %v; want certcheck, true", w.h.Name(), w.h.RequireCertificate())
 	}
 }

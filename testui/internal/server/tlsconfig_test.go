@@ -36,7 +36,6 @@ const (
 	betaHost   = "beta.auth.test"
 	gammaHost  = "gamma.auth.test"
 	ocspHost   = "ocsp.alpha.test"
-	ocspURL    = "http://" + ocspHost + "/"
 )
 
 var (
@@ -51,7 +50,6 @@ var (
 type world struct {
 	now          time.Time
 	rootA, rootB *testpki.CA
-	leaf         *testpki.Leaf        // valid alpha leaf
 	providers    []certcheck.Provider // alpha, beta
 	handler      *certcheck.Handler   // over providers
 	serverCert   tls.Certificate
@@ -106,20 +104,6 @@ func newWorld(t *testing.T) *world {
 		t.Fatalf("certcheck.NewHandler: %v", err)
 	}
 
-	w.leaf = w.rootA.Leaf(t, testpki.CertSpec{
-		Now: now,
-		Subject: testpki.Name{
-			testpki.Printable(testpki.OIDCountry, "ES"),
-			testpki.Printable(testpki.OIDSerialNumber, "IDCES-12345679S"),
-			testpki.UTF8(testpki.OIDGivenName, "JUAN"),
-			testpki.UTF8(testpki.OIDSurname, "GARCÍA LÓPEZ"),
-			testpki.UTF8(testpki.OIDCommonName, "JUAN GARCÍA LÓPEZ"),
-		},
-		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageContentCommitment,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-		Policies:    []asn1.ObjectIdentifier{policyA},
-		OCSPServers: []string{ocspURL},
-	})
 	w.serverCert, w.serverPool = testpki.ServerTLS(t, alphaHost, betaHost, gammaHost)
 	return w
 }
@@ -537,78 +521,6 @@ func TestRequestClientCertOptional(t *testing.T) {
 	}
 }
 
-func TestAuthenticateSuccessAndTLSInfo(t *testing.T) {
-	w := newWorld(t)
-	as := w.startServer(t)
-	call := as.get(t, as.client(t, &tls.Config{RootCAs: w.serverPool, Certificates: []tls.Certificate{w.leaf.TLSCertificate()}}), alphaHost)
-	if call.err != nil {
-		t.Fatalf("Authenticate: %v", call.err)
-	}
-	if call.res.Provider.ID != "alpha" {
-		t.Errorf("provider = %q, want alpha", call.res.Provider.ID)
-	}
-	want := certcheck.TLSInfo{Version: "TLS 1.2", SNI: alphaHost, ClientCertificatePresented: true, ChainLength: 1}
-	got := call.res.Diagnostics.TLS
-	if got == nil {
-		t.Fatal("Diagnostics.TLS = nil, want the handshake details")
-	}
-	if got.Version != want.Version || got.SNI != want.SNI || got.ClientCertificatePresented != want.ClientCertificatePresented ||
-		got.ChainLength != want.ChainLength || got.CipherSuite == "" {
-		t.Errorf("Diagnostics.TLS = %+v, want %+v with a cipher suite", *got, want)
-	}
-}
-
-func TestAuthenticateErrorCarriesTLS(t *testing.T) {
-	w := newWorld(t)
-	as := w.startServer(t)
-	leaf := w.leaf.TLSCertificate()
-	// beta advertises only its own root, so force the alpha leaf onto it.
-	c := as.client(t, &tls.Config{RootCAs: w.serverPool,
-		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &leaf, nil }})
-	call := as.get(t, c, betaHost)
-	e := authError(t, call.err)
-	if e.Code != certcheck.CodeProviderMismatch {
-		t.Errorf("code = %q, want %q", e.Code, certcheck.CodeProviderMismatch)
-	}
-	if got := e.Diagnostics.TLS; got == nil || got.SNI != betaHost || !got.ClientCertificatePresented {
-		t.Errorf("Diagnostics.TLS = %+v, want SNI %s with a certificate", got, betaHost)
-	}
-	if e.Diagnostics.Provider != "beta" {
-		t.Errorf("Diagnostics.Provider = %q, want beta (from the SNI)", e.Diagnostics.Provider)
-	}
-}
-
-func TestAuthenticateRunsEveryRequest(t *testing.T) {
-	w := newWorld(t)
-	as := w.startServer(t)
-	c := as.client(t, &tls.Config{RootCAs: w.serverPool, Certificates: []tls.Certificate{w.leaf.TLSCertificate()}})
-	first, second := as.get(t, c, alphaHost), as.get(t, c, alphaHost)
-	if first.remote != second.remote {
-		t.Fatalf("requests used connections %s and %s, want one keep-alive connection", first.remote, second.remote)
-	}
-	if first.err != nil || second.err != nil {
-		t.Fatalf("Authenticate: %v, %v", first.err, second.err)
-	}
-	if a, b := first.res.Diagnostics.DiagnosticID, second.res.Diagnostics.DiagnosticID; a == "" || a == b {
-		t.Errorf("DiagnosticIDs = %q, %q, want two distinct IDs", a, b)
-	}
-}
-
-func TestAuthenticateWithoutTLS(t *testing.T) {
-	w := newWorld(t)
-	res, err := w.handler.AuthAs(httptest.NewRequest(http.MethodGet, "http://"+alphaHost+"/v1/authenticate", nil), "alpha")
-	if res != nil {
-		t.Fatalf("result = %+v, want nil", res)
-	}
-	e := authError(t, err)
-	if e.Code != certcheck.CodeInternal {
-		t.Errorf("code = %q, want %q", e.Code, certcheck.CodeInternal)
-	}
-	if e.Diagnostics.DiagnosticID != "" {
-		t.Errorf("DiagnosticID = %q, want none (documented)", e.Diagnostics.DiagnosticID)
-	}
-}
-
 func TestProvider(t *testing.T) {
 	h := server.NewAuthHosts("Auth.Test")
 	cases := []struct {
@@ -630,37 +542,5 @@ func TestProvider(t *testing.T) {
 		if got != c.want || ok != c.wantOK {
 			t.Errorf("Provider(%q) = (%q, %v), want (%q, %v)", c.serverName, got, ok, c.want, c.wantOK)
 		}
-	}
-}
-
-func TestCheckHost(t *testing.T) {
-	cases := []struct {
-		name, host, sni string
-		noTLS           bool
-		want            error
-	}{
-		{name: "host with port", host: "alpha.auth.test:8443", sni: alphaHost},
-		{name: "host without port", host: alphaHost, sni: alphaHost},
-		{name: "case-insensitive", host: "Alpha.AUTH.test", sni: alphaHost},
-		{name: "other provider", host: betaHost, sni: alphaHost, want: certcheck.ErrMisdirected},
-		{name: "other provider with port", host: "beta.auth.test:443", sni: alphaHost, want: certcheck.ErrMisdirected},
-		{name: "trailing dot", host: "alpha.auth.test.", sni: alphaHost, want: certcheck.ErrMisdirected},
-		{name: "empty host", host: "", sni: alphaHost, want: certcheck.ErrMisdirected},
-		{name: "no SNI", host: alphaHost, sni: "", want: certcheck.ErrMisdirected},
-		{name: "empty host and no SNI", host: "", sni: "", want: certcheck.ErrMisdirected},
-		{name: "port only and no SNI", host: ":443", sni: "", want: certcheck.ErrMisdirected},
-		{name: "no TLS", host: alphaHost, noTLS: true, want: certcheck.ErrMisdirected},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodGet, "http://placeholder/v1/authenticate", nil)
-			r.Host = c.host
-			if !c.noTLS {
-				r.TLS = &tls.ConnectionState{ServerName: c.sni}
-			}
-			if got := certcheck.CheckHost(r); !errors.Is(got, c.want) {
-				t.Errorf("CheckHost(Host %q, SNI %q) = %v, want %v", c.host, c.sni, got, c.want)
-			}
-		})
 	}
 }

@@ -64,9 +64,22 @@ jobs:
             go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/revocation
           done
           go test -run '^$' -fuzz '^FuzzParseQCStatements$' -fuzztime 30s ./internal/engine
-      - name: dependency isolation (AC3)
+      - name: public API (AC4 go doc golden)
+        run: go doc -all . | diff -u testdata/godoc.golden -
+      - name: test names (AC6 golden)
+        run: |
+          export LC_ALL=C
+          list() { (cd "$1" && go test -list '.*' -tags live ./... | grep -E '^(Test|Fuzz|Example|Benchmark)'); }
+          missing="$(comm -23 <(cut -d' ' -f2 testdata/golden/test-names.txt | sort) <(for m in $MODULES; do list "$m"; done | sort))"
+          if [ -n "$missing" ]; then
+            echo "tests of testdata/golden/test-names.txt missing from both modules:"
+            echo "$missing"
+            exit 1
+          fi
+      - name: dependency isolation (AC3) and import graph
         run: |
           if go list -deps ./... | grep -E 'certmagic|libdns|go\.uber\.org/zap|golang\.org/x/time'; then exit 1; fi
+          if go list -deps ./internal/identity ./internal/revocation ./internal/profiles ./internal/opts | grep -x 'github.com/vocdoni/cert-check'; then exit 1; fi
           for m in $MODULES; do
             if (cd "$m" && go list -f '{{.ImportPath}}: {{join .Imports " "}}' ./...) | grep -v '^github.com/vocdoni/cert-check/internal/testpki' | grep 'internal/testpki'; then exit 1; fi
           done

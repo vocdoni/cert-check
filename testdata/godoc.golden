@@ -1,0 +1,457 @@
+package certcheck // import "github.com/vocdoni/cert-check"
+
+Package certcheck authenticates people by the client certificate their browser
+presents over TLS, for the Spanish certificate types it supports (FNMT, idCAT,
+ACCV, DNIe and others).
+
+A program picks the certificate types it accepts by constructing their providers
+(one package per issuer under providers/, for example idcat.New() or fnmt.New(),
+or providers.All()) and builds a Handler from them. The Handler supplies the
+tls.Config of the listener that requests the client certificate (TLSConfig)
+and verifies the certificate of each request (Auth). Verification checks the
+chain against pinned trust anchors only, the profile (exact policy OIDs), the
+key usage, test-certificate markers, the holder's identity and the revocation
+status (OCSP, then CRL), and fails closed. A success is a *Result with the
+typed Identity; a failure is an *Error with a typed ErrorCode and session-bound
+Diagnostics.
+
+Diagnostics contain certificate details: show them only to the browser that ran
+the check and log Diagnostics.LogAttrs instead.
+
+CONSTANTS
+
+const (
+	DefaultMaxChainLen = 10       // certificates in a received chain
+	MaxCertificateDER  = 16 << 10 // bytes of one received certificate
+)
+    Bounds applied to every chain before path building.
+
+const (
+	RoleNaturalPerson  = profiles.RoleNaturalPerson
+	RoleRepresentative = profiles.RoleRepresentative
+	RolePublicEmployee = profiles.RolePublicEmployee
+
+	DocumentDNI = identity.DocumentDNI
+	DocumentNIE = identity.DocumentNIE
+
+	RevocationStatusGood              = revocation.StatusGood
+	RevocationStatusRevoked           = revocation.StatusRevoked
+	RevocationStatusUnknown           = revocation.StatusUnknown
+	RevocationStatusUnavailable       = revocation.StatusUnavailable
+	RevocationStatusStale             = revocation.StatusStale
+	RevocationStatusInvalidEvidence   = revocation.StatusInvalidEvidence
+	RevocationStatusUnsupportedMethod = revocation.StatusUnsupportedMethod
+
+	RevocationMethodOCSP = revocation.MethodOCSP
+	RevocationMethodCRL  = revocation.MethodCRL
+)
+    Values of the aliased enum types, for comparisons with Result fields
+    (Profile.HolderRole, Identity.Document.Type, Revocation.Status and
+    Revocation.Method, RevocationAttempt.Outcome and RevocationAttempt.Method).
+
+
+VARIABLES
+
+var Codes = []ErrorCode{
+	CodeNoCertificate, CodeProviderMismatch, CodeUntrustedIssuer, CodeInvalidChain, CodeExpired,
+	CodeNotYetValid, CodeUnsupportedProfile, CodeUnsupportedPurpose, CodeWeakAlgorithm,
+	CodeTestCertificate, CodeIdentityInvalid, CodeIdentityUnsupportedDocument, CodeRevoked,
+	CodeRevocationUnknown, CodeRevocationUnavailable, CodeInternal,
+}
+    Codes lists every ErrorCode, for tables keyed by code (user messages,
+    metrics).
+
+var ErrMisdirected = errors.New("certcheck: Host does not match the TLS server name")
+    ErrMisdirected is returned by CheckHost when the request Host differs from
+    the TLS server name (answer 421 Misdirected Request).
+
+
+FUNCTIONS
+
+func CheckHost(r *http.Request) error
+    CheckHost returns ErrMisdirected when r.Host (port stripped, compared
+    case-insensitively) differs from r.TLS.ServerName, or r has no TLS state.
+    Call it before Auth on a listener that serves several names.
+
+func NewDiagnosticID() string
+    NewDiagnosticID returns a new random diagnostic ID (32 lowercase hex
+    digits), for errors a server decides itself.
+
+
+TYPES
+
+type CandidateResult struct {
+	ProfileID string `json:"profileId"`
+	Result    string `json:"result"`
+}
+    CandidateResult is the per-profile outcome of steps 3-4.
+
+type CertificateDetails struct {
+	Subject            string    `json:"subject"`
+	Issuer             string    `json:"issuer"`
+	SerialHex          string    `json:"serialHex"`
+	NotBefore          time.Time `json:"notBefore"`
+	NotAfter           time.Time `json:"notAfter"`
+	SHA256             string    `json:"sha256"`
+	KeyAlgorithm       string    `json:"keyAlgorithm"`
+	SignatureAlgorithm string    `json:"signatureAlgorithm"`
+	KeyUsage           []string  `json:"keyUsage"`
+	ExtKeyUsage        []string  `json:"extKeyUsage"`
+	PolicyOIDs         []string  `json:"policyOids"`
+	CriticalExtensions []string  `json:"criticalExtensions"`
+	OCSPURLs           []string  `json:"ocspUrls"`
+	CAIssuerURLs       []string  `json:"caIssuerUrls"`
+	CDPURLs            []string  `json:"cdpUrls"`
+}
+    CertificateDetails describes the presented leaf.
+
+func DescribeCertificate(c *x509.Certificate) *CertificateDetails
+    DescribeCertificate describes a received leaf for Diagnostics.Certificate.
+
+type CertificateInfo struct {
+	Subject      string    `json:"subject"` // RFC 4514
+	Issuer       string    `json:"issuer"`  // issuer CN
+	SerialHex    string    `json:"serialHex"`
+	NotBefore    time.Time `json:"notBefore"`
+	NotAfter     time.Time `json:"notAfter"`
+	SHA256       string    `json:"sha256"`
+	KeyAlgorithm string    `json:"keyAlgorithm"` // e.g. "RSA-2048", "ECDSA-P-256"
+}
+    CertificateInfo describes the validated leaf.
+
+type ChainEntry struct {
+	Subject string `json:"subject"`
+	Issuer  string `json:"issuer"`
+}
+    ChainEntry is the subject and issuer of one received certificate.
+
+type Date = identity.Date
+    Field types owned by internal packages, aliased so that a program can name
+    every type of a Result.
+
+type Diagnostics struct {
+	DiagnosticID       string              `json:"diagnosticId"`
+	Time               time.Time           `json:"time"`
+	ServerVersion      string              `json:"serverVersion"`
+	Provider           string              `json:"provider"`
+	FailedStep         Step                `json:"failedStep"`
+	Code               ErrorCode           `json:"code"`
+	TechnicalDetail    string              `json:"technicalDetail"`
+	TLS                *TLSInfo            `json:"tls"`
+	Certificate        *CertificateDetails `json:"certificate"`
+	Chain              []ChainEntry        `json:"chain"`
+	ProfileCandidates  []CandidateResult   `json:"profileCandidates"`
+	RevocationAttempts []RevocationAttempt `json:"revocationAttempts"`
+}
+    Diagnostics is the session-bound support report. It contains certificate
+    details and is shown only to the browser that ran the transaction; use
+    LogAttrs for logging.
+
+func (d Diagnostics) LogAttrs() []slog.Attr
+    LogAttrs returns the non-PII fields allowed in logs: id, code, step,
+    provider, candidates (x509 error class only), issuer DN, policy OIDs,
+    revocation host/status/duration, TLS version/cipher. Never subject, names,
+    document, serial, leaf hash, URL paths or technicalDetail.
+
+type Document = identity.Document
+    Field types owned by internal packages, aliased so that a program can name
+    every type of a Result.
+
+type DocumentType = identity.DocumentType
+    Field types owned by internal packages, aliased so that a program can name
+    every type of a Result.
+
+type Error struct {
+	Code        ErrorCode
+	Retryable   bool
+	Detail      string
+	Diagnostics Diagnostics
+}
+    Error is the typed validation failure. Detail never contains identity data.
+
+func (e *Error) Error() string
+
+type ErrorCode string
+    ErrorCode is the typed failure reason shown to users.
+
+const (
+	CodeNoCertificate               ErrorCode = "no_certificate"
+	CodeProviderMismatch            ErrorCode = "provider_mismatch"
+	CodeUntrustedIssuer             ErrorCode = "untrusted_issuer"
+	CodeInvalidChain                ErrorCode = "invalid_chain"
+	CodeExpired                     ErrorCode = "expired"
+	CodeNotYetValid                 ErrorCode = "not_yet_valid"
+	CodeUnsupportedProfile          ErrorCode = "unsupported_profile"
+	CodeUnsupportedPurpose          ErrorCode = "unsupported_purpose"
+	CodeWeakAlgorithm               ErrorCode = "weak_algorithm"
+	CodeTestCertificate             ErrorCode = "test_certificate"
+	CodeIdentityInvalid             ErrorCode = "identity_invalid"
+	CodeIdentityUnsupportedDocument ErrorCode = "identity_unsupported_document"
+	CodeRevoked                     ErrorCode = "revoked"
+	CodeRevocationUnknown           ErrorCode = "revocation_unknown"
+	CodeRevocationUnavailable       ErrorCode = "revocation_unavailable"
+	CodeInternal                    ErrorCode = "internal"
+)
+    Error codes, carried by every *Error and its Diagnostics.
+
+func (c ErrorCode) Retryable() bool
+    Retryable reports whether retrying later may succeed.
+
+type Handler struct {
+	// Has unexported fields.
+}
+    Handler authenticates HTTP requests that arrived over TLS with a client
+    certificate, using a fixed set of certificate types. It is immutable and
+    safe for concurrent use.
+
+func NewHandler(providers []Provider, options ...Option) (*Handler, error)
+    NewHandler returns a Handler for providers. It needs at least one provider,
+    unique provider IDs, no inert provider (one whose CAs are empty because no
+    profile is valid at construction) and no ambiguity: no CA subject may be
+    advertised by two providers, and no two profiles of different providers may
+    share an anchor key and a policy OID. Acceptance therefore never depends
+    on the order of providers. A nil entry is an error; a typed nil (a nil
+    pointer stored in a non-nil Provider) is a programmer error and may panic.
+    NewHandler uses WithClock and WithVersion; other options are ignored.
+
+func (h *Handler) Auth(r *http.Request) (*Result, error)
+    Auth verifies the client certificate chain of r (Verify on
+    r.TLS.PeerCertificates) and adds the handshake details to the diagnostics.
+    Every call runs the full pipeline. A request without TLS state is an
+    internal error with empty Diagnostics. The error is always *Error.
+
+func (h *Handler) AuthAs(r *http.Request, providerID string) (*Result, error)
+    AuthAs is Auth with the provider chosen by the caller (VerifyAs).
+
+func (h *Handler) CertificateCheck(subject []byte) bool
+    CertificateCheck reports whether subject (a DER-encoded distinguished name)
+    is the subject of an advertised CA.
+
+func (h *Handler) Certificates() [][]byte
+    Certificates returns the DER of every advertised CA, deduplicated,
+    in provider order. The slices are fresh copies.
+
+func (h *Handler) ClientCAs() *x509.CertPool
+    ClientCAs returns a fresh pool of the advertised CAs, for
+    tls.Config.ClientCAs.
+
+func (h *Handler) Name() string
+    Name returns "certcheck", for adapters to blind-csp-shaped interfaces.
+
+func (h *Handler) Providers() []Provider
+    Providers returns the providers in construction order (a fresh slice).
+
+func (h *Handler) RequireCertificate() bool
+    RequireCertificate reports true: authentication needs a client certificate.
+    (TLSConfig still requests the certificate without requiring it, so that a
+    browser without one gets a no_certificate answer instead of a handshake
+    failure.)
+
+func (h *Handler) TLSConfig(getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), options ...TLSOption) *tls.Config
+    TLSConfig returns the server configuration of a listener that authenticates
+    with h: TLS 1.2 (see WithTLS13), ECDHE AEAD suites, curves X25519,
+    P-256 and P-384, a client certificate requested but not required with h's
+    CAs advertised, session tickets disabled (every connection presents its
+    certificate again) and ALPN http/1.1 only. getCert supplies the server
+    certificate; it may be nil when the caller sets Certificates.
+
+func (h *Handler) Verify(ctx context.Context, chain []*x509.Certificate) (*Result, error)
+    Verify selects the provider whose CAs include the issuer of chain[0] (by
+    exact subject bytes, as crypto/x509 finds parents) and returns its Verify
+    verbatim. A chain without a leaf is no_certificate; a leaf whose issuer
+    no provider advertises is untrusted_issuer at step path. A provider error
+    that wraps an *Error is returned as that *Error; any other provider error,
+    or a provider that returns neither a Result nor an error, gives an internal
+    error. The error is always *Error.
+
+func (h *Handler) VerifyAs(ctx context.Context, providerID string, chain []*x509.Certificate) (*Result, error)
+    VerifyAs verifies chain with the provider providerID, for servers that
+    already know which certificate type the user chose (for example from the TLS
+    server name). An unknown providerID is provider_mismatch at step bounds.
+    When the provider answers untrusted_issuer at step path and the leaf
+    chains to the pinned CAs of the handler's providers, the code becomes
+    provider_mismatch: the user picked the wrong certificate type. That check
+    builds a path only; it never accepts and makes no network request. Provider
+    errors are handled as in Verify. The error is always *Error.
+
+type Identity = identity.Identity
+    Field types owned by internal packages, aliased so that a program can name
+    every type of a Result.
+
+type Option func(*opts.Settings)
+    Option configures providers (the constructors under providers/) and
+    NewHandler.
+
+func WithClock(now func() time.Time) Option
+    WithClock sets the pipeline clock: providers check anchor validity at
+    construction and certificates at validation with it, and the Handler stamps
+    its own errors with it. The default is time.Now. The revocation checker
+    keeps its own clock (RevocationOptions.Now).
+
+func WithLogger(l *slog.Logger) Option
+    WithLogger sets the logger of construction warnings (an anchor outside
+    validity, a disabled profile). The default is slog.Default().
+
+func WithRevocation(r *Revocation) Option
+    WithRevocation makes providers share r for OCSP and CRL checks. Without it,
+    every provider uses one process-wide default with the User-Agent
+    "cert-check/dev" and the wall clock. r must come from NewRevocation.
+
+func WithVersion(v string) Option
+    WithVersion sets Diagnostics.ServerVersion. The default is "".
+
+type Organization = identity.Organization
+    Field types owned by internal packages, aliased so that a program can name
+    every type of a Result.
+
+type ProfileInfo = profiles.ProfileInfo
+    Field types owned by internal packages, aliased so that a program can name
+    every type of a Result.
+
+type Provider interface {
+	// Info describes the provider (stable ID, display name, description, beta flag).
+	Info() ProviderInfo
+	// CAs returns the pinned CA certificates a TLS server should advertise
+	// in its CertificateRequest for this provider (anchors and pinned
+	// intermediates). The slice and the certificates are shared; callers
+	// must not modify them. Handler builds its own pools from them.
+	CAs() []*x509.Certificate
+	// Verify runs the full validation pipeline on a client certificate chain
+	// as received in tls.ConnectionState.PeerCertificates. chain is used as
+	// received: chain[0] is the leaf; chain[1:] are never used for path
+	// building. A standalone Verify (no Handler) answers untrusted_issuer for
+	// any leaf that does not chain to its own CAs. On failure the error is
+	// *Error. Verify performs network I/O (OCSP/CRL) bounded by ctx; callers
+	// set a deadline (the testing UI uses 40 s). A deadline hit is
+	// *Error{Code: internal, Retryable: true}.
+	Verify(ctx context.Context, chain []*x509.Certificate) (*Result, error)
+}
+    Provider verifies client certificates of one certificate type (an issuer
+    family such as FNMT citizen or idCAT). Implementations are safe for
+    concurrent use; Handler relies only on this interface, so consumers may
+    provide test doubles.
+
+type ProviderInfo struct {
+	ID          string // e.g. "idcat"
+	Name        string // display name, e.g. "idCAT Certificat"
+	Description string // one sentence, as shown by the testing UI
+	Beta        bool
+}
+    ProviderInfo describes a provider. ID is a DNS label and stable.
+
+type ProviderRef struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+    ProviderRef is the provider part of a Result (JSON {"id","name"}).
+
+type Result struct {
+	Provider     ProviderRef     `json:"provider"`
+	Profile      ProfileInfo     `json:"profile"`
+	Identity     Identity        `json:"identity"`
+	Organization *Organization   `json:"organization"`
+	Certificate  CertificateInfo `json:"certificate"`
+	Revocation   RevocationInfo  `json:"revocation"`
+	ValidatedAt  time.Time       `json:"validatedAt"`
+	Diagnostics  Diagnostics     `json:"diagnostics"`
+}
+    Result is a successful validation.
+
+type Revocation struct {
+	// Has unexported fields.
+}
+    Revocation is a shared OCSP/CRL checker with bounded caches. Create it with
+    NewRevocation and pass it to providers with WithRevocation; the zero value
+    is not usable. It is safe for concurrent use.
+
+func NewRevocation(o RevocationOptions) (*Revocation, error)
+    NewRevocation returns a revocation checker. Negative timeouts or cache
+    bounds are an error. Fetches go only to the hosts each profile allowlists
+    and never to loopback, private or link-local addresses.
+
+type RevocationAttempt struct {
+	Method           RevocationMethod `json:"method"`
+	URL              string           `json:"url"`
+	HTTPStatus       int              `json:"httpStatus"`
+	DurationMS       int64            `json:"durationMs"`
+	Outcome          RevocationStatus `json:"outcome"`
+	Detail           string           `json:"detail"`
+	FromCache        bool             `json:"fromCache"`
+	ProducedAt       *time.Time       `json:"producedAt"`
+	ThisUpdate       *time.Time       `json:"thisUpdate"`
+	NextUpdate       *time.Time       `json:"nextUpdate"`
+	ResponderSubject string           `json:"responderSubject"`
+	NonceSent        bool             `json:"nonceSent"`
+	NonceEchoed      bool             `json:"nonceEchoed"`
+}
+    RevocationAttempt is one OCSP or CRL fetch made for the verified chain.
+
+type RevocationInfo struct {
+	Status     RevocationStatus `json:"status"` // always "good" in a Result
+	Method     RevocationMethod `json:"method"`
+	CheckedAt  time.Time        `json:"checkedAt"`
+	ThisUpdate time.Time        `json:"thisUpdate"`
+	NextUpdate *time.Time       `json:"nextUpdate"`
+	Source     string           `json:"source"` // host
+}
+    RevocationInfo is the leaf's accepted revocation evidence.
+
+type RevocationMethod = revocation.Method
+    Field types owned by internal packages, aliased so that a program can name
+    every type of a Result.
+
+type RevocationOptions struct {
+	UserAgent        string           // "" = "cert-check/dev"
+	Now              func() time.Time // evidence freshness clock; nil = time.Now; pass the WithClock clock in tests
+	Logger           *slog.Logger     // rejected evidence warnings; nil = slog.Default()
+	OCSPTimeout      time.Duration    // 0 = 5 s
+	CRLTimeout       time.Duration    // 0 = 15 s
+	CRLCacheBytes    int64            // parsed-CRL cache bound; 0 = 128 MiB
+	OCSPCacheEntries int              // OCSP response cache bound; 0 = 4096
+}
+    RevocationOptions configures NewRevocation. Zero values take the defaults.
+
+type RevocationStatus = revocation.Status
+    Field types owned by internal packages, aliased so that a program can name
+    every type of a Result.
+
+type Role = profiles.Role
+    Field types owned by internal packages, aliased so that a program can name
+    every type of a Result.
+
+type Step string
+    Step is the pipeline step that failed.
+
+const (
+	StepBounds     Step = "bounds"
+	StepAlgorithms Step = "algorithms"
+	StepPath       Step = "path"
+	StepProfile    Step = "profile"
+	StepPurpose    Step = "purpose"
+	StepTestMarker Step = "test_marker"
+	StepIdentity   Step = "identity"
+	StepRevocation Step = "revocation"
+)
+    Pipeline steps, in order (Diagnostics.FailedStep).
+
+type TLSInfo struct {
+	Version                    string `json:"version"`
+	CipherSuite                string `json:"cipherSuite"`
+	SNI                        string `json:"sni"`
+	ClientCertificatePresented bool   `json:"clientCertificatePresented"`
+	ChainLength                int    `json:"chainLength"`
+}
+    TLSInfo describes the handshake (filled by Handler.Auth and Handler.AuthAs).
+
+func DescribeTLS(cs *tls.ConnectionState) *TLSInfo
+    DescribeTLS builds TLSInfo from a connection state.
+
+type TLSOption func(*tlsSettings)
+    TLSOption configures Handler.TLSConfig.
+
+func WithTLS13() TLSOption
+    WithTLS13 allows TLS 1.3. Without it the configuration is TLS 1.2 only:
+    TLS 1.3 needs an RSA-PSS CertificateVerify, which many smart cards, TPM keys
+    and legacy Windows key stores cannot produce. The cost of TLS 1.2 is that
+    the client certificate crosses the network unencrypted.
+
