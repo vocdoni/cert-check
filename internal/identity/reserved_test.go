@@ -1,6 +1,7 @@
 package identity_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/vocdoni/cert-check/internal/identity"
@@ -100,6 +101,18 @@ func TestReservedMatch(t *testing.T) {
 			}
 		})
 	}
+
+	// R10.1 (U6-FABLE-1): ComparisonKey does not fold scripts, so a Cyrillic
+	// A would miss the PRUEBAS marker; Extract rejects it before Match.
+	t.Run("given PRUEBAS with a Cyrillic A never reaches Match", func(t *testing.T) {
+		ca := testpki.NewRoot(t, "reserved-homoglyph-root", testpki.CertSpec{})
+		leaf := ca.Leaf(t, testpki.CertSpec{Subject: person("IDCES-"+doc, "PRUEB\u0410S", "GARCIA LOPEZ")})
+		x, err := shapePlain().Extract(leaf.Cert)
+		if !errors.Is(err, identity.ErrInvalid) {
+			kind, hit := r.Match(x)
+			t.Fatalf("Extract err = %v, want ErrInvalid; Match = (%q, %v)", err, kind, hit)
+		}
+	})
 
 	t.Run("empty registry", func(t *testing.T) {
 		if kind, hit := (identity.Reserved{}).Match(extracted("00000000T", "NOMBRE", "FICTICIO", nil)); hit {

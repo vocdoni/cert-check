@@ -193,6 +193,10 @@ func dateOfBirthCases(tb testing.TB) []sdaCase {
 		{name: "no zone", der: testpki.DateOfBirthSDA("19800101120000"), wantErr: true, values: []string{"19800101120000"}},
 		{name: "signed year", der: testpki.DateOfBirthSDA("+9800101120000Z"), wantErr: true, values: []string{"+9800101120000Z"}},
 		{name: "date only", der: testpki.DateOfBirthSDA("19800101"), wantErr: true, values: []string{"19800101"}},
+		// R10.2 (U6-FABLE-2): the year is from 1900 on.
+		{name: "year 0000", der: testpki.DateOfBirthSDA("00000101000000Z"), wantErr: true, values: []string{"00000101000000Z"}},
+		{name: "year 1899", der: testpki.DateOfBirthSDA("18991231235959Z"), wantErr: true, values: []string{"18991231235959Z"}},
+		{name: "year 1900", der: testpki.DateOfBirthSDA("19000101000000Z"), want: identity.Date{Year: 1900, Month: time.January, Day: 1}, wantFound: true},
 		{name: "PrintableString value", der: seqDER(dobAttr(tb, dob, tlv(asn1.TagPrintableString, []byte("19800101120000Z")))), wantErr: true, values: []string{"19800101120000Z"}},
 		{name: "constructed GeneralizedTime", der: seqDER(dobAttr(tb, dob, tlv(0x20|tagGeneralizedTime, gt("19800101120000Z")))), wantErr: true},
 		{name: "values not a SET", der: seqDER(seqDER(oidDER(tb, dob), seqDER(gt("19800101120000Z")))), wantErr: true},

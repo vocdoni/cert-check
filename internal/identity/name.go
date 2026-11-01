@@ -241,9 +241,13 @@ const maxCombiningRun = 4
 // noncharacters and any space other than U+0020. Per R5.1 it also rejects
 // the other default-ignorable code points (U+034F, the Hangul fillers),
 // variation selectors and runs of more than maxCombiningRun combining marks.
-// The errors name the rule, never the character.
+// Per R10.1 it rejects the blank symbols U+2800 and U+FFFC and a value that
+// mixes Latin letters with Cyrillic or Greek ones (the scripts whose capitals
+// have Latin homoglyphs); a value wholly in one script passes. The errors name
+// the rule, never the character.
 func checkText(s string) error {
 	run := 0
+	var latin, cyrillicGreek bool
 	for _, r := range s {
 		if unicode.Is(unicode.M, r) {
 			run++
@@ -269,11 +273,18 @@ func checkText(s string) error {
 			return errors.New("private-use character")
 		case r >= 0xfdd0 && r <= 0xfdef, r&0xfffe == 0xfffe:
 			return errors.New("noncharacter")
+		case r == 0x2800, r == 0xfffc:
+			return errors.New("blank symbol")
 		case r != ' ' && unicode.Is(unicode.Zs, r):
 			return errors.New("space other than U+0020")
 		case run > maxCombiningRun:
 			return errors.New("too many combining marks")
 		}
+		latin = latin || unicode.Is(unicode.Latin, r)
+		cyrillicGreek = cyrillicGreek || unicode.In(r, unicode.Cyrillic, unicode.Greek)
+	}
+	if latin && cyrillicGreek {
+		return errors.New("mixed scripts")
 	}
 	return nil
 }

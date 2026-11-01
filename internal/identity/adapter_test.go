@@ -493,6 +493,17 @@ func adapterCases(tb testing.TB) []adapterCase {
 			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), DateOfBirth: "19800101120000Z"}, want: ext(dnieBorn)},
 		{name: "dnie malformed birth date", adapter: shapeDNIe(),
 			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), DateOfBirth: "19800230120000Z"}, wantErr: invalid},
+		// R10.2 (U6-FABLE-2): the birth date is from 1900 on and not after NotBefore.
+		{name: "dnie birth date after the certificate validity start", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), DateOfBirth: "29990101000000Z"}, wantErr: invalid},
+		{name: "dnie birth date before 1900", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), DateOfBirth: "18991231235959Z"}, wantErr: invalid},
+		{name: "dnie birth date on the NotBefore day", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), DateOfBirth: "19800101120000Z",
+				NotBefore: time.Date(1980, time.January, 1, 0, 0, 0, 0, time.UTC)}, want: ext(dnieBorn)},
+		{name: "dnie birth date the day after NotBefore", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), DateOfBirth: "19800101120000Z",
+				NotBefore: time.Date(1979, time.December, 31, 23, 59, 59, 0, time.UTC)}, wantErr: invalid},
 		{name: "dnie SDA attribute with a trailing element", adapter: shapeDNIe(),
 			spec: testpki.CertSpec{Subject: dnieSubject(num, dnieCN), SDARaw: sdaTrailingDOB(tb, []byte{0x05, 0x00})}, wantErr: invalid},
 		{name: "dnie SDA attribute with empty values", adapter: shapeDNIe(),
@@ -590,6 +601,13 @@ func adapterCases(tb testing.TB) []adapterCase {
 			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA -, JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
 		{name: "fnmt-rsa SAN first surname long combining run", adapter: rsa,
 			spec: testpki.CertSpec{Subject: person(idces, gn, sn), SANDirNames: san(fnmtDir(num, gn, "GARCI"+strings.Repeat("\u0301", 5)+"A", sn2))}, wantErr: invalid},
+
+		// R10.1 (U6-FABLE-1): a Cyrillic homoglyph in a Latin name is
+		// rejected; a wholly Cyrillic name is not.
+		{name: "plain subject GN with a Cyrillic A", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, "PRUEB\u0410S", sn)}, wantErr: invalid},
+		{name: "plain wholly Cyrillic names", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, "\u0418\u0412\u0410\u041d", "\u041f\u0415\u0422\u0420\u041e\u0412")}, want: ext(plainIdentity(dniDoc(num, idces), "\u0418\u0412\u0410\u041d", "\u041f\u0415\u0422\u0420\u041e\u0412"))},
 	}
 	// R53: each rejected class, in a subject attribute and in a SAN
 	// dirName attribute. NBSP and the other spaces matter most here: before

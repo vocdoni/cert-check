@@ -96,7 +96,8 @@ func (d *Date) UnmarshalJSON(b []byte) error {
 
 // DateOfBirth reads SubjectDirectoryAttributes dateOfBirth. found is false
 // when the extension or the attribute is absent. The value must be exactly one
-// GeneralizedTime "YYYYMMDDHHMMSSZ"; the civil date is its first 8 digits.
+// GeneralizedTime "YYYYMMDDHHMMSSZ" from year 1900 on; the civil date is its
+// first 8 digits.
 func DateOfBirth(cert *x509.Certificate) (d Date, found bool, err error) {
 	ext, ok := findExtension(cert, oidExtSubjectDirAttrs)
 	if !ok {
@@ -132,6 +133,9 @@ func ParseDateOfBirth(der []byte) (d Date, found bool, err error) {
 		t, perr := time.Parse("20060102150405Z", string(v.Bytes))
 		if perr != nil || len(v.Bytes) != 15 {
 			return Date{}, true, invalidf("sda: dateOfBirth is not YYYYMMDDHHMMSSZ")
+		}
+		if t.Year() < 1900 {
+			return Date{}, true, invalidf("sda: dateOfBirth year out of range")
 		}
 		d, found = Date{Year: t.Year(), Month: t.Month(), Day: t.Day()}, true
 	}

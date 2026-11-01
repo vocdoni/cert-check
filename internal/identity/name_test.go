@@ -259,6 +259,21 @@ func nameFieldTextCases(tb testing.TB) []fieldCase {
 		{name: "bmp Spanish letters", der: bmp('P', 'E', 0x00d1, 'A', ' ', 0x00b7), oid: oidGN, kinds: all, want: "PEÑA ·", found: true},
 		{name: "decomposed Catalan lower case", der: utf8(decomposedCatalan), oid: oidGN, kinds: k, want: decomposedCatalan, found: true},
 
+		// R10.1 (U6-FABLE-1): Latin letters mixed with Cyrillic or Greek
+		// homoglyphs are rejected; a value wholly in one script is not.
+		{name: "Latin with Cyrillic capital A U+0410", der: utf8("PRUEB\u0410S"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "mixed scripts", values: []string{"PRUEB\u0410S"}},
+		{name: "Latin with Cyrillic small a U+0430", der: utf8("Ju\u0430n"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "mixed scripts", values: []string{"Ju\u0430n"}},
+		{name: "Latin with Greek capital alpha U+0391", der: utf8("JU\u0391N"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "mixed scripts", values: []string{"JU\u0391N"}},
+		{name: "Latin and Cyrillic in separate words", der: utf8("JUAN \u0418\u0412\u0410\u041d"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "mixed scripts"},
+		{name: "wholly Cyrillic", der: utf8("ИВАН ПЕТРОВ"), oid: oidGN, kinds: k, want: "ИВАН ПЕТРОВ", found: true},
+		{name: "wholly Greek", der: utf8("ΓΙΩΡΓΟΣ"), oid: oidGN, kinds: k, want: "ΓΙΩΡΓΟΣ", found: true},
+
+		// R10.3 (U6-FABLE-3): overlong and out-of-range UTF-8 is rejected.
+		{name: "overlong 2-byte U+0020", der: utf8("JU\xc0\xa0AN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xc0\xa0AN"}},
+		{name: "overlong 3-byte U+002F", der: utf8("JU\xe0\x80\xafAN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xe0\x80\xafAN"}},
+		{name: "overlong 4-byte U+002F", der: utf8("JU\xf0\x80\x80\xafAN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xf0\x80\x80\xafAN"}},
+		{name: "beyond U+10FFFF", der: utf8("JU\xf4\x90\x80\x80AN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xf4\x90\x80\x80AN"}},
+
 		// R5.1: a run of more than 4 combining marks is rejected; x/text
 		// itself inserts U+034F after 30 non-starters.
 		{name: "four combining marks", der: utf8(combiningRun(4)), oid: oidGN, kinds: k, want: combiningRun(4), found: true},
@@ -329,6 +344,9 @@ var invisibleChars = []struct {
 	{"Mn variation selector-16 U+FE0F", 0xfe0f, "variation selector"},
 	{"Mn Mongolian free variation selector U+180B", 0x180b, "variation selector"},
 	{"Mn variation selector-17 U+E0100", 0xe0100, "variation selector"},
+	// R10.1 (U6-FABLE-1): symbols that render as a blank.
+	{"So Braille pattern blank U+2800", 0x2800, "blank symbol"},
+	{"So object replacement character U+FFFC", 0xfffc, "blank symbol"},
 }
 
 func TestNameFieldText(t *testing.T) { runFieldCases(t, nameFieldTextCases(t)) }
