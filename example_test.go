@@ -60,11 +60,11 @@ func ExampleHandler_Auth() {
 	})
 	var getCertificate func(*tls.ClientHelloInfo) (*tls.Certificate, error) // e.g. from certmagic or autocert
 	var protocols http.Protocols
-	protocols.SetHTTP1(true) // the TLS configuration offers http/1.1 only
+	protocols.SetHTTP1(true) // HTTP/1 only, or net/http adds h2 (see TLSConfig)
 	srv := &http.Server{Addr: ":8443", Handler: mux, TLSConfig: h.TLSConfig(getCertificate), Protocols: &protocols}
 	// log.Fatal(srv.ListenAndServeTLS("", ""))
-	fmt.Println(srv.TLSConfig.ClientAuth, srv.TLSConfig.MaxVersion == tls.VersionTLS12)
-	// Output: RequestClientCert true
+	fmt.Println(srv.TLSConfig.ClientAuth, srv.TLSConfig.MaxVersion == tls.VersionTLS12, srv.Protocols.HTTP2())
+	// Output: RequestClientCert true false
 }
 
 // A Result carries the provider, the profile and the holder's identity.

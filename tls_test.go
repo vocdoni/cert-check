@@ -233,6 +233,65 @@ func TestAuthSharedOutcome(t *testing.T) {
 	}
 }
 
+// TestTLSConfigALPN: TLSConfig offers http/1.1 only, but net/http adds h2
+// unless http.Server.Protocols allows HTTP/1 only (the TLSConfig doc and the
+// Handler.Auth example say so). If a Go release stops adding h2, the first
+// case fails and the doc can be relaxed.
+func TestTLSConfigALPN(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	serverCert, pool := testpki.ServerTLS(t, alphaHost)
+	var http1 http.Protocols
+	http1.SetHTTP1(true)
+	for _, tc := range []struct {
+		name      string
+		protocols *http.Protocols
+		h2        string // protocol an h2-only client negotiates; "" = the handshake fails
+	}{
+		{"Protocols unset", nil, "h2"},
+		{"Protocols HTTP/1 only", &http1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := &http.Server{Handler: http.NotFoundHandler(), Protocols: tc.protocols,
+				ErrorLog:  slog.NewLogLogger(slog.DiscardHandler, slog.LevelError),
+				TLSConfig: w.h.TLSConfig(func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &serverCert, nil })}
+			done := make(chan error, 1)
+			go func() { done <- srv.ServeTLS(ln, "", "") }()
+			t.Cleanup(func() {
+				if err := srv.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+				if err := <-done; !errors.Is(err, http.ErrServerClosed) {
+					t.Errorf("ServeTLS = %v, want %v", err, http.ErrServerClosed)
+				}
+			})
+			dial := func(protos ...string) (string, error) {
+				d := tls.Dialer{Config: &tls.Config{RootCAs: pool, ServerName: alphaHost, NextProtos: protos}}
+				conn, err := d.DialContext(t.Context(), "tcp", ln.Addr().String())
+				if err != nil {
+					return "", err
+				}
+				defer conn.Close()
+				return conn.(*tls.Conn).ConnectionState().NegotiatedProtocol, nil
+			}
+			if got, err := dial("http/1.1"); err != nil || got != "http/1.1" {
+				t.Errorf("http/1.1 client: (%q, %v), want http/1.1", got, err)
+			}
+			got, err := dial("h2")
+			switch {
+			case tc.h2 == "" && err == nil:
+				t.Errorf("h2-only client negotiated %q, want a handshake failure", got)
+			case tc.h2 != "" && (err != nil || got != tc.h2):
+				t.Errorf("h2-only client: (%q, %v), want %q", got, err, tc.h2)
+			}
+		})
+	}
+}
+
 func TestAuthenticateWithoutTLS(t *testing.T) {
 	w := newHWorld(t)
 	res, err := w.h.AuthAs(httptest.NewRequest(http.MethodGet, "http://"+alphaHost+"/v1/authenticate", nil), "alpha")

@@ -38,8 +38,10 @@ func WithTLS13() TLSOption { return func(s *tlsSettings) { s.tls13 = true } }
 // authenticates with h: TLS 1.2 (see WithTLS13), ECDHE AEAD suites, curves
 // X25519, P-256 and P-384, a client certificate requested but not required
 // with h's CAs advertised, session tickets disabled (every connection
-// presents its certificate again) and ALPN http/1.1 only. getCert supplies
-// the server certificate; it may be nil when the caller sets Certificates.
+// presents its certificate again) and ALPN http/1.1 only. An http.Server adds
+// h2 to NextProtos unless its Protocols allow HTTP/1 only: set them, as the
+// Handler.Auth example does. getCert supplies the server certificate; it may
+// be nil when the caller sets Certificates.
 func (h *Handler) TLSConfig(getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), options ...TLSOption) *tls.Config {
 	var s tlsSettings
 	for _, o := range options {
