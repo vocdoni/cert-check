@@ -13,52 +13,81 @@ concurrency:
 jobs:
   ci:
     runs-on: [self-hosted, ci]
-    timeout-minutes: 30
+    timeout-minutes: 40
     # No CGO_ENABLED=0 at job level: the race detector needs cgo. The pure-Go
     # build is checked by its own step and by the Dockerfile.
     env:
       GOFLAGS: -mod=readonly
+      # The library is the root module; the testing UI is the nested module
+      # testui/ (it requires the root through `replace => ../`).
+      MODULES: ". testui"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.27.x"
           cache: true
+          cache-dependency-path: |
+            go.sum
+            testui/go.sum
       - name: gofmt
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
       - name: go mod tidy
-        run: go mod tidy -diff
+        run: for m in $MODULES; do (cd "$m" && go mod tidy -diff); done
       - name: vet
-        run: go vet ./... && go vet -tags live ./...
+        run: for m in $MODULES; do (cd "$m" && go vet ./... && go vet -tags live ./...); done
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...
+        run: for m in $MODULES; do (cd "$m" && go run honnef.co/go/tools/cmd/staticcheck@v0.8.2 ./...); done
       - name: build (pure Go, no cgo)
-        run: CGO_ENABLED=0 go build -trimpath ./...
+        run: for m in $MODULES; do (cd "$m" && CGO_ENABLED=0 go build -trimpath ./...); done
       - name: test
         run: |
-          go test -race -count=1 -json ./... > test.json || (grep -E '"Action":"fail"' test.json | head -50; exit 1)
-          skipped="$(grep '"Action":"skip"' test.json | grep -c '"Test":' || true)"
-          test "$skipped" = "0"
+          for m in $MODULES; do
+            if ! (cd "$m" && go test -race -count=1 -json ./... > test.json); then
+              grep -E '"Action":"fail"' "$m/test.json" | head -50
+              exit 1
+            fi
+            skipped="$(grep '"Action":"skip"' "$m/test.json" | grep -c '"Test":' || true)"
+            if [ "$skipped" != "0" ]; then
+              echo "$m: $skipped skipped tests"
+              exit 1
+            fi
+          done
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+        run: for m in $MODULES; do (cd "$m" && go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...); done
       - name: fuzz smoke (30 s per target)
         run: |
           for t in FuzzParseName FuzzParseSANDirectoryNames FuzzParseDateOfBirth FuzzParseDocument FuzzDateUnmarshalJSON; do
-            go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./certauth/identity || exit 1
+            go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/identity
           done
           for t in FuzzParseResponse FuzzParseIDP FuzzParseCDP; do
-            go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./certauth/revocation || exit 1
+            go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/revocation
           done
-          go test -run '^$' -fuzz '^FuzzParseQCStatements$' -fuzztime 30s ./certauth || exit 1
-      - name: AC12 certauth has no app dependencies
+          go test -run '^$' -fuzz '^FuzzParseQCStatements$' -fuzztime 30s ./internal/engine
+      - name: public API (AC4 go doc golden)
+        run: go doc -all . | diff -u testdata/godoc.golden -
+      - name: test names (AC6 golden)
         run: |
-          if go list -deps ./certauth/... | grep -E 'github.com/vocdoni/cert-check/(internal|web)'; then exit 1; fi
-          if go list -f '{{.ImportPath}}: {{join .Imports " "}}' ./... | grep -v '^github.com/vocdoni/cert-check/internal/testpki' | grep 'internal/testpki'; then exit 1; fi
+          export LC_ALL=C
+          list() { (cd "$1" && go test -list '.*' -tags live ./... | grep -E '^(Test|Fuzz|Example|Benchmark)'); }
+          missing="$(comm -23 <(cut -d' ' -f2 testdata/golden/test-names.txt | sort) <(for m in $MODULES; do list "$m"; done | sort))"
+          if [ -n "$missing" ]; then
+            echo "tests of testdata/golden/test-names.txt missing from both modules:"
+            echo "$missing"
+            exit 1
+          fi
+      - name: dependency isolation (AC3) and import graph
+        run: |
+          if go list -deps ./... | grep -E 'certmagic|libdns|go\.uber\.org/zap|golang\.org/x/time'; then exit 1; fi
+          if go list -deps ./internal/identity ./internal/revocation ./internal/profiles ./internal/opts | grep -x 'github.com/vocdoni/cert-check'; then exit 1; fi
+          for m in $MODULES; do
+            if (cd "$m" && go list -f '{{.ImportPath}}: {{join .Imports " "}}' ./...) | grep -v '^github.com/vocdoni/cert-check/internal/testpki' | grep 'internal/testpki'; then exit 1; fi
+          done
       - name: docker build
         run: |
           if ! command -v docker >/dev/null 2>&1; then
             echo "::warning title=docker build skipped::docker is not installed on this runner, so the image build was not checked"
             exit 0
           fi
-          docker build --pull -t cert-check:ci .
+          docker build --pull -f testui/Dockerfile -t cert-check:ci .
           docker image rm cert-check:ci

@@ -3,6 +3,5 @@
 .claude
 docs
 **/*_test.go
-web/internal
-web/testdata
 **/testdata
+testui/web/internal
