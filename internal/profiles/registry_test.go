@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -164,9 +165,12 @@ func TestRegistryErrors(t *testing.T) {
 	// rootA2 re-certifies rootA's key under another serial and validity.
 	rootA2 := testpki.NewRoot(t, "root A", testpki.CertSpec{Now: now, KeyPair: rootA.Key})
 	interB := rootB.Intermediate(t, "inter B", testpki.CertSpec{Now: now})
+	// crossA is a cross-certificate: rootA's subject and key, issued by rootB.
+	crossA := rootB.Intermediate(t, "root A", testpki.CertSpec{Now: now, KeyPair: rootA.Key})
 	leaf := rootA.Leaf(t, testpki.CertSpec{Now: now, Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, "leaf")}})
 
 	a, b, a2 := profiles.TestAnchor(rootA.Cert), profiles.TestAnchor(rootB.Cert), profiles.TestAnchor(rootA2.Cert)
+	iB, xA := profiles.TestAnchor(interB.Cert), profiles.TestAnchor(crossA.Cert)
 	one := func(mut func(*profiles.Profile)) func() profiles.Config {
 		return func() profiles.Config {
 			p := regTProfile("p1", "prov", a)
@@ -180,6 +184,10 @@ func TestRegistryErrors(t *testing.T) {
 		}
 	}
 	withOID := func(p profiles.Profile, oids ...string) profiles.Profile { p.PolicyOIDs = oids; return p }
+	withInter := func(p profiles.Profile, in ...profiles.Anchor) profiles.Profile { p.Intermediates = in; return p }
+	marker := func(m profiles.TestMarker) func() profiles.Config {
+		return one(func(p *profiles.Profile) { p.TestMarkers = []profiles.TestMarker{m} })
+	}
 	files := fstest.MapFS{
 		"anchors/a.pem":     {Data: testpki.PEM(rootA.Cert)},
 		"anchors/two.pem":   {Data: append(testpki.PEM(rootA.Cert), testpki.PEM(rootB.Cert)...)},
@@ -253,6 +261,16 @@ func TestRegistryErrors(t *testing.T) {
 		}), wantErr: "exactly one of SHA256 or Subject"},
 		{name: "marker with neither", cfg: one(func(p *profiles.Profile) { p.TestMarkers = []profiles.TestMarker{{Source: "x"}} }), wantErr: "exactly one of SHA256 or Subject"},
 		{name: "marker with malformed SHA256", cfg: one(func(p *profiles.Profile) { p.TestMarkers = []profiles.TestMarker{{SHA256: "abc"}} }), wantErr: "exactly one of SHA256 or Subject"},
+		{name: "valid markers", cfg: one(func(p *profiles.Profile) {
+			p.TestMarkers = []profiles.TestMarker{{SHA256: a.SHA256, Source: "x"},
+				{Subject: []profiles.AttributeMatch{{OID: identity.OIDGivenName, Value: "NOMDOS"}}, Source: "x"}}
+		})},
+		{name: "subject marker with an empty attribute list", cfg: marker(profiles.TestMarker{Subject: []profiles.AttributeMatch{}, Source: "x"}), wantErr: "exactly one of SHA256 or Subject"},
+		{name: "subject marker with a nil OID", cfg: marker(profiles.TestMarker{Subject: []profiles.AttributeMatch{{Value: "NOMDOS"}}, Source: "x"}), wantErr: "test marker attribute needs an OID and a value"},
+		{name: "subject marker with a one-arc OID", cfg: marker(profiles.TestMarker{Subject: []profiles.AttributeMatch{{OID: []int{2}, Value: "NOMDOS"}}, Source: "x"}), wantErr: "test marker attribute needs an OID and a value"},
+		{name: "subject marker with a blank value", cfg: marker(profiles.TestMarker{Subject: []profiles.AttributeMatch{
+			{OID: identity.OIDGivenName, Value: "NOMDOS"}, {OID: identity.OIDSurname, Value: " \t"}}, Source: "x"}), wantErr: "test marker attribute needs an OID and a value"},
+		{name: "marker without Source", cfg: marker(profiles.TestMarker{SHA256: a.SHA256}), wantErr: "test marker without Source"},
 		{name: "intermediate not signed by an anchor", cfg: one(func(p *profiles.Profile) { p.Intermediates = []profiles.Anchor{profiles.TestAnchor(interB.Cert)} }), wantErr: "is not signed by a profile anchor"},
 		{name: "intermediate pin mismatch", cfg: one(func(p *profiles.Profile) {
 			in := profiles.TestAnchor(interB.Cert)
@@ -262,6 +280,9 @@ func TestRegistryErrors(t *testing.T) {
 		{name: "two profiles sharing an anchor and an OID", cfg: two(regTProfile("p1", "prov", a), regTProfile("p2", "prov", a)), wantErr: "share an anchor and policy 1.2.3.4"},
 		{name: "two profiles sharing an anchor key and an OID", cfg: two(regTProfile("p1", "prov", a), regTProfile("p2", "prov", b, a2)), wantErr: "share an anchor and policy 1.2.3.4"},
 		{name: "one shared OID among several", cfg: two(withOID(regTProfile("p1", "prov", a), "1.2.3.4", "1.2.3.9"), withOID(regTProfile("p2", "prov", a), "1.2.3.5", "1.2.3.9")), wantErr: "share an anchor and policy 1.2.3.9"},
+		{name: "key pinned as an intermediate and as an anchor, shared OID", cfg: two(withInter(regTProfile("p1", "prov", b), iB), regTProfile("p2", "prov", iB)), wantErr: "share an anchor and policy 1.2.3.4"},
+		{name: "cross-signed pinned intermediate, shared OID", cfg: two(regTProfile("p1", "prov", a), withInter(regTProfile("p2", "prov", b), xA)), wantErr: "share an anchor and policy 1.2.3.4"},
+		{name: "cross-signed pinned intermediate, distinct OIDs", cfg: two(regTProfile("p1", "prov", a), withOID(withInter(regTProfile("p2", "prov", b), xA), "1.2.3.5"))},
 		{name: "same anchor with distinct OIDs", cfg: two(regTProfile("p1", "prov", a), withOID(regTProfile("p2", "prov", a), "1.2.3.5"))},
 		{name: "distinct anchors with the same OID", cfg: two(regTProfile("p1", "prov", a), regTProfile("p2", "prov", b))},
 		{name: "same anchor and OID in different providers", cfg: func() profiles.Config {
@@ -305,6 +326,7 @@ func TestValidityDisables(t *testing.T) {
 	early := testpki.NewRoot(t, "future root", future)
 	deadInter := live.Intermediate(t, "expired inter", expired)
 	liveInter := live.Intermediate(t, "live inter", valid)
+	orphanInter := dead.Intermediate(t, "inter under expired root", valid)
 	anc := profiles.TestAnchor
 
 	tests := []struct {
@@ -326,6 +348,11 @@ func TestValidityDisables(t *testing.T) {
 			wantLog: []string{"intermediate outside validity", "profile disabled: no valid pinned intermediate", "provider hidden"}},
 		{name: "one of two intermediates expired", anchors: []*testpki.CA{live}, intermediates: []*testpki.CA{deadInter, liveInter},
 			wantEnabled: true, wantAnchors: []*testpki.CA{live}, wantInter: []*testpki.CA{liveInter}, wantLog: []string{"intermediate outside validity"}},
+		{name: "intermediate under an expired anchor, second anchor valid", anchors: []*testpki.CA{dead, live}, intermediates: []*testpki.CA{orphanInter, liveInter},
+			wantEnabled: true, wantAnchors: []*testpki.CA{live}, wantInter: []*testpki.CA{liveInter},
+			wantLog: []string{"anchor outside validity", "intermediate signer outside validity"}},
+		{name: "only intermediate under an expired anchor", anchors: []*testpki.CA{dead, live}, intermediates: []*testpki.CA{orphanInter},
+			wantLog: []string{"intermediate signer outside validity", "profile disabled: no valid pinned intermediate", "provider hidden"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -374,6 +401,40 @@ func TestValidityDisables(t *testing.T) {
 			}
 			if !e[0].Inter.Equal(regTPool(wantI...)) || len(e[0].Intermediates) != len(wantI) {
 				t.Errorf("Inter: got %d intermediates, want exactly the %d valid ones", len(e[0].Intermediates), len(wantI))
+			}
+		})
+	}
+}
+
+// TestCheckAmbiguityAcrossProviders: the Handler's cross-provider check also
+// compares pinned intermediates (each provider loads on its own).
+func TestCheckAmbiguityAcrossProviders(t *testing.T) {
+	now := time.Now()
+	rootA := testpki.NewRoot(t, "root A", testpki.CertSpec{Now: now})
+	rootB := testpki.NewRoot(t, "root B", testpki.CertSpec{Now: now})
+	crossA := rootB.Intermediate(t, "root A", testpki.CertSpec{Now: now, KeyPair: rootA.Key})
+	viaCross := regTProfile("p2", "other", profiles.TestAnchor(rootB.Cert))
+	viaCross.Intermediates = []profiles.Anchor{profiles.TestAnchor(crossA.Cert)}
+	for _, tc := range []struct {
+		name    string
+		oid     string
+		wantErr string // "" = no ambiguity
+	}{
+		{"shared OID", "1.2.3.4", "p1 and p2 share an anchor and policy 1.2.3.4"},
+		{"distinct OIDs", "1.2.3.5", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p2 := viaCross
+			p2.PolicyOIDs = []string{tc.oid}
+			logger, _ := regTLogger()
+			r, err := profiles.New(profiles.Config{Now: now, Logger: logger, Providers: []profiles.Provider{
+				regTProvider("prov", regTProfile("p1", "prov", profiles.TestAnchor(rootA.Cert))), regTProvider("other", p2)}})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			err = profiles.CheckAmbiguity(slices.Concat(r.Enabled("prov"), r.Enabled("other")))
+			if (tc.wantErr == "") != (err == nil) || !strings.Contains(fmt.Sprint(err), tc.wantErr) {
+				t.Errorf("CheckAmbiguity = %v, want %q", err, tc.wantErr)
 			}
 		})
 	}
