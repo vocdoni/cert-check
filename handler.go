@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/vocdoni/cert-check/internal/opts"
@@ -42,8 +43,9 @@ type pinnedProfiles interface {
 // profile is valid at construction) and no ambiguity: no CA subject may be
 // advertised by two providers, and no two profiles of different providers may
 // share an anchor key and a policy OID. Acceptance therefore never depends on
-// the order of providers. NewHandler uses WithClock and WithVersion; other
-// options are ignored.
+// the order of providers. A nil entry is an error; a typed nil (a nil pointer
+// stored in a non-nil Provider) is a programmer error and may panic.
+// NewHandler uses WithClock and WithVersion; other options are ignored.
 func NewHandler(providers []Provider, options ...Option) (*Handler, error) {
 	if len(providers) == 0 {
 		return nil, errors.New("certcheck: NewHandler needs at least one provider")
@@ -96,7 +98,8 @@ func NewHandler(providers []Provider, options ...Option) (*Handler, error) {
 		h.providers = append(h.providers, p)
 	}
 	if err := profiles.CheckAmbiguity(enabled); err != nil {
-		return nil, fmt.Errorf("certcheck: %w", err)
+		// CheckAmbiguity's message carries its own package prefix.
+		return nil, errors.New("certcheck: " + strings.TrimPrefix(err.Error(), "profiles: "))
 	}
 	return h, nil
 }
@@ -137,9 +140,10 @@ func (h *Handler) Providers() []Provider { return slices.Clone(h.providers) }
 // Verify selects the provider whose CAs include the issuer of chain[0] (by
 // exact subject bytes, as crypto/x509 finds parents) and returns its Verify
 // verbatim. A chain without a leaf is no_certificate; a leaf whose issuer no
-// provider advertises is untrusted_issuer at step path. A provider that
-// returns neither a Result nor an error gives an internal error. The error is
-// always *Error.
+// provider advertises is untrusted_issuer at step path. A provider error that
+// wraps an *Error is returned as that *Error; any other provider error, or a
+// provider that returns neither a Result nor an error, gives an internal
+// error. The error is always *Error.
 func (h *Handler) Verify(ctx context.Context, chain []*x509.Certificate) (*Result, error) {
 	if len(chain) == 0 || chain[0] == nil {
 		return nil, h.fail(chain, "", StepBounds, CodeNoCertificate, "no client certificate")
@@ -157,9 +161,8 @@ func (h *Handler) Verify(ctx context.Context, chain []*x509.Certificate) (*Resul
 // bounds. When the provider answers untrusted_issuer at step path and the
 // leaf chains to the pinned CAs of the handler's providers, the code becomes
 // provider_mismatch: the user picked the wrong certificate type. That check
-// builds a path only; it never accepts and makes no network request. A
-// provider that returns neither a Result nor an error gives an internal error.
-// The error is always *Error.
+// builds a path only; it never accepts and makes no network request.
+// Provider errors are handled as in Verify. The error is always *Error.
 func (h *Handler) VerifyAs(ctx context.Context, providerID string, chain []*x509.Certificate) (*Result, error) {
 	p, ok := h.byID[providerID]
 	if !ok {
@@ -175,14 +178,21 @@ func (h *Handler) VerifyAs(ctx context.Context, providerID string, chain []*x509
 	return res, err
 }
 
-// verify returns p.Verify(ctx, chain), except that a provider breaking its
-// contract by returning neither a Result nor an error gives an internal error.
+// verify returns p.Verify(ctx, chain) as (Result, nil) or (nil, *Error). A
+// provider breaking its contract (an error that holds no *Error, or neither a
+// Result nor an error) gives an internal error.
 func (h *Handler) verify(ctx context.Context, p Provider, chain []*x509.Certificate) (*Result, error) {
 	res, err := p.Verify(ctx, chain)
-	if res == nil && err == nil {
+	switch {
+	case err != nil:
+		if e, ok := errors.AsType[*Error](err); ok {
+			return nil, e
+		}
+		return nil, h.fail(chain, p.Info().ID, "", CodeInternal, "provider returned an error that is not *certcheck.Error")
+	case res == nil:
 		return nil, h.fail(chain, p.Info().ID, "", CodeInternal, "provider returned no result")
 	}
-	return res, err
+	return res, nil
 }
 
 // chainsToPinnedCA is the former engine's unknownAuthorityCode: it reports
