@@ -590,6 +590,13 @@ func adapterCases(tb testing.TB) []adapterCase {
 			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA -, JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
 		{name: "fnmt-rsa SAN first surname long combining run", adapter: rsa,
 			spec: testpki.CertSpec{Subject: person(idces, gn, sn), SANDirNames: san(fnmtDir(num, gn, "GARCI"+strings.Repeat("\u0301", 5)+"A", sn2))}, wantErr: invalid},
+
+		// R10.1 (U6-FABLE-1): a Cyrillic homoglyph in a Latin name is
+		// rejected; a wholly Cyrillic name is not.
+		{name: "plain subject GN with a Cyrillic A", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, "PRUEB\u0410S", sn)}, wantErr: invalid},
+		{name: "plain wholly Cyrillic names", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, "\u0418\u0412\u0410\u041d", "\u041f\u0415\u0422\u0420\u041e\u0412")}, want: ext(plainIdentity(dniDoc(num, idces), "\u0418\u0412\u0410\u041d", "\u041f\u0415\u0422\u0420\u041e\u0412"))},
 	}
 	// R53: each rejected class, in a subject attribute and in a SAN
 	// dirName attribute. NBSP and the other spaces matter most here: before
