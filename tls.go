@@ -38,12 +38,16 @@ func WithTLS13() TLSOption { return func(s *tlsSettings) { s.tls13 = true } }
 // authenticates with h: TLS 1.2 (see WithTLS13), ECDHE AEAD suites, curves
 // X25519, P-256 and P-384, a client certificate requested but not required
 // with h's CAs advertised, session tickets disabled (every connection
-// presents its certificate again) and ALPN http/1.1 only. getCert supplies
-// the server certificate; it may be nil when the caller sets Certificates.
+// presents its certificate again) and ALPN http/1.1 only. An http.Server adds
+// h2 to NextProtos unless its Protocols allow HTTP/1 only: set them, as the
+// Handler.Auth example does. getCert supplies the server certificate; it may
+// be nil when the caller sets Certificates.
 func (h *Handler) TLSConfig(getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), options ...TLSOption) *tls.Config {
 	var s tlsSettings
 	for _, o := range options {
-		o(&s)
+		if o != nil {
+			o(&s)
+		}
 	}
 	maxVersion := uint16(tls.VersionTLS12)
 	if s.tls13 {
@@ -87,18 +91,22 @@ func errNoTLS() *Error {
 	return &Error{Code: CodeInternal, Retryable: true, Detail: "request without TLS state"}
 }
 
-// withTLSInfo adds the handshake details to the outcome of Verify or
-// VerifyAs, which is either a Result or an *Error, never neither.
+// withTLSInfo adds the handshake details to a shallow copy of the outcome of
+// Verify or VerifyAs, which is either a Result or an *Error, never neither.
+// The outcome may be a provider's shared value: it is never modified.
 func withTLSInfo(cs *tls.ConnectionState, res *Result, err error) (*Result, error) {
 	info := DescribeTLS(cs)
 	if err != nil {
-		if e, ok := errors.AsType[*Error](err); ok {
-			e.Diagnostics.TLS = info
+		if e, ok := errors.AsType[*Error](err); ok && e != nil {
+			cp := *e
+			cp.Diagnostics.TLS = info
+			return nil, &cp
 		}
 		return nil, err
 	}
-	res.Diagnostics.TLS = info
-	return res, nil
+	cp := *res
+	cp.Diagnostics.TLS = info
+	return &cp, nil
 }
 
 // CheckHost returns ErrMisdirected when r.Host (port stripped, compared

@@ -115,6 +115,9 @@ func DescribeTLS(cs *tls.ConnectionState) *TLSInfo {
 
 // DescribeCertificate describes a received leaf for Diagnostics.Certificate.
 func DescribeCertificate(c *x509.Certificate) *CertificateDetails {
+	if c == nil {
+		return nil
+	}
 	sum := sha256.Sum256(c.Raw)
 	d := &CertificateDetails{
 		Subject: c.Subject.String(), Issuer: c.Issuer.String(), SerialHex: fmt.Sprintf("%x", c.SerialNumber),
@@ -148,9 +151,13 @@ func DescribeCertificate(c *x509.Certificate) *CertificateDetails {
 func keyAlgorithm(c *x509.Certificate) string {
 	switch k := c.PublicKey.(type) {
 	case *rsa.PublicKey:
-		return fmt.Sprintf("RSA-%d", k.N.BitLen())
+		if k != nil && k.N != nil {
+			return fmt.Sprintf("RSA-%d", k.N.BitLen())
+		}
 	case *ecdsa.PublicKey:
-		return "ECDSA-" + k.Curve.Params().Name
+		if k != nil && k.Curve != nil {
+			return "ECDSA-" + k.Curve.Params().Name
+		}
 	}
 	return c.PublicKeyAlgorithm.String()
 }
@@ -172,9 +179,10 @@ func extKeyUsageName(e x509.ExtKeyUsage) string {
 }
 
 // LogAttrs returns the non-PII fields allowed in logs: id, code, step,
-// provider, candidates (x509 error class only), issuer DN,
-// policy OIDs, revocation host/status/duration, TLS version/cipher. Never
-// subject, names, document, serial, leaf hash, URL paths or technicalDetail.
+// provider, candidates (x509 error class only), policy OIDs, revocation
+// host/status/duration, TLS version/cipher. Never subject, issuer or any
+// other DN the client presented, names, document, serial, leaf hash, URL
+// paths or technicalDetail.
 func (d Diagnostics) LogAttrs() []slog.Attr {
 	attrs := []slog.Attr{
 		slog.String("diagnosticId", d.DiagnosticID),
@@ -188,7 +196,7 @@ func (d Diagnostics) LogAttrs() []slog.Attr {
 	}
 	attrs = append(attrs, slog.Any("candidates", cands))
 	if d.Certificate != nil {
-		attrs = append(attrs, slog.String("issuer", d.Certificate.Issuer), slog.Any("policies", d.Certificate.PolicyOIDs))
+		attrs = append(attrs, slog.Any("policies", d.Certificate.PolicyOIDs))
 	}
 	var revs []string
 	for _, a := range d.RevocationAttempts {

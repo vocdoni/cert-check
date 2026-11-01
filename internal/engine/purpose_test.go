@@ -41,6 +41,9 @@ func TestPurposeRules(t *testing.T) {
 		{"anyEKU plus clientAuth (FNMT 2016 kit)", leaf(ekus(x509.ExtKeyUsageAny, x509.ExtKeyUsageClientAuth)), requireCA, true, ""},
 		{"clientAuth and emailProtection", leaf(ekus(x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageEmailProtection)), requireCA, true, ""},
 		{"CA:TRUE leaf", caLeaf, requireCA, false, "leaf is a CA certificate"},
+		// An OCSP signer could answer for its own status (U3-FABLE-1).
+		{"clientAuth and OCSPSigning", leaf(ekus(x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageOCSPSigning)), requireCA, false, "ExtendedKeyUsage lists OCSPSigning"},
+		{"clientAuth and OCSPSigning with AllowAbsent", leaf(ekus(x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageOCSPSigning)), allowAbsent, false, "ExtendedKeyUsage lists OCSPSigning"},
 		{"EKU rule unset", leaf(nil), profiles.Profile{}, false, "profile EKU rule unset"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -51,11 +54,22 @@ func TestPurposeRules(t *testing.T) {
 		})
 	}
 
-	t.Run("CA:TRUE leaf through the pipeline", func(t *testing.T) {
-		res, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{caLeaf})
-		e := tErr(t, err)
-		if res != nil || e.Code != CodeUnsupportedPurpose || e.Diagnostics.FailedStep != StepPurpose {
-			t.Errorf("got (%s at %s), want (%s at %s)", e.Code, e.Diagnostics.FailedStep, CodeUnsupportedPurpose, StepPurpose)
-		}
-	})
+	for _, tc := range []struct {
+		name string
+		leaf *x509.Certificate
+	}{
+		{"CA:TRUE leaf", caLeaf},
+		{"OCSPSigning leaf", leaf(ekus(x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageOCSPSigning))},
+	} {
+		t.Run(tc.name+" through the pipeline", func(t *testing.T) {
+			res, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{tc.leaf})
+			e := tErr(t, err)
+			if res != nil || e.Code != CodeUnsupportedPurpose || e.Diagnostics.FailedStep != StepPurpose {
+				t.Errorf("got (%s at %s), want (%s at %s)", e.Code, e.Diagnostics.FailedStep, CodeUnsupportedPurpose, StepPurpose)
+			}
+			if n := len(e.Diagnostics.RevocationAttempts); n != 0 {
+				t.Errorf("%d revocation attempts, want none", n)
+			}
+		})
+	}
 }
