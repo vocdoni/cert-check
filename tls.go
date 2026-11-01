@@ -43,7 +43,9 @@ func WithTLS13() TLSOption { return func(s *tlsSettings) { s.tls13 = true } }
 func (h *Handler) TLSConfig(getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), options ...TLSOption) *tls.Config {
 	var s tlsSettings
 	for _, o := range options {
-		o(&s)
+		if o != nil {
+			o(&s)
+		}
 	}
 	maxVersion := uint16(tls.VersionTLS12)
 	if s.tls13 {

@@ -129,6 +129,8 @@ func TestTLSConfig(t *testing.T) {
 	}{
 		{"default TLS 1.2", nil, tls.VersionTLS12},
 		{"WithTLS13", []certcheck.TLSOption{certcheck.WithTLS13()}, tls.VersionTLS13},
+		{"nil option skipped", []certcheck.TLSOption{nil}, tls.VersionTLS12},
+		{"nil option and WithTLS13", []certcheck.TLSOption{nil, certcheck.WithTLS13(), nil}, tls.VersionTLS13},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := w.h.TLSConfig(getCert, tc.opts...)
