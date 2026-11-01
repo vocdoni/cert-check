@@ -32,6 +32,10 @@ const readyPoll = 500 * time.Millisecond
 // shutdownTimeout bounds the graceful shutdown of both listeners.
 const shutdownTimeout = 15 * time.Second
 
+// MainMaxConns caps the main listener's open connections; beyond it a
+// connection is closed before anything is read.
+const MainMaxConns = 1024
+
 // Deps are the App's collaborators.
 type Deps struct {
 	Config    config.Config
@@ -55,6 +59,7 @@ type App struct {
 	store         *Store
 	createLimiter *ipLimiter
 	redeemLimiter *ipLimiter
+	mainConns     int // MainMaxConns; tests shorten it
 	mainUp        atomic.Bool
 	authUp        atomic.Bool
 	authTLS       *tls.Config
@@ -76,7 +81,8 @@ func New(d Deps) (*App, error) {
 	}
 	a := &App{cfg: d.Config, providers: handler.Providers(), providerIDs: map[string]bool{}, certs: d.Certs, log: d.Logger, version: d.Version, now: now,
 		publicOrigin: d.Config.PublicURL.Scheme + "://" + d.Config.PublicURL.Host,
-		store:        NewStore(TxCapacity, now), createLimiter: newIPLimiter(createPerMinute), redeemLimiter: newIPLimiter(redeemPerMinute)}
+		store:        NewStore(TxCapacity, now), createLimiter: newIPLimiter(createPerMinute), redeemLimiter: newIPLimiter(redeemPerMinute),
+		mainConns: MainMaxConns}
 	for _, p := range a.providers {
 		a.providerIDs[p.Info().ID] = true
 	}
@@ -128,9 +134,10 @@ func newMainServer(h http.Handler, log *slog.Logger) *http.Server {
 }
 
 // Run serves both listeners until ctx ends, then shuts down gracefully.
-// mainLn is plain TCP (the platform edge terminates TLS); authLn is wrapped
-// with the 512-connection cap and TLS here, and served once the certificate
-// is ready. Both listeners are closed when Run returns.
+// mainLn is plain TCP (the platform edge terminates TLS), wrapped with the
+// MainMaxConns cap; authLn is wrapped with the 512-connection cap and TLS
+// here, and served once the certificate is ready. Both listeners are closed
+// when Run returns.
 func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 	mainSrv := newMainServer(a.MainHandler(), a.log)
 	authSrv := newAuthServer(a.auth, a.log)
@@ -141,7 +148,7 @@ func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 	wg.Go(func() { a.store.RunJanitor(ctx, JanitorInterval) })
 	wg.Go(func() {
 		a.mainUp.Store(true)
-		if err := mainSrv.Serve(mainLn); !errors.Is(err, http.ErrServerClosed) {
+		if err := mainSrv.Serve(newLimitListener(mainLn, a.mainConns)); !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
 	})

@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -96,6 +99,68 @@ func TestRunAuthWaitsForCert(t *testing.T) {
 	w.certs.ready.Store(true)
 	if err := handshake(t, 5*time.Second); err != nil {
 		t.Fatalf("handshake after the certificate is ready: %v", err)
+	}
+}
+
+// TestRunMainConnectionCap: the main listener holds at most mainConns
+// connections; one more is closed before anything is read (U12-ASTRA-1).
+func TestRunMainConnectionCap(t *testing.T) {
+	w := newSrvWorld(t, srvOptions{})
+	if w.app.mainConns != MainMaxConns {
+		t.Fatalf("mainConns = %d, want MainMaxConns (%d)", w.app.mainConns, MainMaxConns)
+	}
+	const capacity = 2
+	w.app.mainConns = capacity
+	run := w.start(t)
+	dial := func(t *testing.T) net.Conn {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", run.mainAddr, time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() }) // test teardown; a second Close is harmless
+		if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatalf("SetDeadline: %v", err)
+		}
+		return c
+	}
+	// healthz sends one keep-alive request on c and returns the status.
+	healthz := func(c net.Conn) (int, error) {
+		if _, err := io.WriteString(c, "GET /healthz HTTP/1.1\r\nHost: check.test\r\n\r\n"); err != nil {
+			return 0, err
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil {
+			return 0, err
+		}
+		_ = resp.Body.Close() // empty body
+		return resp.StatusCode, nil
+	}
+
+	held := make([]net.Conn, capacity)
+	for i := range held {
+		held[i] = dial(t)
+		if st, err := healthz(held[i]); err != nil || st != http.StatusOK {
+			t.Fatalf("connection %d: /healthz = (%d, %v), want 200", i+1, st, err)
+		}
+	}
+	extra := dial(t)
+	if n, err := extra.Read(make([]byte, 1)); n != 0 || err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("connection %d: Read = (%d, %v), want (0, EOF or reset) before any byte", capacity+1, n, err)
+	}
+
+	// A released slot serves a new connection (the server notices the close asynchronously).
+	_ = held[0].Close() // frees a slot
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, err := healthz(dial(t))
+		if err == nil && st == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no connection served within 5s of freeing a slot (last: %d, %v)", st, err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

@@ -130,7 +130,8 @@ func (a *authHandler) logOutcome(o Outcome) {
 	a.log.LogAttrs(context.Background(), slog.LevelInfo, "authentication succeeded", attrs...)
 }
 
-// limitListener closes connections beyond its capacity before the TLS handshake.
+// limitListener closes connections beyond its capacity before anything is
+// read (on the auth listener, before the TLS handshake).
 type limitListener struct {
 	net.Listener
 	sem chan struct{}
