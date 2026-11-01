@@ -153,8 +153,8 @@ func FuzzParseDateOfBirth(f *testing.F) {
 			return
 		}
 		civil := time.Date(d.Year, d.Month, d.Day, 0, 0, 0, 0, time.UTC)
-		if civil.Year() != d.Year || civil.Month() != d.Month || civil.Day() != d.Day || d.Year < 0 || d.Year > 9999 {
-			t.Fatalf("ParseDateOfBirth = %v, not a valid civil date", d)
+		if civil.Year() != d.Year || civil.Month() != d.Month || civil.Day() != d.Day || d.Year < 1900 || d.Year > 9999 {
+			t.Fatalf("ParseDateOfBirth = %v, not a valid civil date from 1900 on", d)
 		}
 		d2, found2, err2 := identity.ParseDateOfBirth(der)
 		if d2 != d || !found2 || err2 != nil {

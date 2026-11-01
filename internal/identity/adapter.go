@@ -6,6 +6,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -65,7 +66,8 @@ type BirthDateRule int
 const (
 	// BirthDateNone: SDA is ignored; a malformed SDA is noted, not an error.
 	BirthDateNone BirthDateRule = iota + 1
-	// BirthDateOptional: dateOfBirth from SDA when present; malformed → ErrInvalid.
+	// BirthDateOptional: dateOfBirth from SDA when present; malformed or
+	// later than the certificate NotBefore → ErrInvalid.
 	BirthDateOptional
 )
 
@@ -268,6 +270,10 @@ func (a Adapter) Extract(cert *x509.Certificate) (Extracted, error) {
 			return Extracted{}, err
 		}
 		if found {
+			// R10.2: nobody is certified before birth.
+			if time.Date(d.Year, d.Month, d.Day, 0, 0, 0, 0, time.UTC).After(cert.NotBefore) {
+				return Extracted{}, invalidf("sda: dateOfBirth later than the certificate validity start")
+			}
 			id.BirthDate = &d
 			src["birthDate"] = "sda.1.3.6.1.5.5.7.9.1"
 		}
