@@ -245,8 +245,11 @@ func (c *Checker) fillOCSP(res *Result, it ocspItem) {
 // certificate (pinned intermediate) is checked against every usable
 // distribution point and is good only when all of them answer good: AC RAIZ
 // DNIE 2 publishes CA revocations in ARL.crl only, while AC DNIE 005/006
-// name the empty CRL.crl first. With several DPs each CRL must name its DP
-// in an IDP, so another CRL of the same issuer cannot stand in for the ARL.
+// name the empty CRL.crl first. When the DPs name several CRLs each CRL must
+// name its DP in an IDP, so another CRL of the same issuer cannot stand in
+// for the ARL. DPs naming one path (and query) on several hosts are mirrors
+// of one CRL (UANATACA, BEWOR, inDenova, DIGITEL) and need no IDP; a DP
+// without an HTTP URI counts as a CRL of its own.
 func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, p Policy, scope Scope, now time.Time, res *Result) Status {
 	dps, err := ParseCRLDistributionPoints(cert)
 	if err != nil {
@@ -254,7 +257,7 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 		return StatusUnsupportedMethod
 	}
 	usable := usableDistributionPoints(dps, issuer)
-	needIDP := scope == ScopeCA && len(usable) > 1
+	needIDP := scope == ScopeCA && len(usable) > 1 && distinctCRLs(usable) > 1
 	last, tried, good, failed := StatusUnsupportedMethod, false, false, false
 	for _, dp := range usable {
 		for _, gn := range dp.FullName {
@@ -289,6 +292,26 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 		return StatusGood
 	}
 	return last
+}
+
+// distinctCRLs counts the CRLs dps name: one per distinct path and query of
+// their HTTP URIs, plus one per DP without an HTTP URI.
+func distinctCRLs(dps []DistributionPoint) int {
+	paths, other := make(map[string]bool), 0
+	for _, dp := range dps {
+		found := false
+		for _, gn := range dp.FullName {
+			raw, _ := gn.URI()
+			if u, err := url.Parse(raw); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
+				paths[u.EscapedPath()+"?"+u.RawQuery] = true
+				found = true
+			}
+		}
+		if !found {
+			other++
+		}
+	}
+	return len(paths) + other
 }
 
 func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Certificate, dp DistributionPoint, p Policy, scope Scope, needIDP bool, now time.Time, res *Result) Status {
