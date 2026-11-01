@@ -973,6 +973,90 @@ func TestFetchHTTPStatus(t *testing.T) {
 	}
 }
 
+// TestFetchNon200BodyNotRead: a non-200 answer returns before its body is
+// read and the connection is dropped, not drained, so an endless error body
+// costs neither the timeout nor the bandwidth.
+func TestFetchNon200BodyNotRead(t *testing.T) {
+	var written, open atomic.Int64
+	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
+	n := testpki.NewNet()
+	n.Serve(t, "err.example.es", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		open.Add(1)
+		defer open.Add(-1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fl := w.(http.Flusher)
+		for r.Context().Err() == nil {
+			n, err := w.Write(chunk)
+			written.Add(int64(n))
+			if err != nil {
+				return
+			}
+			fl.Flush()
+		}
+	}))
+	f := NewFetcher(FetcherOptions{DialContext: n.DialContext})
+	start := time.Now()
+	res, err := f.Fetch(t.Context(), FetchRequest{URL: "http://err.example.es/x.crl", MaxBytes: 1 << 10,
+		Timeout: 30 * time.Second, AllowedHosts: []string{"err.example.es"}})
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrHTTPStatus) || res.StatusCode != http.StatusServiceUnavailable || res.Body != nil {
+		t.Fatalf("Fetch = status %d, %d bytes, %v, want 503 and %v", res.StatusCode, len(res.Body), err, ErrHTTPStatus)
+	}
+	if elapsed > time.Second {
+		t.Errorf("Fetch took %v, want it to return on the status line", elapsed)
+	}
+	// A drain behind Close would keep the handler writing until the 30 s
+	// timeout, gigabytes on loopback; what is written before the drop is
+	// what the socket buffers hold, a few MiB at most.
+	fetchTEventually(t, func() bool { return open.Load() == 0 })
+	if got := written.Load(); got >= 64<<20 {
+		t.Errorf("server wrote %d body bytes before the connection dropped, want < 64 MiB", got)
+	}
+}
+
+// TestFetchCancelMidBodyNoLeak: fetches that time out while a body drips in
+// leave no transport goroutine and no server-side connection behind.
+func TestFetchCancelMidBodyNoLeak(t *testing.T) {
+	var open atomic.Int64
+	n := testpki.NewNet()
+	n.Serve(t, "drip.example.es", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		open.Add(1)
+		defer open.Add(-1)
+		fl := w.(http.Flusher)
+		for {
+			if _, err := w.Write([]byte{0x30}); err != nil {
+				return
+			}
+			fl.Flush()
+			select {
+			case <-time.After(20 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}))
+	f := NewFetcher(FetcherOptions{DialContext: n.DialContext})
+	base := runtime.NumGoroutine()
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Go(func() {
+			_, err := f.Fetch(t.Context(), FetchRequest{URL: "http://drip.example.es/x.crl", MaxBytes: 1 << 20,
+				Timeout: 300 * time.Millisecond, AllowedHosts: []string{"drip.example.es"}})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("Fetch error = %v, want %v", err, context.DeadlineExceeded)
+			}
+		})
+	}
+	wg.Wait()
+	deadline := time.Now().Add(3 * time.Second)
+	for open.Load() != 0 || runtime.NumGoroutine() > base {
+		if time.Now().After(deadline) {
+			t.Fatalf("after 3s: %d handlers open, %d goroutines, want 0 and <= %d", open.Load(), runtime.NumGoroutine(), base)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // fetchTRaise raises peak to v if v is higher.
 func fetchTRaise(peak *atomic.Int64, v int64) {
 	for p := peak.Load(); v > p && !peak.CompareAndSwap(p, v); p = peak.Load() {
