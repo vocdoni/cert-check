@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -461,7 +463,7 @@ func TestCheckFailures(t *testing.T) {
 		want         Status
 		wantMethod   Method
 		wantCRLHits  int64
-		wantWarn     bool
+		wantWarn     Method // the method whose rejected evidence is logged; "" for none
 		wantRevoked  bool
 		wantAttempts int
 	}{
@@ -474,7 +476,7 @@ func TestCheckFailures(t *testing.T) {
 		{
 			name: "ocsp invalid and crl down",
 			ocsp: ocspAnswer(func(_ time.Time, s *testpki.OCSPSpec) { s.CorruptSignature = true }), crl: crlDown,
-			want: StatusInvalidEvidence, wantCRLHits: 1, wantWarn: true, wantAttempts: 2,
+			want: StatusInvalidEvidence, wantCRLHits: 1, wantWarn: MethodOCSP, wantAttempts: 2,
 		},
 		{
 			name: "ocsp down and crl stale",
@@ -493,7 +495,7 @@ func TestCheckFailures(t *testing.T) {
 			crl: func(t *testing.T, f *chkTFixture, _ *x509.Certificate) http.Handler {
 				return f.crl(t, testpki.CRLSpec{CorruptSig: true})
 			},
-			want: StatusInvalidEvidence, wantCRLHits: 1, wantWarn: true, wantAttempts: 2,
+			want: StatusInvalidEvidence, wantCRLHits: 1, wantWarn: MethodCRL, wantAttempts: 2,
 		},
 		{
 			name:   "leaf without AIA or CDP",
@@ -564,7 +566,7 @@ func TestCheckFailures(t *testing.T) {
 			}
 
 			warns := f.logs.warnings()
-			if !tc.wantWarn {
+			if tc.wantWarn == "" {
 				if len(warns) != 0 {
 					t.Errorf("warn records = %d, want 0", len(warns))
 				}
@@ -573,10 +575,77 @@ func TestCheckFailures(t *testing.T) {
 			if len(warns) != 1 {
 				t.Fatalf("warn records = %d, want 1", len(warns))
 			}
-			got := chkTAttrs(warns[0])
-			want := map[string]string{"issuer": f.ca.Cert.Subject.String(), "detail": res.Detail}
-			if len(got) != len(want) || got["issuer"] != want["issuer"] || got["detail"] != want["detail"] {
+			host := chkTOCSPHost
+			if tc.wantWarn == MethodCRL {
+				host = chkTCRLHost
+			}
+			want := map[string]string{"issuer": f.ca.Cert.Subject.String(), "method": string(tc.wantWarn), "outcome": string(StatusInvalidEvidence), "host": host}
+			if got := chkTAttrs(warns[0]); fmt.Sprint(got) != fmt.Sprint(want) {
 				t.Errorf("warn attrs = %v, want exactly %v", got, want)
+			}
+		})
+	}
+}
+
+// TestCheckRejectedEvidenceLog: the warning for rejected evidence names the
+// method, outcome and host of each rejected attempt, and nothing from a URL
+// path or query, a redirect target or an error text.
+func TestCheckRejectedEvidenceLog(t *testing.T) {
+	const (
+		ocspURL = "http://" + chkTOCSPHost + "/SENTINEL-OCSP-PATH?q=SENTINEL-OCSP-QUERY"
+		crlURL  = "http://" + chkTCRLHost + "/SENTINEL-CRL-PATH.crl?x=SENTINEL-CRL-QUERY"
+	)
+	ocspBad := func(t *testing.T, f *chkTFixture) http.Handler {
+		f.answer(chkTWith(func(_ time.Time, s *testpki.OCSPSpec) { s.CorruptSignature = true }))
+		return f.ocsp.Handler(t)
+	}
+	ocspDown := func(*testing.T, *chkTFixture) http.Handler { return chkTStatus(http.StatusServiceUnavailable) }
+	foreign := func(*testing.T, *chkTFixture) http.Handler {
+		return testpki.Redirect("http://foreign.test/SENTINEL-REDIRECT-PATH?y=SENTINEL-REDIRECT-QUERY")
+	}
+	badCRL := func(t *testing.T, f *chkTFixture) http.Handler {
+		mux := http.NewServeMux()
+		mux.Handle("/SENTINEL-CRL-PATH.crl", testpki.Redirect("/SENTINEL-REDIRECT-PATH?y=SENTINEL-REDIRECT-QUERY"))
+		mux.Handle("/SENTINEL-REDIRECT-PATH", f.crl(t, testpki.CRLSpec{CorruptSig: true}))
+		return mux
+	}
+	cases := []struct {
+		name      string
+		ocsp, crl func(*testing.T, *chkTFixture) http.Handler
+		want      []Method
+	}{
+		{"ocsp rejected, crl redirect blocked", ocspBad, foreign, []Method{MethodOCSP}},
+		{"ocsp down, crl rejected after a redirect", ocspDown, badCRL, []Method{MethodCRL}},
+		{"both rejected", ocspBad, badCRL, []Method{MethodOCSP, MethodCRL}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := chkTNewFixture(t)
+			f.serve(t, chkTOCSPHost, tc.ocsp(t, f))
+			f.serve(t, chkTCRLHost, tc.crl(t, f))
+			f.serve(t, "foreign.test", f.crl(t, testpki.CRLSpec{}))
+			leaf := f.leaf(t, []string{ocspURL}, []string{crlURL})
+			res := chkTCheck(t, f.checker(t, Options{}), leaf, f.ca.Cert, chkTPolicy())
+			if res.Status != StatusInvalidEvidence {
+				t.Fatalf("Check = %s %s, want invalid_evidence", res.Status, chkTTrace(res.Attempts))
+			}
+			warns := f.logs.warnings()
+			if len(warns) != len(tc.want) {
+				t.Fatalf("warn records = %d, want %d", len(warns), len(tc.want))
+			}
+			for i, w := range warns {
+				host := chkTOCSPHost
+				if tc.want[i] == MethodCRL {
+					host = chkTCRLHost
+				}
+				want := map[string]string{"issuer": f.ca.Cert.Subject.String(), "method": string(tc.want[i]), "outcome": string(StatusInvalidEvidence), "host": host}
+				got := chkTAttrs(w)
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Errorf("warn %d attrs = %v, want exactly %v", i, got, want)
+				}
+				if line := w.Message + fmt.Sprint(got); strings.Contains(line, "SENTINEL") {
+					t.Errorf("warn %d = %q, want no URL path, query or redirect target", i, line)
+				}
 			}
 		})
 	}
@@ -613,6 +682,55 @@ func TestCheckTimeouts(t *testing.T) {
 			t.Errorf("CRL attempt = %s %q, want unavailable mentioning the deadline", c.Outcome, c.Detail)
 		}
 	})
+}
+
+// TestCheckCRLFetchesLeaveOCSPSlots: CRL fetches that hang for their whole
+// timeout hold at most half the fetch slots, so an OCSP check on another
+// host still answers within its own timeout.
+func TestCheckCRLFetchesLeaveOCSPSlots(t *testing.T) {
+	f := chkTNewFixture(t)
+	release := make(chan struct{})
+	var hung atomic.Int64
+	hang := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hung.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		http.Error(w, "released", http.StatusServiceUnavailable)
+	})
+	p := Policy{OCSPHosts: []string{chkTOCSPHost}, AllowCRL: true}
+	var leaves []*x509.Certificate
+	for i := range MaxConcurrent { // one host each: the transport also caps connections per host
+		host := fmt.Sprintf("crl-hung-%d.test", i)
+		f.serve(t, host, hang)
+		p.CRLHosts = append(p.CRLHosts, host)
+		leaves = append(leaves, f.leaf(t, nil, []string{"http://" + host + "/a.crl"}))
+	}
+	f.serve(t, chkTOCSPHost, f.ocsp.Handler(t))
+	ocspLeaf := f.leaf(t, []string{chkTOCSPURL}, nil)
+	const ocspTimeout = 2 * time.Second
+	c := f.checker(t, Options{OCSPTimeout: ocspTimeout, CRLTimeout: time.Minute})
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	defer close(release)
+	for _, leaf := range leaves {
+		wg.Go(func() { c.Check(context.Background(), leaf, f.ca.Cert, p) })
+	}
+	crlTEventually(t, func() bool { return hung.Load() >= MaxConcurrent/2 })
+	time.Sleep(100 * time.Millisecond) // let the other CRL checks queue
+	start := time.Now()
+	res := chkTCheck(t, c, ocspLeaf, f.ca.Cert, p)
+	if res.Status != StatusGood || res.Method != MethodOCSP {
+		t.Errorf("OCSP Check = %s via %q %s after %v, want good via ocsp", res.Status, res.Method, chkTTrace(res.Attempts), time.Since(start))
+	}
+	if d := time.Since(start); d >= ocspTimeout {
+		t.Errorf("OCSP Check took %v, want under the %v OCSP timeout", d, ocspTimeout)
+	}
+	if got := hung.Load(); got != MaxConcurrent/2 {
+		t.Errorf("CRL fetches in flight = %d, want %d", got, MaxConcurrent/2)
+	}
 }
 
 func TestCheckOversizedOCSP(t *testing.T) {
@@ -718,6 +836,96 @@ func TestCheckPrivateIPBlocked(t *testing.T) {
 	}
 	if got := hits.Load(); got != 0 {
 		t.Errorf("loopback server saw %d requests, want 0", got)
+	}
+}
+
+// chkTSwitch serves whatever CRL was last set.
+type chkTSwitch struct{ body atomic.Pointer[[]byte] }
+
+func (s *chkTSwitch) set(der []byte) { s.body.Store(&der) }
+
+func (s *chkTSwitch) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	testpki.Bytes("application/pkix-crl", *s.body.Load()).ServeHTTP(w, r)
+}
+
+// TestCheckCRLCacheAdmission: a CRL that is not fresh or names another DP is
+// rejected and not cached, so the right CRL is fetched on the next check.
+func TestCheckCRLCacheAdmission(t *testing.T) {
+	cases := []struct {
+		name  string
+		first func(f *chkTFixture) testpki.CRLSpec
+		want  Status
+	}{
+		{"wrong partition", func(*chkTFixture) testpki.CRLSpec {
+			return testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.test/b.crl"}, OnlyUser: true}}
+		}, StatusInvalidEvidence},
+		{"this update in the future", func(f *chkTFixture) testpki.CRLSpec {
+			return testpki.CRLSpec{ThisUpdate: f.base.Add(10 * time.Minute)}
+		}, StatusStale},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := chkTNewFixture(t)
+			sw := &chkTSwitch{}
+			first := tc.first(f)
+			first.Now = f.base
+			sw.set(f.ca.CRL(t, first))
+			hits := f.serve(t, chkTCRLHost, sw)
+			leaf := f.leaf(t, nil, []string{chkTCRLURL})
+			c := f.checker(t, Options{})
+			if res := chkTCheck(t, c, leaf, f.ca.Cert, chkTPolicy()); res.Status != tc.want {
+				t.Fatalf("first Check = %s %s, want %s", res.Status, chkTTrace(res.Attempts), tc.want)
+			}
+			sw.set(f.ca.CRL(t, testpki.CRLSpec{Now: f.base, IDP: &testpki.IDPSpec{URIs: []string{chkTCRLURL}, OnlyUser: true}}))
+			if res := chkTCheck(t, c, leaf, f.ca.Cert, chkTPolicy()); res.Status != StatusGood || res.Method != MethodCRL {
+				t.Fatalf("second Check = %s via %q %s, want good via crl", res.Status, res.Method, chkTTrace(res.Attempts))
+			}
+			if got := hits.Load(); got != 2 {
+				t.Errorf("CRL requests = %d, want 2 (the first CRL not cached)", got)
+			}
+		})
+	}
+}
+
+// TestCRLRollbackRejected: once a CRL number is seen for an (issuer, URL), a
+// lower one is invalid evidence, also after the cached CRL expired.
+func TestCRLRollbackRejected(t *testing.T) {
+	f := chkTNewFixture(t)
+	sw := &chkTSwitch{}
+	hits := f.serve(t, chkTCRLHost, sw)
+	leaf := f.leaf(t, nil, []string{chkTCRLURL})
+	c := f.checker(t, Options{})
+	listed := []testpki.CRLEntry{{Serial: leaf.SerialNumber, RevokedAt: f.base.Add(-time.Hour), Reason: 1}}
+	steps := []struct {
+		name   string
+		number int64
+		listed bool
+		want   Status
+	}{
+		{"crl 44 lists the leaf", 44, true, StatusRevoked},
+		{"crl 43 replayed", 43, false, StatusInvalidEvidence},
+		{"crl 44 again", 44, true, StatusRevoked},
+		{"crl 45", 45, false, StatusGood},
+		{"crl 44 replayed", 44, true, StatusInvalidEvidence},
+	}
+	for i, s := range steps {
+		now := f.base.Add(time.Duration(i) * 61 * time.Minute) // past the cache's one hour
+		f.clock.Set(now)
+		spec := testpki.CRLSpec{Now: now, Number: s.number}
+		if s.listed {
+			spec.Entries = listed
+		}
+		sw.set(f.ca.CRL(t, spec))
+		res := chkTCheck(t, c, leaf, f.ca.Cert, chkTPolicy())
+		if res.Status != s.want {
+			t.Fatalf("%s: Check = %s %s, want %s", s.name, res.Status, chkTTrace(res.Attempts), s.want)
+		}
+		if a := res.Attempts[len(res.Attempts)-1]; s.want == StatusInvalidEvidence && a.Detail != errCRLRollback.Error() {
+			t.Errorf("%s: CRL attempt detail = %q, want %q", s.name, a.Detail, errCRLRollback)
+		}
+	}
+	if got := hits.Load(); got != int64(len(steps)) {
+		t.Errorf("CRL requests = %d, want %d", got, len(steps))
 	}
 }
 
@@ -830,6 +1038,96 @@ func TestCheckCAScope(t *testing.T) {
 			}
 			if len(res.Attempts) != 3 || res.Attempts[1].URL != crlURL || res.Attempts[1].Outcome != StatusGood || res.Attempts[2].URL != arlURL {
 				t.Errorf("attempts = %s, want OCSP unsupported, CRL good on %q, then %q", chkTTrace(res.Attempts), crlURL, arlURL)
+			}
+		})
+	}
+}
+
+// TestCheckCAScopeUnsupportedARLCannotYieldGood: in the AC DNIE 005/006 shape
+// the ARL URL must answer a CRL bound to it; anything the checker cannot use
+// there keeps the CA from good even though CRL.crl answers good.
+func TestCheckCAScopeUnsupportedARLCannotYieldGood(t *testing.T) {
+	const (
+		crlURL = "http://crl.test/CRL.crl"
+		arlURL = "http://arl.test/ARL.crl"
+	)
+	arlIDP := func(s testpki.IDPSpec) *testpki.IDPSpec { s.URIs = []string{arlURL}; return &s }
+	cases := []struct {
+		name       string
+		arl        testpki.CRLSpec
+		crlNoIDP   bool // CRL.crl also served without an IDP
+		wantStatus Status
+		wantARL    Status
+	}{
+		{"delta crl", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true}),
+			ExtraExtensions: []pkix.Extension{{Id: oidExtDeltaCRLIndicator, Critical: true, Value: []byte{0x02, 0x01, 0x01}}}}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"unknown critical extension", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true}),
+			ExtraExtensions: []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 9}, Critical: true, Value: []byte{0x05, 0x00}}}}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"user-only crl naming the arl", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyUser: true})}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"user-only crl naming CRL.crl", testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{crlURL}, OnlyUser: true}}, false, StatusInvalidEvidence, StatusInvalidEvidence},
+		{"partial reasons", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true, OnlySomeReasons: true})}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"empty crl without an idp", testpki.CRLSpec{}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"idp without a name", testpki.CRLSpec{IDP: &testpki.IDPSpec{OnlyCA: true}}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"unscoped crl at both urls", testpki.CRLSpec{}, true, StatusUnavailable, StatusUnsupportedMethod},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := chkTNewFixture(t)
+			cdp := []testpki.DistributionPoint{{URIs: []string{crlURL}}, {URIs: []string{arlURL}}}
+			cert := f.ca.Intermediate(t, "chkT AC DNIE 005", testpki.CertSpec{Now: f.base, CDP: cdp}).Cert
+			crlSpec := testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{crlURL}}}
+			if tc.crlNoIDP {
+				crlSpec = testpki.CRLSpec{}
+			}
+			f.serve(t, "crl.test", f.crl(t, crlSpec))
+			f.serve(t, "arl.test", f.crl(t, tc.arl))
+			p := Policy{CRLHosts: []string{"crl.test", "arl.test"}, AllowCRL: true}
+			res := chkTCheck(t, f.checker(t, Options{}), cert, f.ca.Cert, p)
+
+			if res.Status != tc.wantStatus || res.Method != "" {
+				t.Fatalf("Check = %s via %q %s, want %s", res.Status, res.Method, chkTTrace(res.Attempts), tc.wantStatus)
+			}
+			if a := res.Attempts[len(res.Attempts)-1]; a.URL != arlURL || a.Outcome != tc.wantARL {
+				t.Errorf("last attempt = %q %s, want %q %s", a.URL, a.Outcome, arlURL, tc.wantARL)
+			}
+		})
+	}
+
+	// One DP (the AC DNIE 004 shape): a complete CRL without an IDP still
+	// covers the CA.
+	t.Run("single dp without an idp", func(t *testing.T) {
+		f := chkTNewFixture(t)
+		cert := f.ca.Intermediate(t, "chkT AC DNIE 004", testpki.CertSpec{Now: f.base, CDP: []testpki.DistributionPoint{{URIs: []string{arlURL}}}}).Cert
+		f.serve(t, "arl.test", f.crl(t, testpki.CRLSpec{}))
+		res := chkTCheck(t, f.checker(t, Options{}), cert, f.ca.Cert, Policy{CRLHosts: []string{"arl.test"}, AllowCRL: true})
+		if res.Status != StatusGood || res.Method != MethodCRL {
+			t.Fatalf("Check = %s via %q %s, want good via crl", res.Status, res.Method, chkTTrace(res.Attempts))
+		}
+	})
+}
+
+// TestCheckRealDNIeCRLs runs the real AC RAIZ DNIE 2 CRL and ARL through the
+// checker for AC DNIE 004 (ARL only) and 005 (CRL.crl then ARL.crl).
+func TestCheckRealDNIeCRLs(t *testing.T) {
+	n := testpki.NewNet()
+	mux := http.NewServeMux()
+	mux.Handle("/dnie/crls/CRL.crl", testpki.Bytes("application/pkix-crl", crlTReadFile(t, "dnie-crl.crl")))
+	mux.Handle("/dnie/crls/ARL.crl", testpki.Bytes("application/pkix-crl", crlTReadFile(t, "dnie-arl.crl")))
+	n.Serve(t, "pki.policia.es", mux)
+	root := crlTReadCert(t, "ac-raiz-dnie-2.pem")
+	c, err := NewChecker(Options{DialContext: n.DialContext, Now: func() time.Time { return crlTNow }, Logger: slog.New(&chkTLogs{})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := Policy{CRLHosts: []string{"pki.policia.es"}, AllowCRL: true}
+	for _, tc := range []struct {
+		cert     string
+		attempts int
+	}{{"ac-dnie-004.pem", 2}, {"ac-dnie-005.pem", 3}} {
+		t.Run(tc.cert, func(t *testing.T) {
+			res := chkTCheck(t, c, crlTReadCert(t, tc.cert), root, p)
+			if res.Status != StatusGood || res.Method != MethodCRL || len(res.Attempts) != tc.attempts {
+				t.Errorf("Check = %s via %q %s, want good via crl after %d attempts", res.Status, res.Method, chkTTrace(res.Attempts), tc.attempts)
 			}
 		})
 	}
@@ -973,6 +1271,8 @@ func TestCheckMisuse(t *testing.T) {
 	f := chkTNewFixture(t)
 	ocspHits := f.serve(t, chkTOCSPHost, f.ocsp.Handler(t))
 	leaf := f.leaf(t, []string{chkTOCSPURL}, []string{chkTCRLURL})
+	noSerial, noRaw := *leaf, *f.ca.Cert
+	noSerial.SerialNumber, noRaw.Raw = nil, nil
 	c := f.checker(t, Options{})
 	cases := []struct {
 		name   string
@@ -985,6 +1285,8 @@ func TestCheckMisuse(t *testing.T) {
 		{"empty policy", leaf, f.ca.Cert, Policy{}},
 		{"uppercase host", leaf, f.ca.Cert, Policy{OCSPHosts: []string{"OCSP.test"}}},
 		{"crl allowed without hosts", leaf, f.ca.Cert, Policy{OCSPHosts: []string{chkTOCSPHost}, AllowCRL: true}},
+		{"cert without serial", &noSerial, f.ca.Cert, chkTPolicy()},
+		{"issuer without raw DER", leaf, &noRaw, chkTPolicy()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

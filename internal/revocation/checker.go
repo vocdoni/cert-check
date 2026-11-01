@@ -34,6 +34,7 @@ type Checker struct {
 	log     *slog.Logger
 	ocspTO  time.Duration
 	crlTO   time.Duration
+	crlSem  chan struct{} // CRL fetches take at most half the fetch slots
 }
 
 // NewChecker builds a Checker. Zero cache bounds and timeouts take the
@@ -63,6 +64,7 @@ func NewChecker(o Options) (*Checker, error) {
 		log:     o.Logger,
 		ocspTO:  cmp.Or(o.OCSPTimeout, OCSPTimeout),
 		crlTO:   cmp.Or(o.CRLTimeout, CRLTimeout),
+		crlSem:  make(chan struct{}, MaxConcurrent/2),
 	}
 	if c.now == nil {
 		c.now = time.Now
@@ -86,6 +88,9 @@ func NewChecker(o Options) (*Checker, error) {
 func (c *Checker) Check(ctx context.Context, cert, issuer *x509.Certificate, p Policy) (Result, error) {
 	if cert == nil || issuer == nil {
 		return Result{}, errors.New("revocation: nil certificate or issuer")
+	}
+	if cert.SerialNumber == nil || len(issuer.Raw) == 0 || len(issuer.RawSubject) == 0 || len(issuer.RawSubjectPublicKeyInfo) == 0 {
+		return Result{}, errors.New("revocation: certificate or issuer lacks parsed DER fields")
 	}
 	if err := p.Validate(); err != nil {
 		return Result{}, err
@@ -113,9 +118,25 @@ func (c *Checker) Check(ctx context.Context, cert, issuer *x509.Certificate, p P
 	}
 	res.Status = worstFailure(ocspStatus, crlStatus)
 	if res.Status == StatusInvalidEvidence {
-		c.log.Warn("revocation evidence rejected", "issuer", issuer.Subject.String(), "detail", res.Detail)
+		c.logRejected(issuer, res.Attempts)
 	}
 	return res, nil
+}
+
+// logRejected warns once per attempt whose evidence was rejected, with its
+// method, outcome and host only: a URL path or query, a redirect target or
+// an error text may carry data that does not belong in logs.
+func (c *Checker) logRejected(issuer *x509.Certificate, attempts []Attempt) {
+	logged := false
+	for _, a := range attempts {
+		if a.Outcome == StatusInvalidEvidence {
+			c.log.Warn("revocation evidence rejected", "issuer", issuer.Subject.String(), "method", a.Method, "outcome", a.Outcome, "host", hostOf(a.URL))
+			logged = true
+		}
+	}
+	if !logged { // rejected before any attempt was recorded
+		c.log.Warn("revocation evidence rejected", "issuer", issuer.Subject.String())
+	}
 }
 
 // worstFailure folds two failed methods into one status: invalid evidence
@@ -224,15 +245,18 @@ func (c *Checker) fillOCSP(res *Result, it ocspItem) {
 // certificate (pinned intermediate) is checked against every usable
 // distribution point and is good only when all of them answer good: AC RAIZ
 // DNIE 2 publishes CA revocations in ARL.crl only, while AC DNIE 005/006
-// name the empty, unscoped CRL.crl first.
+// name the empty CRL.crl first. With several DPs each CRL must name its DP
+// in an IDP, so another CRL of the same issuer cannot stand in for the ARL.
 func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, p Policy, scope Scope, now time.Time, res *Result) Status {
 	dps, err := ParseCRLDistributionPoints(cert)
 	if err != nil {
 		res.Attempts = append(res.Attempts, Attempt{Method: MethodCRL, Outcome: StatusUnsupportedMethod, Detail: err.Error()})
 		return StatusUnsupportedMethod
 	}
+	usable := usableDistributionPoints(dps, issuer)
+	needIDP := scope == ScopeCA && len(usable) > 1
 	last, tried, good, failed := StatusUnsupportedMethod, false, false, false
-	for _, dp := range usableDistributionPoints(dps, issuer) {
+	for _, dp := range usable {
 		for _, gn := range dp.FullName {
 			raw, ok := gn.URI()
 			if !ok {
@@ -243,7 +267,7 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 				continue
 			}
 			tried = true
-			switch st := c.crlOnce(ctx, raw, cert, issuer, dp, p, scope, now, res); st {
+			switch st := c.crlOnce(ctx, raw, cert, issuer, dp, p, scope, needIDP, now, res); st {
 			case StatusRevoked:
 				return st
 			case StatusGood:
@@ -251,8 +275,6 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 					return st
 				}
 				good = true
-			case StatusUnsupportedMethod:
-				last = worstFailure(last, st)
 			default:
 				failed = true
 				last = worstFailure(last, st)
@@ -269,10 +291,16 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 	return last
 }
 
-func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Certificate, dp DistributionPoint, p Policy, scope Scope, now time.Time, res *Result) Status {
+func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Certificate, dp DistributionPoint, p Policy, scope Scope, needIDP bool, now time.Time, res *Result) Status {
 	key := issuerKey(issuer) + " " + u
 	load := c.crls.load(ctx, key, now, c.crlTO, func(fctx context.Context) crlLoad {
 		at := Attempt{Method: MethodCRL, URL: u}
+		select {
+		case c.crlSem <- struct{}{}:
+			defer func() { <-c.crlSem }()
+		case <-fctx.Done():
+			return crlLoad{status: StatusUnavailable, err: fctx.Err(), attempt: at}
+		}
 		fr, err := c.fetcher.Fetch(fctx, FetchRequest{URL: u, MaxBytes: MaxCRLResponse, Timeout: c.crlTO, AllowedHosts: p.AllHosts()})
 		at.HTTPStatus, at.Duration = fr.StatusCode, fr.Duration
 		if err != nil {
@@ -283,7 +311,8 @@ func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Cert
 			return crlLoad{status: st, err: err, attempt: at}
 		}
 		parsed.URL = u
-		return crlLoad{crl: parsed, status: StatusGood, attempt: at}
+		applies, _ := crlApplies(parsed, dp, now)
+		return crlLoad{crl: parsed, status: StatusGood, attempt: at, admit: applies == StatusGood}
 	})
 	at := load.attempt
 	if at.URL == "" {
@@ -296,12 +325,15 @@ func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Cert
 		return load.status
 	}
 	st, rec, detail := EvaluateCRL(load.crl, cert, dp, scope, now)
+	if st == StatusGood && needIDP && (load.crl.IDP == nil || len(load.crl.IDP.FullName) == 0) {
+		st, detail = StatusUnsupportedMethod, "crl without an idp name for a CA with several DPs"
+	}
 	at.Outcome, at.Detail = st, detail
-	at.ThisUpdate, at.NextUpdate = load.crl.List.ThisUpdate, load.crl.List.NextUpdate
+	at.ThisUpdate, at.NextUpdate = load.crl.ThisUpdate, load.crl.NextUpdate
 	res.Attempts = append(res.Attempts, at)
 	res.Detail = fmt.Sprintf("CRL %s: %s", u, detail)
 	if st == StatusGood || st == StatusRevoked {
-		res.ThisUpdate, res.NextUpdate, res.Source = load.crl.List.ThisUpdate, load.crl.List.NextUpdate, hostOf(u)
+		res.ThisUpdate, res.NextUpdate, res.Source = load.crl.ThisUpdate, load.crl.NextUpdate, hostOf(u)
 		if st == StatusRevoked {
 			res.RevokedAt, res.Reason = rec.RevokedAt, rec.Reason
 		}

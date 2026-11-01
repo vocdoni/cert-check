@@ -210,14 +210,26 @@ func ParseIDP(der []byte) (IDP, error) {
 	return idp, nil
 }
 
-// ParsedCRL is a parsed, signature-checked CRL kept in the cache. Raw bytes are discarded.
+// ParsedCRL is a parsed, signature-checked CRL kept in the cache: only what
+// EvaluateCRL reads, without the DER or the x509.RevocationList.
 type ParsedCRL struct {
-	List   *x509.RevocationList
-	IDP    *IDP                 // nil when the CRL has no IDP
-	Listed map[string]CRLRecord // serial (lowercase hex of big.Int bytes) -> record
-	Size   int64                // raw size, for the cache bound
-	URL    string
+	ThisUpdate time.Time
+	NextUpdate time.Time            // zero when the CRL has none
+	Number     *big.Int             // cRLNumber, nil when absent
+	IDP        *IDP                 // nil when the CRL has no IDP
+	Listed     map[string]CRLRecord // serial (lowercase hex of big.Int bytes) -> record
+	Cost       int64                // estimated retained heap, for the cache bound
+	URL        string
 }
+
+// Cache charge of a ParsedCRL: a conservative bound on its retained heap,
+// calibrated by TestCRLCacheDenseEntryAccounting. An entry costs its key
+// bytes plus crlCostEntry for its map slot, key header and size-class
+// rounding (measured at most 128 bytes on Go 1.27 amd64, 1k to 1M entries).
+const (
+	crlCostBase  = 4 << 10
+	crlCostEntry = 160
+)
 
 // CRLRecord is one listed serial.
 type CRLRecord struct {
@@ -228,30 +240,35 @@ type CRLRecord struct {
 // SerialKey is the map key for a serial number.
 func SerialKey(n *big.Int) string { return fmt.Sprintf("%x", n) }
 
-// ParseCRL parses der, checks issuer name and signature against issuer, and
-// enforces criticality: only IDP among critical CRL extensions; only
+// ParseCRL checks issuer name and signature against issuer, then parses der
+// and enforces criticality: only IDP among critical CRL extensions; only
 // reasonCode and invalidityDate among entry extensions; certificateIssuer and
 // delta CRLs are unsupported. It returns a Status for the failure cases.
 func ParseCRL(der []byte, issuer *x509.Certificate) (*ParsedCRL, Status, error) {
+	if err := checkCRLSignature(der, issuer); err != nil {
+		return nil, StatusInvalidEvidence, err
+	}
 	rl, err := x509.ParseRevocationList(der)
 	if err != nil {
 		return nil, StatusInvalidEvidence, fmt.Errorf("crl: parse: %w", err)
 	}
-	if !bytes.Equal(rl.RawIssuer, issuer.RawSubject) {
-		return nil, StatusInvalidEvidence, errors.New("crl: issuer name differs from the certificate issuer")
-	}
-	if err := rl.CheckSignatureFrom(issuer); err != nil {
-		return nil, StatusInvalidEvidence, fmt.Errorf("crl: signature: %w", err)
-	}
-	p := &ParsedCRL{List: rl, Listed: make(map[string]CRLRecord, len(rl.RevokedCertificateEntries)), Size: int64(len(der))}
+	p := &ParsedCRL{ThisUpdate: rl.ThisUpdate, NextUpdate: rl.NextUpdate, Number: rl.Number,
+		Listed: make(map[string]CRLRecord, len(rl.RevokedCertificateEntries)), Cost: crlCostBase}
+	seen := make(map[string]bool, len(rl.Extensions))
 	for _, e := range rl.Extensions {
+		id := e.Id.String()
+		if seen[id] {
+			return nil, StatusInvalidEvidence, fmt.Errorf("crl: duplicate extension %s", id)
+		}
+		seen[id] = true
 		switch {
 		case e.Id.Equal(oidExtIssuingDistPoint):
-			idp, err := ParseIDP(e.Value)
+			idp, err := ParseIDP(bytes.Clone(e.Value)) // e.Value aliases der
 			if err != nil {
 				return nil, StatusInvalidEvidence, err
 			}
 			p.IDP = &idp
+			p.Cost += int64(len(e.Value))
 		case e.Id.Equal(oidExtDeltaCRLIndicator):
 			return nil, StatusUnsupportedMethod, errors.New("crl: delta CRL")
 		case e.Critical && !e.Id.Equal(oidExtCRLNumber) && !e.Id.Equal(oidExtAuthorityKeyID):
@@ -265,15 +282,48 @@ func ParseCRL(der []byte, issuer *x509.Certificate) (*ParsedCRL, Status, error) 
 			case e.Id.Equal(oidEntryReasonCode):
 				rec.Reason = entry.ReasonCode
 			case e.Id.Equal(oidEntryInvalidityDate):
+				v, at := cryptobyte.String(e.Value), time.Time{}
+				if e.Critical && (!v.ReadASN1GeneralizedTime(&at) || !v.Empty()) {
+					return nil, StatusInvalidEvidence, errors.New("crl: malformed critical invalidityDate entry extension")
+				}
 			case e.Id.Equal(oidEntryCertificateIssuer):
 				return nil, StatusUnsupportedMethod, errors.New("crl: certificateIssuer entry extension (indirect CRL)")
 			case e.Critical:
 				return nil, StatusUnsupportedMethod, fmt.Errorf("crl: unhandled critical entry extension %s", e.Id)
 			}
 		}
-		p.Listed[SerialKey(entry.SerialNumber)] = rec
+		k := SerialKey(entry.SerialNumber)
+		p.Listed[k] = rec
+		p.Cost += crlCostEntry + int64(len(k))
 	}
 	return p, StatusGood, nil
+}
+
+// checkCRLSignature authenticates der before x509.ParseRevocationList
+// allocates its entries: it splits the CertificateList, compares the TBS
+// issuer Name with issuer and checks the signature (with the issuer
+// constraints of RevocationList.CheckSignatureFrom).
+func checkCRLSignature(der []byte, issuer *x509.Certificate) error {
+	in := cryptobyte.String(der)
+	var crl, tbs, body, sigAlg, name cryptobyte.String
+	var sig asn1.BitString
+	if !in.ReadASN1(&crl, cbasn1.SEQUENCE) || !in.Empty() ||
+		!crl.ReadASN1Element(&tbs, cbasn1.SEQUENCE) || !crl.ReadASN1(&sigAlg, cbasn1.SEQUENCE) ||
+		!crl.ReadASN1BitString(&sig) || sig.BitLength%8 != 0 || !crl.Empty() {
+		return errors.New("crl: malformed CertificateList")
+	}
+	if b := tbs; !b.ReadASN1(&body, cbasn1.SEQUENCE) || !body.SkipOptionalASN1(cbasn1.INTEGER) ||
+		!body.SkipASN1(cbasn1.SEQUENCE) || !body.ReadASN1Element(&name, cbasn1.SEQUENCE) {
+		return errors.New("crl: malformed tbsCertList")
+	}
+	if !bytes.Equal(name, issuer.RawSubject) {
+		return errors.New("crl: issuer name differs from the certificate issuer")
+	}
+	rl := x509.RevocationList{RawTBSRevocationList: tbs, SignatureAlgorithm: parseSignatureAlgorithm(sigAlg), Signature: sig.Bytes}
+	if err := rl.CheckSignatureFrom(issuer); err != nil {
+		return fmt.Errorf("crl: signature: %w", err)
+	}
+	return nil
 }
 
 // Scope is what the checked certificate is.
@@ -288,15 +338,8 @@ const (
 // EvaluateCRL applies freshness, scope and listing to a parsed CRL for cert,
 // whose CDP DistributionPoint (the one the URL came from) is dp.
 func EvaluateCRL(p *ParsedCRL, cert *x509.Certificate, dp DistributionPoint, scope Scope, now time.Time) (Status, CRLRecord, string) {
-	rl := p.List
-	if rl.ThisUpdate.After(now.Add(ClockSkew)) {
-		return StatusStale, CRLRecord{}, "crl thisUpdate in the future"
-	}
-	if rl.NextUpdate.IsZero() {
-		return StatusStale, CRLRecord{}, "crl without nextUpdate"
-	}
-	if rl.NextUpdate.Before(now) {
-		return StatusStale, CRLRecord{}, "crl nextUpdate in the past"
+	if st, detail := crlApplies(p, dp, now); st != StatusGood {
+		return st, CRLRecord{}, detail
 	}
 	if idp := p.IDP; idp != nil {
 		if idp.RelativeName {
@@ -315,14 +358,33 @@ func EvaluateCRL(p *ParsedCRL, cert *x509.Certificate, dp DistributionPoint, sco
 				return StatusUnsupportedMethod, CRLRecord{}, "idp onlyContainsUserCerts for a CA"
 			}
 		}
-		if len(idp.FullName) > 0 && !namesIntersect(idp.FullName, dp.FullName) {
-			return StatusInvalidEvidence, CRLRecord{}, "idp distributionPoint does not match the certificate CDP"
-		}
 	}
 	if rec, ok := p.Listed[SerialKey(cert.SerialNumber)]; ok {
 		return StatusRevoked, rec, "serial listed"
 	}
 	return StatusGood, CRLRecord{}, "serial not listed"
+}
+
+// crlApplies is the part of EvaluateCRL that does not depend on the
+// certificate: p is well dated and fresh at now and, when its IDP names
+// distribution points, issued for dp. The name check comes before any scope
+// flag, so a CRL of another DP is invalid evidence.
+func crlApplies(p *ParsedCRL, dp DistributionPoint, now time.Time) (Status, string) {
+	switch {
+	case p.ThisUpdate.IsZero():
+		return StatusInvalidEvidence, "crl thisUpdate is the zero time"
+	case !p.NextUpdate.IsZero() && p.NextUpdate.Before(p.ThisUpdate):
+		return StatusInvalidEvidence, "crl nextUpdate before thisUpdate"
+	case p.ThisUpdate.After(now.Add(ClockSkew)):
+		return StatusStale, "crl thisUpdate in the future"
+	case p.NextUpdate.IsZero():
+		return StatusStale, "crl without nextUpdate"
+	case p.NextUpdate.Before(now):
+		return StatusStale, "crl nextUpdate in the past"
+	case p.IDP != nil && len(p.IDP.FullName) > 0 && !namesIntersect(p.IDP.FullName, dp.FullName):
+		return StatusInvalidEvidence, "idp distributionPoint does not match the certificate CDP"
+	}
+	return StatusGood, ""
 }
 
 func namesIntersect(a, b []GeneralName) bool {

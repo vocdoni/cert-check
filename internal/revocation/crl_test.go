@@ -3,10 +3,14 @@ package revocation
 import (
 	"bufio"
 	"bytes"
+	"crypto"
+	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
@@ -14,6 +18,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -340,6 +345,8 @@ func TestParseCRL(t *testing.T) {
 			pkix.Extension{Id: testpki.OIDEntryCertIssuer, Value: certIssuer})})), ca.Cert, StatusUnsupportedMethod},
 		{"invalidity date entry extension", ca.CRL(t, spec(testpki.CRLSpec{Entries: entry(
 			testpki.InvalidityDate(crlTNow.Add(-2 * time.Hour)))})), ca.Cert, StatusGood},
+		{"trailing data", append(ca.CRL(t, spec(testpki.CRLSpec{})), 0x00), ca.Cert, StatusInvalidEvidence},
+		{"ecdsa with sha1", crlTSHA1(t, ca), ca.Cert, StatusInvalidEvidence},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -353,11 +360,18 @@ func TestParseCRL(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || p == nil || p.List == nil {
+			if err != nil || p == nil || p.Listed == nil {
 				t.Fatalf("ParseCRL = %v, %v, want a parsed CRL", p, err)
 			}
-			if p.Size != int64(len(c.der)) {
-				t.Errorf("Size = %d, want %d", p.Size, len(c.der))
+			rl, err := x509.ParseRevocationList(c.der)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !p.ThisUpdate.Equal(rl.ThisUpdate) || !p.NextUpdate.Equal(rl.NextUpdate) || p.Number == nil || p.Number.Cmp(rl.Number) != 0 {
+				t.Errorf("ParseCRL = thisUpdate %v nextUpdate %v number %v, want %v %v %v", p.ThisUpdate, p.NextUpdate, p.Number, rl.ThisUpdate, rl.NextUpdate, rl.Number)
+			}
+			if p.Cost < crlCostBase {
+				t.Errorf("Cost = %d, want at least %d", p.Cost, crlCostBase)
 			}
 		})
 	}
@@ -401,6 +415,13 @@ func TestParseCRL(t *testing.T) {
 		if len(p.Listed) != len(want) {
 			t.Errorf("Listed has %d entries, want %d", len(p.Listed), len(want))
 		}
+		wantCost := int64(crlCostBase)
+		for k := range want {
+			wantCost += crlCostEntry + int64(len(k))
+		}
+		if p.Cost != wantCost {
+			t.Errorf("Cost = %d, want %d", p.Cost, wantCost)
+		}
 		for k, w := range want {
 			g, ok := p.Listed[k]
 			if !ok || !g.RevokedAt.Equal(w.RevokedAt) || g.Reason != w.Reason {
@@ -408,6 +429,106 @@ func TestParseCRL(t *testing.T) {
 			}
 		}
 	})
+}
+
+// crlTECDSAAlgID is the ecdsa-with-SHA256 AlgorithmIdentifier testpki uses
+// for its (P-256) CA keys.
+var crlTECDSAAlgID = crlTSeq(crlTDER(cbasn1.OBJECT_IDENTIFIER, []byte{0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02}))
+
+// crlTSign wraps tbs into a CertificateList signed with key (ECDSA P-256,
+// SHA-256); corrupt flips the last signature byte.
+func crlTSign(t testing.TB, key crypto.Signer, tbs []byte, corrupt bool) []byte {
+	t.Helper()
+	h := sha256.Sum256(tbs)
+	sig, err := key.Sign(rand.Reader, h[:], crypto.SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if corrupt {
+		sig[len(sig)-1] ^= 0xff
+	}
+	return crlTSeq(tbs, crlTECDSAAlgID, crlTDER(cbasn1.BIT_STRING, append([]byte{0}, sig...)))
+}
+
+// crlTSHA1 returns an empty CRL issued by ca and signed with ecdsa-with-SHA1,
+// which x509.RevocationList.CheckSignatureFrom accepts.
+func crlTSHA1(t testing.TB, ca *testpki.CA) []byte {
+	t.Helper()
+	algID := crlTSeq(crlTDER(cbasn1.OBJECT_IDENTIFIER, []byte{0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01}))
+	utc := func(tm time.Time) []byte { return crlTDER(cbasn1.UTCTime, []byte(tm.UTC().Format("060102150405Z"))) }
+	tbs := crlTSeq(crlTDER(cbasn1.INTEGER, []byte{1}), algID, ca.Cert.RawSubject, utc(crlTNow.Add(-time.Hour)), utc(crlTNow.Add(time.Hour)))
+	h := sha1.Sum(tbs)
+	sig, err := ca.Key.Sign(rand.Reader, h[:], crypto.SHA1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der := crlTSeq(tbs, algID, crlTDER(cbasn1.BIT_STRING, append([]byte{0}, sig...)))
+	rl, err := x509.ParseRevocationList(der)
+	if err != nil || rl.CheckSignatureFrom(ca.Cert) != nil {
+		t.Fatalf("SHA-1 CRL: parse %v, want a CRL x509 accepts", err)
+	}
+	return der
+}
+
+// crlTDense returns a CRL issued by ca that lists n distinct serials of
+// serialLen (>= 5) bytes, with a reasonCode when withReason, valid around
+// crlTNow.
+func crlTDense(t testing.TB, ca *testpki.CA, n, serialLen int, withReason, corrupt bool) []byte {
+	t.Helper()
+	utc := func(tm time.Time) []byte { return []byte(tm.UTC().Format("060102150405Z")) }
+	reason := crlTSeq(crlTSeq(crlTDER(cbasn1.OBJECT_IDENTIFIER, []byte{0x55, 0x1d, 0x15}),
+		crlTDER(cbasn1.OCTET_STRING, crlTDER(cbasn1.ENUM, []byte{1}))))
+	number := crlTSeq(crlTDER(cbasn1.OBJECT_IDENTIFIER, []byte{0x55, 0x1d, 0x14}), crlTDER(cbasn1.OCTET_STRING, crlTDER(cbasn1.INTEGER, []byte{1})))
+	var b cryptobyte.Builder
+	b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		b.AddASN1Int64(1)
+		b.AddBytes(crlTECDSAAlgID)
+		b.AddBytes(ca.Cert.RawSubject)
+		b.AddASN1(cbasn1.UTCTime, func(b *cryptobyte.Builder) { b.AddBytes(utc(crlTNow.Add(-time.Hour))) })
+		b.AddASN1(cbasn1.UTCTime, func(b *cryptobyte.Builder) { b.AddBytes(utc(crlTNow.Add(24 * time.Hour))) })
+		b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+			serial := make([]byte, serialLen)
+			serial[0] = 0x40 // positive, minimal
+			at := utc(crlTNow.Add(-48 * time.Hour))
+			for i := range n {
+				binary.BigEndian.PutUint32(serial[serialLen-4:], uint32(i))
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					b.AddASN1(cbasn1.INTEGER, func(b *cryptobyte.Builder) { b.AddBytes(serial) })
+					b.AddASN1(cbasn1.UTCTime, func(b *cryptobyte.Builder) { b.AddBytes(at) })
+					if withReason {
+						b.AddBytes(reason)
+					}
+				})
+			}
+		})
+		b.AddASN1(cbasn1.Tag(0).Constructed().ContextSpecific(), func(b *cryptobyte.Builder) {
+			b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) { b.AddBytes(number) })
+		})
+	})
+	return crlTSign(t, ca.Key, b.BytesOrPanic(), corrupt)
+}
+
+// TestParseCRLDenseBadSignature: an unauthenticated CRL near the size cap
+// costs one signature check, not one allocation per entry.
+func TestParseCRLDenseBadSignature(t *testing.T) {
+	ca := testpki.NewRoot(t, "crlT dense ca", testpki.CertSpec{Now: crlTNow})
+	der := crlTDense(t, ca, 1_000_000, 5, false, true)
+	if len(der) > MaxCRLResponse {
+		t.Fatalf("dense CRL is %d bytes, want within MaxCRLResponse", len(der))
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	p, st, err := ParseCRL(der, ca.Cert)
+	runtime.ReadMemStats(&after)
+	if st != StatusInvalidEvidence || err == nil || p != nil {
+		t.Fatalf("ParseCRL = %v, %s, %v, want invalid_evidence", p, st, err)
+	}
+	got := after.TotalAlloc - before.TotalAlloc
+	if got > 4<<20 {
+		t.Errorf("ParseCRL of a %d-byte CRL with a bad signature allocated %d bytes, want at most 4 MiB", len(der), got)
+	}
+	t.Logf("%d-byte CRL with a bad signature: %d bytes allocated", len(der), got)
 }
 
 func TestSerialKey(t *testing.T) {
@@ -493,6 +614,11 @@ func TestEvaluateCRL(t *testing.T) {
 		{name: "non-critical idp mismatch", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}, NonCritical: true}}, want: StatusInvalidEvidence},
 		{name: "non-critical idp only ca for a leaf", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{crlURI}, OnlyCA: true, NonCritical: true}}, want: StatusUnsupportedMethod},
 		{name: "non-critical idp relative name", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{RelativeName: testpki.RDN{{OID: testpki.OIDCommonName, Value: "CRL1"}}, NonCritical: true}}, want: StatusUnsupportedMethod},
+		// A CRL of another DP is invalid evidence whatever its scope flags.
+		{name: "idp mismatch with only user for a ca", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}, OnlyUser: true}}, ca: true, want: StatusInvalidEvidence},
+		{name: "idp mismatch with only ca for a leaf", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}, OnlyCA: true}}, want: StatusInvalidEvidence},
+		{name: "idp mismatch with indirect", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}, Indirect: true}}, want: StatusInvalidEvidence},
+		{name: "idp mismatch with only some reasons for a ca", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}, OnlySomeReasons: true}}, ca: true, want: StatusInvalidEvidence},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -516,6 +642,137 @@ func TestEvaluateCRL(t *testing.T) {
 			}
 			if detail == "" {
 				t.Error("EvaluateCRL detail is empty")
+			}
+		})
+	}
+}
+
+// crlTEvalFixture is a root, a leaf it issued and the leaf's single DP.
+func crlTEvalFixture(t *testing.T) (*testpki.CA, *x509.Certificate, DistributionPoint) {
+	t.Helper()
+	root := testpki.NewRoot(t, "crlT fixture root", testpki.CertSpec{Now: crlTNow})
+	leaf := root.Leaf(t, testpki.CertSpec{Now: crlTNow, Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, "crlT fixture leaf")},
+		CDP: []testpki.DistributionPoint{{URIs: []string{"http://crl.example.es/root.crl"}}}})
+	dps, err := ParseCRLDistributionPoints(leaf.Cert)
+	if err != nil || len(dps) != 1 {
+		t.Fatalf("ParseCRLDistributionPoints = %s, %v, want one DP", crlTDPString(dps), err)
+	}
+	return root, leaf.Cert, dps[0]
+}
+
+// crlTEvaluate parses der against root (want good) and evaluates it for leaf.
+func crlTEvaluate(t *testing.T, der []byte, root *testpki.CA, leaf *x509.Certificate, dp DistributionPoint) (Status, CRLRecord, string) {
+	t.Helper()
+	p, st, err := ParseCRL(der, root.Cert)
+	if st != StatusGood || err != nil {
+		t.Fatalf("ParseCRL = %s, %v, want good", st, err)
+	}
+	return EvaluateCRL(p, leaf, dp, ScopeLeaf, crlTNow)
+}
+
+func TestEvaluateCRLZeroThisUpdate(t *testing.T) {
+	root, leaf, dp := crlTEvalFixture(t)
+	zero := crlTDER(cbasn1.GeneralizedTime, []byte("00010101000000Z"))
+	next := crlTDER(cbasn1.UTCTime, []byte(crlTNow.Add(time.Hour).UTC().Format("060102150405Z")))
+	der := crlTSign(t, root.Key, crlTSeq(crlTDER(cbasn1.INTEGER, []byte{1}), crlTECDSAAlgID, root.Cert.RawSubject, zero, next), false)
+	if got, _, detail := crlTEvaluate(t, der, root, leaf, dp); got != StatusInvalidEvidence {
+		t.Errorf("EvaluateCRL with thisUpdate 00010101000000Z = %s (%s), want invalid_evidence", got, detail)
+	}
+}
+
+func TestEvaluateCRLInvertedUpdateInterval(t *testing.T) {
+	root, leaf, dp := crlTEvalFixture(t)
+	cases := []struct {
+		name                   string
+		thisUpdate, nextUpdate time.Time
+		want                   Status
+	}{
+		{"next update before this update", crlTNow.Add(4 * time.Minute), crlTNow.Add(2 * time.Minute), StatusInvalidEvidence},
+		{"next update equal to this update", crlTNow.Add(time.Minute), crlTNow.Add(time.Minute), StatusGood},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, ThisUpdate: c.thisUpdate, NextUpdate: c.nextUpdate})
+			if got, _, detail := crlTEvaluate(t, der, root, leaf, dp); got != c.want {
+				t.Errorf("EvaluateCRL = %s (%s), want %s", got, detail, c.want)
+			}
+		})
+	}
+}
+
+func TestParseCRLDuplicateIDP(t *testing.T) {
+	root, _, _ := crlTEvalFixture(t)
+	idp := func(s testpki.IDPSpec) pkix.Extension {
+		return pkix.Extension{Id: oidExtIssuingDistPoint, Critical: true, Value: testpki.EncodeIDP(s)}
+	}
+	cases := []struct {
+		name  string
+		extra []pkix.Extension
+	}{
+		{"second idp naming another dp", []pkix.Extension{idp(testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}})}},
+		{"second idp widening the scope", []pkix.Extension{idp(testpki.IDPSpec{})}},
+		{"second crl number", []pkix.Extension{{Id: oidExtCRLNumber, Value: []byte{0x02, 0x01, 0x07}}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/root.crl"}, OnlyUser: true}, ExtraExtensions: c.extra})
+			if p, st, err := ParseCRL(der, root.Cert); st != StatusInvalidEvidence || err == nil || p != nil {
+				t.Errorf("ParseCRL = %v, %s, %v, want invalid_evidence", p, st, err)
+			}
+		})
+	}
+}
+
+func TestParseCRLDuplicateSerial(t *testing.T) {
+	root, leaf, dp := crlTEvalFixture(t)
+	at := crlTNow.Add(-time.Hour)
+	der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, Entries: []testpki.CRLEntry{
+		{Serial: leaf.SerialNumber, RevokedAt: at, Reason: 1},
+		{Serial: big.NewInt(99), RevokedAt: at, Reason: 1},
+		{Serial: leaf.SerialNumber, RevokedAt: at, Reason: 4},
+	}})
+	if got, rec, detail := crlTEvaluate(t, der, root, leaf, dp); got != StatusRevoked || !rec.RevokedAt.Equal(at) {
+		t.Errorf("EvaluateCRL = %s %+v (%s), want revoked at %v", got, rec, detail, at)
+	}
+}
+
+// TestParseCRLRemoveFromCRL pins today's behaviour: removeFromCRL (8) only
+// has a meaning in a delta CRL, which is unsupported; in a complete CRL the
+// serial is listed, so it is revoked.
+func TestParseCRLRemoveFromCRL(t *testing.T) {
+	root, leaf, dp := crlTEvalFixture(t)
+	at := crlTNow.Add(-time.Hour)
+	der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, Entries: []testpki.CRLEntry{{Serial: leaf.SerialNumber, RevokedAt: at, Reason: 8}}})
+	if got, rec, detail := crlTEvaluate(t, der, root, leaf, dp); got != StatusRevoked || rec.Reason != 8 {
+		t.Errorf("EvaluateCRL = %s %+v (%s), want revoked with reason 8", got, rec, detail)
+	}
+}
+
+func TestParseCRLCriticalEntryExtensions(t *testing.T) {
+	root, leaf, _ := crlTEvalFixture(t)
+	gt := func(s string) []byte { return crlTDER(cbasn1.GeneralizedTime, []byte(s)) }
+	invalidity := func(critical bool, value []byte) pkix.Extension {
+		return pkix.Extension{Id: oidEntryInvalidityDate, Critical: critical, Value: value}
+	}
+	cases := []struct {
+		name string
+		ext  pkix.Extension
+		want Status
+	}{
+		{"unknown critical", pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 8}, Critical: true, Value: []byte{0x05, 0x00}}, StatusUnsupportedMethod},
+		{"critical invalidity date", invalidity(true, gt("20261029120000Z")), StatusGood},
+		{"critical invalidity date as UTCTime", invalidity(true, crlTDER(cbasn1.UTCTime, []byte("261029120000Z"))), StatusInvalidEvidence},
+		{"critical invalidity date with trailing data", invalidity(true, append(gt("20261029120000Z"), 0x00)), StatusInvalidEvidence},
+		{"critical invalidity date not a time", invalidity(true, []byte{0x05, 0x00}), StatusInvalidEvidence},
+		{"critical invalidity date empty", invalidity(true, nil), StatusInvalidEvidence},
+		{"non-critical malformed invalidity date ignored", invalidity(false, []byte{0x05, 0x00}), StatusGood},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, Entries: []testpki.CRLEntry{
+				{Serial: leaf.SerialNumber, RevokedAt: crlTNow.Add(-time.Hour), Reason: 1, Extensions: []pkix.Extension{c.ext}}}})
+			if p, st, err := ParseCRL(der, root.Cert); st != c.want || (st == StatusGood) != (err == nil && p != nil) {
+				t.Errorf("ParseCRL = %v, %s, %v, want %s", p, st, err, c.want)
 			}
 		})
 	}
