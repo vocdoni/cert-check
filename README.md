@@ -454,9 +454,10 @@ answer is `internal` and retryable. `Auth` takes the context from the request, s
   `provider_mismatch` with "provider has no enabled profile". `providers.All`, `Standard` and `ByID`
   omit inert providers, and `NewHandler` returns an error for one, so a server fails at startup instead
   of advertising no CA. `NewHandler` also rejects a nil provider, duplicate IDs, a CA subject
-  advertised by two providers, and two profiles of different providers that share an anchor key and a
-  policy OID. The provider constructors panic on corrupt embedded data (a pin that does not match, a
-  malformed declaration): that is a build-time error that the module's tests catch.
+  advertised by two providers, and two profiles of different providers that share a pinned CA key
+  (anchor or pinned intermediate) and a policy OID. The provider constructors panic on corrupt
+  embedded data (a pin that does not match, a malformed declaration): that is a build-time error that
+  the module's tests catch.
 - **No PII in logs.** The package logs only warnings at construction, through the `WithLogger` logger.
   `Error.Detail` and `Diagnostics.LogAttrs()` never carry names, document numbers, subjects, serials or
   certificate hashes. Keep it that way in your own logging: log `LogAttrs()`, not `Diagnostics`.
