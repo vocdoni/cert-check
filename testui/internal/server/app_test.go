@@ -101,12 +101,12 @@ func TestRunAuthWaitsForCert(t *testing.T) {
 
 func TestNewRequiresDeps(t *testing.T) {
 	w := newSrvWorld(t, srvOptions{})
-	full := Deps{Config: srvConfig(t), Checker: w.checker, Certs: w.certs, Logger: srvDiscard, Version: srvVersion}
+	full := Deps{Config: srvConfig(t), Providers: w.providers, Certs: w.certs, Logger: srvDiscard, Version: srvVersion}
 	cases := []struct {
 		name string
 		mod  func(*Deps)
 	}{
-		{"no checker", func(d *Deps) { d.Checker = nil }},
+		{"no providers", func(d *Deps) { d.Providers = nil }},
 		{"no certificate source", func(d *Deps) { d.Certs = nil }},
 		{"no logger", func(d *Deps) { d.Logger = nil }},
 		{"no public URL", func(d *Deps) { d.Config.PublicURL = nil }},

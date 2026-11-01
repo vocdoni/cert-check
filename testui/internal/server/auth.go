@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
+	certcheck "github.com/vocdoni/cert-check"
 )
 
 // Auth listener limits (spec "TLS on the auth listener", "Rate limiting").
@@ -28,7 +28,8 @@ const (
 // http.Redirect writes no HTML.
 type authHandler struct {
 	store     *Store
-	tls       *Handler
+	hosts     *AuthHosts
+	handler   *certcheck.Handler
 	publicURL string // fixed origin, never taken from the request
 	slots     chan struct{}
 	slotWait  time.Duration // ValidationSlotWait; tests shorten it
@@ -44,11 +45,11 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	if err := CheckHost(r); err != nil {
+	if err := certcheck.CheckHost(r); err != nil {
 		w.WriteHeader(http.StatusMisdirectedRequest)
 		return
 	}
-	provider, ok := a.tls.Provider(r.TLS.ServerName)
+	provider, ok := a.hosts.Provider(r.TLS.ServerName)
 	states := r.URL.Query()["state"]
 	var ref TxRef
 	err := ErrInvalidState
@@ -56,16 +57,16 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ref, err = a.store.ConsumeState(Secret(states[0]), provider)
 	}
 	if err != nil {
-		diag := certauth.NewDiagnosticID()
+		diag := certcheck.NewDiagnosticID()
 		a.log.Warn("auth state rejected", "diagnosticId", diag, "sni", r.TLS.ServerName, "reason", err.Error())
 		http.Redirect(w, r, a.publicURL+fragmentInvalidState+diag, http.StatusSeeOther)
 		return
 	}
 
-	outcome := a.validate(r)
+	outcome := a.validate(r, provider)
 	code, err := a.store.Complete(ref, outcome)
 	if err != nil {
-		diag := certauth.NewDiagnosticID()
+		diag := certcheck.NewDiagnosticID()
 		a.log.Warn("auth transaction expired during validation", "diagnosticId", diag, "sni", r.TLS.ServerName)
 		http.Redirect(w, r, a.publicURL+fragmentInvalidState+diag, http.StatusSeeOther)
 		return
@@ -76,24 +77,24 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // validate runs the checker in a bounded slot with a 40 s budget detached
 // from client disconnects; a missed slot or the budget yields internal (retryable).
-func (a *authHandler) validate(r *http.Request) Outcome {
+func (a *authHandler) validate(r *http.Request, provider string) Outcome {
 	wait := time.NewTimer(a.slotWait)
 	defer wait.Stop()
 	select {
 	case a.slots <- struct{}{}:
 		defer func() { <-a.slots }()
 	case <-wait.C:
-		return Outcome{Err: a.serverError(r, certauth.CodeInternal, "validation capacity exhausted")}
+		return Outcome{Err: a.serverError(r, certcheck.CodeInternal, "validation capacity exhausted")}
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), a.budget)
 	defer cancel()
-	res, err := a.tls.Authenticate(r.WithContext(ctx))
+	res, err := a.handler.AuthAs(r.WithContext(ctx), provider)
 	if err != nil {
-		e, ok := errors.AsType[*certauth.Error](err)
+		e, ok := errors.AsType[*certcheck.Error](err)
 		if !ok {
-			return Outcome{Err: a.serverError(r, certauth.CodeInternal, "unexpected validation error")}
+			return Outcome{Err: a.serverError(r, certcheck.CodeInternal, "unexpected validation error")}
 		}
-		if e.Diagnostics.DiagnosticID == "" { // Authenticate's request-without-TLS error carries no diagnostics
+		if e.Diagnostics.DiagnosticID == "" { // AuthAs's request-without-TLS error carries no diagnostics
 			return Outcome{Err: a.serverError(r, e.Code, e.Detail)}
 		}
 		return Outcome{Err: e}
@@ -103,15 +104,15 @@ func (a *authHandler) validate(r *http.Request) Outcome {
 
 // serverError is an error decided by the server (not by the checker), with
 // minimal diagnostics stamped by the injected clock.
-func (a *authHandler) serverError(r *http.Request, code certauth.ErrorCode, detail string) *certauth.Error {
-	d := certauth.Diagnostics{DiagnosticID: certauth.NewDiagnosticID(), Time: a.now().UTC(), ServerVersion: a.version,
-		Code: code, TechnicalDetail: detail, TLS: certauth.DescribeTLS(r.TLS)}
+func (a *authHandler) serverError(r *http.Request, code certcheck.ErrorCode, detail string) *certcheck.Error {
+	d := certcheck.Diagnostics{DiagnosticID: certcheck.NewDiagnosticID(), Time: a.now().UTC(), ServerVersion: a.version,
+		Code: code, TechnicalDetail: detail, TLS: certcheck.DescribeTLS(r.TLS)}
 	if r.TLS != nil {
-		if p, ok := a.tls.Provider(r.TLS.ServerName); ok {
+		if p, ok := a.hosts.Provider(r.TLS.ServerName); ok {
 			d.Provider = p
 		}
 	}
-	return &certauth.Error{Code: code, Retryable: code.Retryable(), Detail: detail, Diagnostics: d}
+	return &certcheck.Error{Code: code, Retryable: code.Retryable(), Detail: detail, Diagnostics: d}
 }
 
 // logOutcome writes one line with non-PII fields only.

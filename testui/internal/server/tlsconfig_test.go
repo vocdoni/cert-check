@@ -18,7 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
+	certcheck "github.com/vocdoni/cert-check"
+	"github.com/vocdoni/cert-check/internal/engine"
 	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
@@ -50,8 +51,9 @@ var (
 type world struct {
 	now          time.Time
 	rootA, rootB *testpki.CA
-	leaf         *testpki.Leaf // valid alpha leaf
-	checker      *certauth.Checker
+	leaf         *testpki.Leaf        // valid alpha leaf
+	providers    []certcheck.Provider // alpha, beta
+	handler      *certcheck.Handler   // over providers
 	serverCert   tls.Certificate
 	serverPool   *x509.CertPool // trusts serverCert
 }
@@ -88,19 +90,20 @@ func newWorld(t *testing.T) *world {
 			EKU: profiles.EKURequireClientAuth, Identity: adapter,
 			Revocation: revocation.Policy{OCSPHosts: []string{ocspHost}, OCSPNonce: true}}
 	}
-	reg, err := profiles.New(profiles.Config{
-		Providers: []profiles.Provider{
-			{ID: "alpha", Name: "Alpha", Profiles: []profiles.Profile{profile("alpha-a", "alpha", w.rootA, policyA)}},
-			{ID: "beta", Name: "Beta", Profiles: []profiles.Profile{profile("beta-a", "beta", w.rootB, policyB)}},
-		},
-		Reserved: identity.DefaultReserved(), Now: now, Logger: discard,
-	})
-	if err != nil {
-		t.Fatalf("profiles.New: %v", err)
+	clock := func() time.Time { return now }
+	for _, d := range []profiles.Provider{
+		{ID: "alpha", Name: "Alpha", Profiles: []profiles.Profile{profile("alpha-a", "alpha", w.rootA, policyA)}},
+		{ID: "beta", Name: "Beta", Profiles: []profiles.Profile{profile("beta-a", "beta", w.rootB, policyB)}},
+	} {
+		p, err := engine.New(engine.Config{Provider: d, Revocation: rc, Now: clock, Logger: discard, Version: "test"})
+		if err != nil {
+			t.Fatalf("engine.New(%s): %v", d.ID, err)
+		}
+		w.providers = append(w.providers, p)
 	}
-	w.checker, err = certauth.NewChecker(certauth.Options{Registry: reg, Revocation: rc, Now: func() time.Time { return now }, Version: "test"})
+	w.handler, err = certcheck.NewHandler(w.providers, certcheck.WithClock(clock), certcheck.WithVersion("test"))
 	if err != nil {
-		t.Fatalf("certauth.NewChecker: %v", err)
+		t.Fatalf("certcheck.NewHandler: %v", err)
 	}
 
 	w.leaf = w.rootA.Leaf(t, testpki.CertSpec{
@@ -121,11 +124,25 @@ func newWorld(t *testing.T) *world {
 	return w
 }
 
+// pool returns the CAs of provider id as a pool.
+func (w *world) pool(t *testing.T, id string) *x509.CertPool {
+	t.Helper()
+	i := slices.IndexFunc(w.providers, func(p certcheck.Provider) bool { return p.Info().ID == id })
+	if i < 0 {
+		t.Fatalf("no provider %q", id)
+	}
+	pool := x509.NewCertPool()
+	for _, c := range w.providers[i].CAs() {
+		pool.AddCert(c)
+	}
+	return pool
+}
+
 // config returns the auth listener configuration of the world.
 func (w *world) config(t *testing.T, allowTLS13 bool, log *slog.Logger) *tls.Config {
 	t.Helper()
 	cfg, err := server.ServerConfig(server.ConfigOptions{
-		Checker:        w.checker,
+		Providers:      w.providers,
 		AuthDomain:     authDomain,
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &w.serverCert, nil },
 		AllowTLS13:     allowTLS13,
@@ -211,9 +228,9 @@ func TestServerConfigRequiresOptions(t *testing.T) {
 		name string
 		opts server.ConfigOptions
 	}{
-		{"no checker", server.ConfigOptions{AuthDomain: authDomain, GetCertificate: getCert}},
-		{"no domain", server.ConfigOptions{Checker: w.checker, GetCertificate: getCert}},
-		{"no certificate source", server.ConfigOptions{Checker: w.checker, AuthDomain: authDomain}},
+		{"no providers", server.ConfigOptions{AuthDomain: authDomain, GetCertificate: getCert}},
+		{"no domain", server.ConfigOptions{Providers: w.providers, GetCertificate: getCert}},
+		{"no certificate source", server.ConfigOptions{Providers: w.providers, AuthDomain: authDomain}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -245,12 +262,8 @@ func TestServerConfigPerProvider(t *testing.T) {
 			if pc.ClientAuth != tls.RequestClientCert {
 				t.Errorf("ClientAuth = %v, want RequestClientCert", pc.ClientAuth)
 			}
-			want, err := w.checker.ClientCAs(c.provider)
-			if err != nil {
-				t.Fatalf("ClientCAs(%q): %v", c.provider, err)
-			}
-			if pc.ClientCAs == nil || !pc.ClientCAs.Equal(want) {
-				t.Errorf("ClientCAs differ from checker.ClientCAs(%q)", c.provider)
+			if want := w.pool(t, c.provider); pc.ClientCAs == nil || !pc.ClientCAs.Equal(want) {
+				t.Errorf("ClientCAs differ from the CAs of provider %q", c.provider)
 			}
 			if pc.MinVersion != tls.VersionTLS12 || pc.MaxVersion != tls.VersionTLS12 {
 				t.Errorf("versions = [%#x, %#x], want TLS 1.2 only", pc.MinVersion, pc.MaxVersion)
@@ -420,12 +433,12 @@ func TestNoResumptionNoH2(t *testing.T) {
 // authCall is what the test handler saw for one request.
 type authCall struct {
 	remote string
-	res    *certauth.Result
+	res    *certcheck.Result
 	err    error
 }
 
 // authServer is a real TLS server using the world's configuration whose
-// handler calls Handler.Authenticate.
+// handler calls certcheck.Handler.AuthAs with the provider of the SNI.
 type authServer struct {
 	addr  string
 	mu    sync.Mutex
@@ -434,10 +447,11 @@ type authServer struct {
 
 func (w *world) startServer(t *testing.T) *authServer {
 	t.Helper()
-	h := server.NewHandler(w.checker, authDomain)
+	hosts := server.NewAuthHosts(authDomain)
 	as := &authServer{}
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		res, err := h.Authenticate(r)
+		id, _ := hosts.Provider(r.TLS.ServerName)
+		res, err := w.handler.AuthAs(r, id)
 		as.mu.Lock()
 		as.calls = append(as.calls, authCall{remote: r.RemoteAddr, res: res, err: err})
 		as.mu.Unlock()
@@ -493,12 +507,12 @@ func (as *authServer) get(t *testing.T, c *http.Client, host string) authCall {
 	return as.calls[len(as.calls)-1]
 }
 
-// authError returns err as *certauth.Error or stops the test.
-func authError(t *testing.T, err error) *certauth.Error {
+// authError returns err as *certcheck.Error or stops the test.
+func authError(t *testing.T, err error) *certcheck.Error {
 	t.Helper()
-	e, ok := errors.AsType[*certauth.Error](err)
+	e, ok := errors.AsType[*certcheck.Error](err)
 	if !ok {
-		t.Fatalf("error = %v (%T), want *certauth.Error", err, err)
+		t.Fatalf("error = %v (%T), want *certcheck.Error", err, err)
 	}
 	return e
 }
@@ -511,8 +525,8 @@ func TestRequestClientCertOptional(t *testing.T) {
 		t.Fatalf("Authenticate result = %+v, want error", call.res)
 	}
 	e := authError(t, call.err)
-	if e.Code != certauth.CodeNoCertificate {
-		t.Errorf("code = %q, want %q", e.Code, certauth.CodeNoCertificate)
+	if e.Code != certcheck.CodeNoCertificate {
+		t.Errorf("code = %q, want %q", e.Code, certcheck.CodeNoCertificate)
 	}
 	got := e.Diagnostics.TLS
 	if got == nil {
@@ -533,7 +547,7 @@ func TestAuthenticateSuccessAndTLSInfo(t *testing.T) {
 	if call.res.Provider.ID != "alpha" {
 		t.Errorf("provider = %q, want alpha", call.res.Provider.ID)
 	}
-	want := certauth.TLSInfo{Version: "TLS 1.2", SNI: alphaHost, ClientCertificatePresented: true, ChainLength: 1}
+	want := certcheck.TLSInfo{Version: "TLS 1.2", SNI: alphaHost, ClientCertificatePresented: true, ChainLength: 1}
 	got := call.res.Diagnostics.TLS
 	if got == nil {
 		t.Fatal("Diagnostics.TLS = nil, want the handshake details")
@@ -553,8 +567,8 @@ func TestAuthenticateErrorCarriesTLS(t *testing.T) {
 		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &leaf, nil }})
 	call := as.get(t, c, betaHost)
 	e := authError(t, call.err)
-	if e.Code != certauth.CodeProviderMismatch {
-		t.Errorf("code = %q, want %q", e.Code, certauth.CodeProviderMismatch)
+	if e.Code != certcheck.CodeProviderMismatch {
+		t.Errorf("code = %q, want %q", e.Code, certcheck.CodeProviderMismatch)
 	}
 	if got := e.Diagnostics.TLS; got == nil || got.SNI != betaHost || !got.ClientCertificatePresented {
 		t.Errorf("Diagnostics.TLS = %+v, want SNI %s with a certificate", got, betaHost)
@@ -582,13 +596,13 @@ func TestAuthenticateRunsEveryRequest(t *testing.T) {
 
 func TestAuthenticateWithoutTLS(t *testing.T) {
 	w := newWorld(t)
-	res, err := server.NewHandler(w.checker, authDomain).Authenticate(httptest.NewRequest(http.MethodGet, "http://"+alphaHost+"/v1/authenticate", nil))
+	res, err := w.handler.AuthAs(httptest.NewRequest(http.MethodGet, "http://"+alphaHost+"/v1/authenticate", nil), "alpha")
 	if res != nil {
 		t.Fatalf("result = %+v, want nil", res)
 	}
 	e := authError(t, err)
-	if e.Code != certauth.CodeInternal {
-		t.Errorf("code = %q, want %q", e.Code, certauth.CodeInternal)
+	if e.Code != certcheck.CodeInternal {
+		t.Errorf("code = %q, want %q", e.Code, certcheck.CodeInternal)
 	}
 	if e.Diagnostics.DiagnosticID != "" {
 		t.Errorf("DiagnosticID = %q, want none (documented)", e.Diagnostics.DiagnosticID)
@@ -596,7 +610,7 @@ func TestAuthenticateWithoutTLS(t *testing.T) {
 }
 
 func TestProvider(t *testing.T) {
-	h := server.NewHandler(nil, "Auth.Test")
+	h := server.NewAuthHosts("Auth.Test")
 	cases := []struct {
 		serverName string
 		want       string
@@ -628,14 +642,14 @@ func TestCheckHost(t *testing.T) {
 		{name: "host with port", host: "alpha.auth.test:8443", sni: alphaHost},
 		{name: "host without port", host: alphaHost, sni: alphaHost},
 		{name: "case-insensitive", host: "Alpha.AUTH.test", sni: alphaHost},
-		{name: "other provider", host: betaHost, sni: alphaHost, want: server.ErrMisdirected},
-		{name: "other provider with port", host: "beta.auth.test:443", sni: alphaHost, want: server.ErrMisdirected},
-		{name: "trailing dot", host: "alpha.auth.test.", sni: alphaHost, want: server.ErrMisdirected},
-		{name: "empty host", host: "", sni: alphaHost, want: server.ErrMisdirected},
-		{name: "no SNI", host: alphaHost, sni: "", want: server.ErrMisdirected},
-		{name: "empty host and no SNI", host: "", sni: "", want: server.ErrMisdirected},
-		{name: "port only and no SNI", host: ":443", sni: "", want: server.ErrMisdirected},
-		{name: "no TLS", host: alphaHost, noTLS: true, want: server.ErrMisdirected},
+		{name: "other provider", host: betaHost, sni: alphaHost, want: certcheck.ErrMisdirected},
+		{name: "other provider with port", host: "beta.auth.test:443", sni: alphaHost, want: certcheck.ErrMisdirected},
+		{name: "trailing dot", host: "alpha.auth.test.", sni: alphaHost, want: certcheck.ErrMisdirected},
+		{name: "empty host", host: "", sni: alphaHost, want: certcheck.ErrMisdirected},
+		{name: "no SNI", host: alphaHost, sni: "", want: certcheck.ErrMisdirected},
+		{name: "empty host and no SNI", host: "", sni: "", want: certcheck.ErrMisdirected},
+		{name: "port only and no SNI", host: ":443", sni: "", want: certcheck.ErrMisdirected},
+		{name: "no TLS", host: alphaHost, noTLS: true, want: certcheck.ErrMisdirected},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -644,7 +658,7 @@ func TestCheckHost(t *testing.T) {
 			if !c.noTLS {
 				r.TLS = &tls.ConnectionState{ServerName: c.sni}
 			}
-			if got := server.CheckHost(r); !errors.Is(got, c.want) {
+			if got := certcheck.CheckHost(r); !errors.Is(got, c.want) {
 				t.Errorf("CheckHost(Host %q, SNI %q) = %v, want %v", c.host, c.sni, got, c.want)
 			}
 		})

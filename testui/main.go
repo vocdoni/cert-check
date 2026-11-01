@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/internal/profiles"
+	certcheck "github.com/vocdoni/cert-check"
 	"github.com/vocdoni/cert-check/internal/revocation"
+	"github.com/vocdoni/cert-check/providers"
 	"github.com/vocdoni/cert-check/testui/internal/acme"
 	"github.com/vocdoni/cert-check/testui/internal/config"
 	"github.com/vocdoni/cert-check/testui/internal/probe"
@@ -89,18 +89,11 @@ func run(getenv func(string) string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	reg, err := profiles.Default(time.Now(), log)
-	if err != nil {
-		return fmt.Errorf("registry: %w", err)
-	}
-	rev, err := revocation.NewChecker(revocation.Options{UserAgent: "cert-check/" + version, Logger: log})
+	rev, err := certcheck.NewRevocation(certcheck.RevocationOptions{UserAgent: "cert-check/" + version, Logger: log})
 	if err != nil {
 		return err
 	}
-	checker, err := certauth.NewChecker(certauth.Options{Registry: reg, Revocation: rev, Version: version})
-	if err != nil {
-		return err
-	}
+	provs := providers.All(certcheck.WithRevocation(rev), certcheck.WithLogger(log), certcheck.WithVersion(version))
 	var certs *acme.Manager
 	switch cfg.CertMode {
 	case config.CertStatic:
@@ -114,7 +107,7 @@ func run(getenv func(string) string) error {
 		return err
 	}
 	defer certs.Close() // stops certmagic's renewal; no-op in static mode
-	app, err := server.New(server.Deps{Config: cfg, Checker: checker, Certs: certs, Logger: log, Version: version})
+	app, err := server.New(server.Deps{Config: cfg, Providers: provs, Certs: certs, Logger: log, Version: version})
 	if err != nil {
 		return err
 	}
@@ -127,7 +120,7 @@ func run(getenv func(string) string) error {
 		_ = mainLn.Close() // never served; the listen error is what matters
 		return err
 	}
-	log.Info("cert-check starting", "version", version, "providers", len(checker.Providers()), "authDomain", cfg.AuthDomain)
+	log.Info("cert-check starting", "version", version, "providers", len(provs), "authDomain", cfg.AuthDomain)
 	// The main listener serves at once (/readyz 503); the auth listener
 	// starts when the certificate is ready. ACME retries with backoff.
 	var wg sync.WaitGroup

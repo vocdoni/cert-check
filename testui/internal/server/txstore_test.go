@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
+	certcheck "github.com/vocdoni/cert-check"
 )
 
 // fakeClock is a goroutine-safe settable clock.
@@ -68,7 +68,7 @@ func mustComplete(t *testing.T, s *Store, provider string, o Outcome) txSecrets 
 }
 
 func successOutcome() Outcome {
-	return Outcome{Result: &certauth.Result{Diagnostics: certauth.Diagnostics{DiagnosticID: "diag-ok"}}}
+	return Outcome{Result: &certcheck.Result{Diagnostics: certcheck.Diagnostics{DiagnosticID: "diag-ok"}}}
 }
 
 func TestStoreFlow(t *testing.T) {
@@ -129,7 +129,7 @@ func TestStoreFlow(t *testing.T) {
 
 func TestStoreFlowErrorOutcome(t *testing.T) {
 	s := NewStore(0, newClock().Now)
-	want := Outcome{Err: &certauth.Error{Code: certauth.CodeRevoked}}
+	want := Outcome{Err: &certcheck.Error{Code: certcheck.CodeRevoked}}
 	sec := mustComplete(t, s, "alpha", want)
 	got, err := s.Redeem(sec.code, sec.cookie)
 	if err != nil {
@@ -472,7 +472,7 @@ func TestNoRawSecretsRetained(t *testing.T) {
 		t.Fatalf("ConsumeState: %v", err)
 	}
 	completed := mustComplete(t, s, "alpha", successOutcome())
-	mismatched := mustComplete(t, s, "beta", Outcome{Err: &certauth.Error{Code: certauth.CodeExpired, Detail: "leaf expired"}})
+	mismatched := mustComplete(t, s, "beta", Outcome{Err: &certcheck.Error{Code: certcheck.CodeExpired, Detail: "leaf expired"}})
 	if _, err := s.Redeem(mismatched.code, pending.cookie); !errors.Is(err, ErrCookie) {
 		t.Fatalf("Redeem with a foreign cookie = %v, want %v", err, ErrCookie)
 	}

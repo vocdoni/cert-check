@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
+	certcheck "github.com/vocdoni/cert-check"
 )
 
 // authListenerHeaders are set on every auth-listener response.
@@ -210,7 +210,7 @@ func TestAuthNoCertificate(t *testing.T) {
 	c := w.authClient(t, run.authAddr, nil)
 	authURL, cookie := w.createTx(t, "alpha")
 	o := w.storedOutcome(t, w.authenticate(t, c, authURL), cookie)
-	if o.Err == nil || o.Err.Code != certauth.CodeNoCertificate {
+	if o.Err == nil || o.Err.Code != certcheck.CodeNoCertificate {
 		t.Fatalf("outcome = %+v, want no_certificate", o)
 	}
 	if tlsInfo := o.Err.Diagnostics.TLS; tlsInfo == nil || tlsInfo.SNI != srvAlphaHost || tlsInfo.ClientCertificatePresented {
@@ -233,12 +233,12 @@ func TestAuthSlotsExhausted(t *testing.T) {
 	w.clk.Advance(time.Second) // diagnostics time follows the injected clock (ruling R47)
 
 	o := w.storedOutcome(t, w.authenticate(t, c, authURL), cookie)
-	if o.Err == nil || o.Err.Code != certauth.CodeInternal || !o.Err.Retryable {
+	if o.Err == nil || o.Err.Code != certcheck.CodeInternal || !o.Err.Retryable {
 		t.Fatalf("outcome = %+v, want internal, retryable", o)
 	}
 	d := o.Err.Diagnostics
 	if !srvHex32.MatchString(d.DiagnosticID) || !d.Time.Equal(w.clk.Now()) || d.ServerVersion != srvVersion ||
-		d.Code != certauth.CodeInternal || d.Provider != "alpha" || d.TLS == nil || d.TechnicalDetail == "" {
+		d.Code != certcheck.CodeInternal || d.Provider != "alpha" || d.TLS == nil || d.TechnicalDetail == "" {
 		t.Errorf("diagnostics = %+v, want id, time %v, version %q, code internal, provider alpha, TLS info and a detail",
 			d, w.clk.Now(), srvVersion)
 	}
@@ -260,7 +260,7 @@ func TestAuthBudget(t *testing.T) {
 		t.Errorf("the 303 took %v, want less than the 1s OCSP delay", d)
 	}
 	o := w.storedOutcome(t, code, cookie)
-	if o.Err == nil || o.Err.Code != certauth.CodeInternal || !o.Err.Retryable {
+	if o.Err == nil || o.Err.Code != certcheck.CodeInternal || !o.Err.Retryable {
 		t.Fatalf("outcome = %+v, want internal, retryable", o)
 	}
 	if got := o.Err.Diagnostics.TechnicalDetail; !strings.Contains(got, "deadline") {
@@ -268,17 +268,17 @@ func TestAuthBudget(t *testing.T) {
 	}
 }
 
-// TestValidateWithoutTLS: Authenticate's error for a request without TLS
+// TestValidateWithoutTLS: AuthAs's error for a request without TLS
 // state has no diagnostics; the handler stamps its own (ruling R60).
 func TestValidateWithoutTLS(t *testing.T) {
 	w := newSrvWorld(t, srvOptions{})
-	o := w.app.auth.validate(httptest.NewRequest(http.MethodGet, "http://"+srvAlphaHost+authenticatePath, nil))
-	if o.Err == nil || o.Err.Code != certauth.CodeInternal || !o.Err.Retryable {
+	o := w.app.auth.validate(httptest.NewRequest(http.MethodGet, "http://"+srvAlphaHost+authenticatePath, nil), "alpha")
+	if o.Err == nil || o.Err.Code != certcheck.CodeInternal || !o.Err.Retryable {
 		t.Fatalf("outcome = %+v, want internal, retryable", o)
 	}
 	d := o.Err.Diagnostics
 	if !srvHex32.MatchString(d.DiagnosticID) || !d.Time.Equal(w.clk.Now()) || d.ServerVersion != srvVersion ||
-		d.Code != certauth.CodeInternal || d.TechnicalDetail == "" || d.TLS != nil {
+		d.Code != certcheck.CodeInternal || d.TechnicalDetail == "" || d.TLS != nil {
 		t.Errorf("diagnostics = %+v, want a diagnostic ID, time %v, version %q, code internal, a detail and no TLS info",
 			d, w.clk.Now(), srvVersion)
 	}

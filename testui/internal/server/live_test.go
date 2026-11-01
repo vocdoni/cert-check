@@ -12,10 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
+	certcheck "github.com/vocdoni/cert-check"
+	"github.com/vocdoni/cert-check/internal/engine"
 	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
+	"github.com/vocdoni/cert-check/providers"
 )
 
 // beworSpecimenSHA256 is the official Bewor test identity
@@ -42,18 +44,25 @@ func TestLiveBeworCredential(t *testing.T) {
 	}
 
 	t.Run("markers emptied: success", func(t *testing.T) {
-		providers := profiles.All()
-		for i := range providers {
-			for j := range providers[i].Profiles {
-				providers[i].Profiles[j].TestMarkers = nil
+		logs := &e2eLogs{}
+		rc, err := revocation.NewChecker(revocation.Options{UserAgent: "cert-check/live-test", Logger: logs.logger()})
+		if err != nil {
+			t.Fatalf("revocation.NewChecker: %v", err)
+		}
+		var provs []certcheck.Provider
+		for _, d := range profiles.All() {
+			for j := range d.Profiles {
+				d.Profiles[j].TestMarkers = nil
+			}
+			p, err := engine.New(engine.Config{Provider: d, Revocation: rc, Logger: logs.logger(), Version: e2eVersion, Reserved: &identity.Reserved{}})
+			if err != nil {
+				t.Fatalf("engine.New(%s): %v", d.ID, err)
+			}
+			if len(p.CAs()) > 0 { // keep the non-inert ones, as providers.All does
+				provs = append(provs, p)
 			}
 		}
-		logs := &e2eLogs{}
-		reg, err := profiles.New(profiles.Config{Providers: providers, Reserved: identity.Reserved{}, Now: time.Now(), Logger: logs.logger()})
-		if err != nil {
-			t.Fatalf("profiles.New: %v", err)
-		}
-		got := liveBeworRedeem(t, reg, logs, &cred)
+		got := liveBeworRedeem(t, provs, logs, &cred)
 		if got.Status != "success" || got.Result == nil {
 			t.Fatalf("redeem = %+v (error %+v, diagnostics %+v), want success", got, got.Error, got.Diagnostics)
 		}
@@ -86,15 +95,16 @@ func TestLiveBeworCredential(t *testing.T) {
 
 	t.Run("production registry: test_certificate", func(t *testing.T) {
 		logs := &e2eLogs{}
-		reg, err := profiles.Default(time.Now(), logs.logger())
+		rev, err := certcheck.NewRevocation(certcheck.RevocationOptions{UserAgent: "cert-check/live-test", Logger: logs.logger()})
 		if err != nil {
-			t.Fatalf("profiles.Default: %v", err)
+			t.Fatalf("certcheck.NewRevocation: %v", err)
 		}
-		got := liveBeworRedeem(t, reg, logs, &cred)
-		if got.Status != "error" || got.Error == nil || got.Error.Code != string(certauth.CodeTestCertificate) || got.Diagnostics == nil {
+		provs := providers.All(certcheck.WithRevocation(rev), certcheck.WithLogger(logs.logger()), certcheck.WithVersion(e2eVersion))
+		got := liveBeworRedeem(t, provs, logs, &cred)
+		if got.Status != "error" || got.Error == nil || got.Error.Code != string(certcheck.CodeTestCertificate) || got.Diagnostics == nil {
 			t.Fatalf("redeem = %+v (error %+v), want test_certificate", got, got.Error)
 		}
-		if d := got.Diagnostics; d.FailedStep != certauth.StepTestMarker || len(d.RevocationAttempts) != 0 {
+		if d := got.Diagnostics; d.FailedStep != certcheck.StepTestMarker || len(d.RevocationAttempts) != 0 {
 			t.Errorf("diagnostics: failedStep %s with %d revocation attempts, want test_marker before any revocation check",
 				d.FailedStep, len(d.RevocationAttempts))
 		}
@@ -103,19 +113,12 @@ func TestLiveBeworCredential(t *testing.T) {
 	})
 }
 
-// liveBeworRedeem serves reg with a live revocation checker, runs create →
-// mTLS GET on bewor.<auth domain> → redeem, and returns the redeem body.
-func liveBeworRedeem(t *testing.T, reg *profiles.Registry, logs *e2eLogs, cred *tls.Certificate) redeemResponse {
+// liveBeworRedeem serves providers (built with a live revocation checker),
+// runs create → mTLS GET on bewor.<auth domain> → redeem, and returns the
+// redeem body.
+func liveBeworRedeem(t *testing.T, providers []certcheck.Provider, logs *e2eLogs, cred *tls.Certificate) redeemResponse {
 	t.Helper()
-	rc, err := revocation.NewChecker(revocation.Options{UserAgent: "cert-check/live-test", Logger: logs.logger()})
-	if err != nil {
-		t.Fatalf("revocation.NewChecker: %v", err)
-	}
-	checker, err := certauth.NewChecker(certauth.Options{Registry: reg, Revocation: rc, Version: e2eVersion})
-	if err != nil {
-		t.Fatalf("certauth.NewChecker: %v", err)
-	}
-	s := startE2E(t, checker, logs, &e2eClock{t: time.Now()})
+	s := startE2E(t, providers, logs, &e2eClock{t: time.Now()})
 	authURL, cookie := s.create(t, "bewor")
 	code := s.authenticate(t, s.authClient(t, "bewor."+e2eAuthDomain, cred), authURL)
 	return s.redeemOK(t, code, cookie)

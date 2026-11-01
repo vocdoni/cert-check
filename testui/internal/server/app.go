@@ -14,7 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
+	certcheck "github.com/vocdoni/cert-check"
 	"github.com/vocdoni/cert-check/testui/internal/config"
 	"github.com/vocdoni/cert-check/testui/web"
 )
@@ -34,18 +34,19 @@ const shutdownTimeout = 15 * time.Second
 
 // Deps are the App's collaborators.
 type Deps struct {
-	Config  config.Config
-	Checker *certauth.Checker
-	Certs   CertSource
-	Logger  *slog.Logger
-	Version string
-	Now     func() time.Time // store, limiter and auth-diagnostics clock; nil = time.Now
+	Config    config.Config
+	Providers []certcheck.Provider // display order; one auth host each
+	Certs     CertSource
+	Logger    *slog.Logger
+	Version   string
+	Now       func() time.Time // store, limiter, auth-diagnostics and handler clock; nil = time.Now
 }
 
 // App is the running service.
 type App struct {
 	cfg           config.Config
-	checker       *certauth.Checker
+	providers     []certcheck.Provider // display order
+	providerIDs   map[string]bool      // Info().ID of providers
 	certs         CertSource
 	log           *slog.Logger
 	version       string
@@ -62,23 +63,30 @@ type App struct {
 
 // New builds the App.
 func New(d Deps) (*App, error) {
-	if d.Checker == nil || d.Certs == nil || d.Logger == nil || d.Config.PublicURL == nil {
-		return nil, errors.New("server: Checker, Certs, Logger and Config are required")
+	if len(d.Providers) == 0 || d.Certs == nil || d.Logger == nil || d.Config.PublicURL == nil {
+		return nil, errors.New("server: Providers, Certs, Logger and Config are required")
 	}
 	now := d.Now
 	if now == nil {
 		now = time.Now
 	}
-	a := &App{cfg: d.Config, checker: d.Checker, certs: d.Certs, log: d.Logger, version: d.Version, now: now,
+	handler, err := certcheck.NewHandler(d.Providers, certcheck.WithClock(now), certcheck.WithVersion(d.Version))
+	if err != nil {
+		return nil, err
+	}
+	a := &App{cfg: d.Config, providers: handler.Providers(), providerIDs: map[string]bool{}, certs: d.Certs, log: d.Logger, version: d.Version, now: now,
 		publicOrigin: d.Config.PublicURL.Scheme + "://" + d.Config.PublicURL.Host,
 		store:        NewStore(TxCapacity, now), createLimiter: newIPLimiter(createPerMinute), redeemLimiter: newIPLimiter(redeemPerMinute)}
-	tcfg, err := ServerConfig(ConfigOptions{Checker: d.Checker, AuthDomain: d.Config.AuthDomain,
+	for _, p := range a.providers {
+		a.providerIDs[p.Info().ID] = true
+	}
+	tcfg, err := ServerConfig(ConfigOptions{Providers: a.providers, AuthDomain: d.Config.AuthDomain,
 		GetCertificate: d.Certs.GetCertificate, AllowTLS13: d.Config.AuthTLS13, Logger: d.Logger})
 	if err != nil {
 		return nil, err
 	}
 	a.authTLS = tcfg
-	a.auth = &authHandler{store: a.store, tls: NewHandler(d.Checker, d.Config.AuthDomain),
+	a.auth = &authHandler{store: a.store, hosts: NewAuthHosts(d.Config.AuthDomain), handler: handler,
 		publicURL: a.publicOrigin, slots: make(chan struct{}, ValidationSlots), slotWait: ValidationSlotWait,
 		budget: ValidationBudget, log: d.Logger, version: d.Version, now: now}
 	return a, nil
@@ -94,7 +102,7 @@ func (a *App) MainHandler() http.Handler {
 	mux.HandleFunc("GET /api/v1/transactions/current", a.handleCurrent)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
-		if a.mainUp.Load() && a.authUp.Load() && a.certs.Ready() && len(a.checker.Providers()) > 0 {
+		if a.mainUp.Load() && a.authUp.Load() && a.certs.Ready() && len(a.providers) > 0 {
 			w.WriteHeader(http.StatusOK)
 			return
 		}

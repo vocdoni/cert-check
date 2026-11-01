@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
+	certcheck "github.com/vocdoni/cert-check"
 )
 
 // Per-IP limits on the main listener (spec "Rate limiting"); newIPLimiter
@@ -44,10 +44,10 @@ func writeError(w http.ResponseWriter, status int, code string, retryable bool) 
 
 // handleProviders: GET /api/v1/providers.
 func (a *App) handleProviders(w http.ResponseWriter, _ *http.Request) {
-	providers := a.checker.Providers()
-	out := make([]providerJSON, 0, len(providers))
-	for _, p := range providers {
-		out = append(out, providerJSON{ID: p.ID, Name: p.Name, Description: p.Description, Beta: p.Beta})
+	out := make([]providerJSON, 0, len(a.providers))
+	for _, p := range a.providers {
+		info := p.Info()
+		out = append(out, providerJSON{ID: info.ID, Name: info.Name, Description: info.Description, Beta: info.Beta})
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -71,7 +71,7 @@ func (a *App) handleCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", false)
 		return
 	}
-	if _, err := a.checker.ClientCAs(body.Provider); err != nil {
+	if !a.providerIDs[body.Provider] {
 		writeError(w, http.StatusBadRequest, "unknown_provider", false)
 		return
 	}
@@ -107,7 +107,7 @@ func (a *App) handleRedeem(w http.ResponseWriter, r *http.Request) {
 	}
 	// invalid answers 400 with minimal diagnostics and no identity data.
 	invalid := func(technical string) {
-		diag := certauth.Diagnostics{DiagnosticID: certauth.NewDiagnosticID(), Time: a.now().UTC(), ServerVersion: a.version,
+		diag := certcheck.Diagnostics{DiagnosticID: certcheck.NewDiagnosticID(), Time: a.now().UTC(), ServerVersion: a.version,
 			Code: "invalid_or_expired", TechnicalDetail: technical}
 		a.log.Info("redeem rejected", "diagnosticId", diag.DiagnosticID, "reason", technical)
 		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error",
@@ -157,34 +157,34 @@ func message(code string) string {
 	if m, ok := messages[code]; ok {
 		return m
 	}
-	return messages[string(certauth.CodeInternal)]
+	return messages[string(certcheck.CodeInternal)]
 }
 
 var messages = map[string]string{
-	string(certauth.CodeNoCertificate):               "No certificate was presented.",
-	string(certauth.CodeProviderMismatch):            "The certificate belongs to a different provider than the one selected.",
-	string(certauth.CodeUntrustedIssuer):             "The certificate was not issued by a supported certification authority.",
-	string(certauth.CodeInvalidChain):                "The certificate chain could not be validated.",
-	string(certauth.CodeExpired):                     "The certificate has expired.",
-	string(certauth.CodeNotYetValid):                 "The certificate is not valid yet.",
-	string(certauth.CodeUnsupportedProfile):          "This type of certificate is not supported.",
-	string(certauth.CodeUnsupportedPurpose):          "The certificate cannot be used for authentication.",
-	string(certauth.CodeWeakAlgorithm):               "The certificate uses a key or signature algorithm that is too weak.",
-	string(certauth.CodeTestCertificate):             "This is a test or specimen certificate.",
-	string(certauth.CodeIdentityInvalid):             "The identity data in the certificate is not valid.",
-	string(certauth.CodeIdentityUnsupportedDocument): "This certificate identifies the holder with a document other than a Spanish DNI/NIE.",
-	string(certauth.CodeRevoked):                     "The certificate has been revoked or suspended.",
-	string(certauth.CodeRevocationUnknown):           "The certification authority does not recognise this certificate.",
-	string(certauth.CodeRevocationUnavailable):       "The revocation status could not be checked right now.",
-	string(certauth.CodeInternal):                    "Something went wrong on our side.",
-	"invalid_or_expired":                             "This authentication link is no longer valid. Please start again.",
-	"unknown_provider":                               "Unknown certificate provider.",
-	"unsupported_media_type":                         "Unsupported request format.",
-	"rate_limited":                                   "Too many attempts. Please wait a moment.",
-	"store_full":                                     "The service is busy. Please try again shortly.",
-	"forbidden":                                      "Request not allowed.",
-	"bad_request":                                    "Malformed request.",
-	"invalid_state":                                  "This authentication link is no longer valid. Please start again.",
+	string(certcheck.CodeNoCertificate):               "No certificate was presented.",
+	string(certcheck.CodeProviderMismatch):            "The certificate belongs to a different provider than the one selected.",
+	string(certcheck.CodeUntrustedIssuer):             "The certificate was not issued by a supported certification authority.",
+	string(certcheck.CodeInvalidChain):                "The certificate chain could not be validated.",
+	string(certcheck.CodeExpired):                     "The certificate has expired.",
+	string(certcheck.CodeNotYetValid):                 "The certificate is not valid yet.",
+	string(certcheck.CodeUnsupportedProfile):          "This type of certificate is not supported.",
+	string(certcheck.CodeUnsupportedPurpose):          "The certificate cannot be used for authentication.",
+	string(certcheck.CodeWeakAlgorithm):               "The certificate uses a key or signature algorithm that is too weak.",
+	string(certcheck.CodeTestCertificate):             "This is a test or specimen certificate.",
+	string(certcheck.CodeIdentityInvalid):             "The identity data in the certificate is not valid.",
+	string(certcheck.CodeIdentityUnsupportedDocument): "This certificate identifies the holder with a document other than a Spanish DNI/NIE.",
+	string(certcheck.CodeRevoked):                     "The certificate has been revoked or suspended.",
+	string(certcheck.CodeRevocationUnknown):           "The certification authority does not recognise this certificate.",
+	string(certcheck.CodeRevocationUnavailable):       "The revocation status could not be checked right now.",
+	string(certcheck.CodeInternal):                    "Something went wrong on our side.",
+	"invalid_or_expired":                              "This authentication link is no longer valid. Please start again.",
+	"unknown_provider":                                "Unknown certificate provider.",
+	"unsupported_media_type":                          "Unsupported request format.",
+	"rate_limited":                                    "Too many attempts. Please wait a moment.",
+	"store_full":                                      "The service is busy. Please try again shortly.",
+	"forbidden":                                       "Request not allowed.",
+	"bad_request":                                     "Malformed request.",
+	"invalid_state":                                   "This authentication link is no longer valid. Please start again.",
 }
 
 // logForwardedHeaders records, at debug level, which client-address headers

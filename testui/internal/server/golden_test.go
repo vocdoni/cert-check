@@ -12,10 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/internal/profiles"
-	"github.com/vocdoni/cert-check/internal/revocation"
+	certcheck "github.com/vocdoni/cert-check"
 	"github.com/vocdoni/cert-check/internal/testpki"
+	"github.com/vocdoni/cert-check/providers"
 )
 
 const goldenDir = "../../../testdata/golden"
@@ -26,24 +25,17 @@ type goldenCA struct {
 	Name string `json:"name"` // RFC 4514, for readers
 }
 
-// TestGoldenService serves the production providers and records the
-// providers API body and, for each provider host, the ordered
-// certificate_authorities list of the CertificateRequest (AC6 golden).
+// TestGoldenService serves the production providers, built as main.go builds
+// them, and records the providers API body and, for each provider host, the
+// ordered certificate_authorities list of the CertificateRequest (AC6 golden).
 func TestGoldenService(t *testing.T) {
 	logs := &e2eLogs{}
-	reg, err := profiles.Default(time.Now(), logs.logger())
+	rev, err := certcheck.NewRevocation(certcheck.RevocationOptions{UserAgent: "cert-check/golden", Logger: logs.logger()})
 	if err != nil {
-		t.Fatalf("profiles.Default: %v", err)
+		t.Fatalf("certcheck.NewRevocation: %v", err)
 	}
-	rc, err := revocation.NewChecker(revocation.Options{UserAgent: "cert-check/golden", Logger: logs.logger()})
-	if err != nil {
-		t.Fatalf("revocation.NewChecker: %v", err)
-	}
-	checker, err := certauth.NewChecker(certauth.Options{Registry: reg, Revocation: rc, Version: e2eVersion})
-	if err != nil {
-		t.Fatalf("certauth.NewChecker: %v", err)
-	}
-	s := startE2E(t, checker, logs, &e2eClock{t: time.Now()})
+	provs := providers.All(certcheck.WithRevocation(rev), certcheck.WithLogger(logs.logger()), certcheck.WithVersion(e2eVersion))
+	s := startE2E(t, provs, logs, &e2eClock{t: time.Now()})
 
 	resp, body := s.do(t, s.request(t, http.MethodGet, "/api/v1/providers", "", ""))
 	if resp.StatusCode != http.StatusOK {

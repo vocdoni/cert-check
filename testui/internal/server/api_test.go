@@ -23,11 +23,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
+	certcheck "github.com/vocdoni/cert-check"
+	"github.com/vocdoni/cert-check/internal/engine"
 	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
 	"github.com/vocdoni/cert-check/internal/testpki"
+	"github.com/vocdoni/cert-check/providers"
 	"github.com/vocdoni/cert-check/testui/internal/config"
 )
 
@@ -62,14 +64,15 @@ type srvOptions struct {
 	notReady  bool          // the auth certificate starts not ready
 }
 
-// srvWorld is the shared fixture: a Checker over a testpki registry and an
-// App built on it with a fake clock, a fake certificate source and a JSON
-// log sink.
+// srvWorld is the shared fixture: providers and a Handler over testpki
+// declarations and an App built on them with a fake clock, a fake
+// certificate source and a JSON log sink.
 type srvWorld struct {
-	now        time.Time  // checker clock and certificate reference time
+	now        time.Time  // provider and handler clock, certificate reference time
 	clk        *fakeClock // App clock: store, limiters, auth diagnostics
 	leaf       *testpki.Leaf
-	checker    *certauth.Checker
+	providers  []certcheck.Provider // alpha and beta, clock fixed at now
+	handler    *certcheck.Handler   // over providers, clock fixed at now
 	certs      *fakeCerts
 	serverPool *x509.CertPool // trusts the auth listener certificate
 	logs       *logSink
@@ -112,21 +115,22 @@ func newSrvWorld(t *testing.T, o srvOptions) *srvWorld {
 			EKU: profiles.EKURequireClientAuth, Identity: adapter,
 			Revocation: revocation.Policy{OCSPHosts: []string{srvOCSPHost}, OCSPNonce: true}} // no CRL fallback
 	}
-	reg, err := profiles.New(profiles.Config{
-		Providers: []profiles.Provider{
-			{ID: "alpha", Name: "Alpha - Test", Description: "Alpha test provider",
-				Profiles: []profiles.Profile{profile("alpha-a", "alpha", rootA, srvPolicyA)}},
-			{ID: "beta", Name: "Beta - Test", Description: "Beta test provider", Beta: true,
-				Profiles: []profiles.Profile{profile("beta-a", "beta", rootB, srvPolicyB)}},
-		},
-		Reserved: identity.DefaultReserved(), Now: now, Logger: srvDiscard,
-	})
-	if err != nil {
-		t.Fatalf("profiles.New: %v", err)
+	clock := func() time.Time { return now }
+	for _, d := range []profiles.Provider{
+		{ID: "alpha", Name: "Alpha - Test", Description: "Alpha test provider",
+			Profiles: []profiles.Profile{profile("alpha-a", "alpha", rootA, srvPolicyA)}},
+		{ID: "beta", Name: "Beta - Test", Description: "Beta test provider", Beta: true,
+			Profiles: []profiles.Profile{profile("beta-a", "beta", rootB, srvPolicyB)}},
+	} {
+		p, err := engine.New(engine.Config{Provider: d, Revocation: rc, Now: clock, Logger: srvDiscard, Version: srvVersion})
+		if err != nil {
+			t.Fatalf("engine.New(%s): %v", d.ID, err)
+		}
+		w.providers = append(w.providers, p)
 	}
-	w.checker, err = certauth.NewChecker(certauth.Options{Registry: reg, Revocation: rc, Now: func() time.Time { return now }, Version: srvVersion})
+	w.handler, err = certcheck.NewHandler(w.providers, certcheck.WithClock(clock), certcheck.WithVersion(srvVersion))
 	if err != nil {
-		t.Fatalf("certauth.NewChecker: %v", err)
+		t.Fatalf("certcheck.NewHandler: %v", err)
 	}
 	w.leaf = rootA.Leaf(t, testpki.CertSpec{
 		Now: now,
@@ -148,7 +152,7 @@ func newSrvWorld(t *testing.T, o srvOptions) *srvWorld {
 	w.certs.ready.Store(!o.notReady)
 
 	logger := slog.New(slog.NewJSONHandler(w.logs, &slog.HandlerOptions{Level: o.logLevel}))
-	w.app, err = New(Deps{Config: srvConfig(t), Checker: w.checker, Certs: w.certs, Logger: logger,
+	w.app, err = New(Deps{Config: srvConfig(t), Providers: w.providers, Certs: w.certs, Logger: logger,
 		Version: srvVersion, Now: w.clk.Now})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -420,21 +424,14 @@ func TestProvidersEndpoint(t *testing.T) {
 			{"lleidanet", "Lleidanet / inDenova", true},
 			{"dnie", "DNIe (requires card reader)", true},
 		}
-		reg, err := profiles.Default(time.Now(), srvDiscard)
+		rev, err := certcheck.NewRevocation(certcheck.RevocationOptions{UserAgent: "cert-check/test", Logger: srvDiscard})
 		if err != nil {
-			t.Fatalf("profiles.Default: %v", err)
+			t.Fatalf("certcheck.NewRevocation: %v", err)
 		}
-		rc, err := revocation.NewChecker(revocation.Options{UserAgent: "cert-check/test", Logger: srvDiscard})
-		if err != nil {
-			t.Fatalf("revocation.NewChecker: %v", err)
-		}
-		checker, err := certauth.NewChecker(certauth.Options{Registry: reg, Revocation: rc, Version: srvVersion})
-		if err != nil {
-			t.Fatalf("certauth.NewChecker: %v", err)
-		}
+		provs := providers.All(certcheck.WithRevocation(rev), certcheck.WithLogger(srvDiscard), certcheck.WithVersion(srvVersion))
 		cfg := srvConfig(t)
 		cfg.AuthDomain = "auth.cert-check.vocdoni.dev"
-		app, err := New(Deps{Config: cfg, Checker: checker, Certs: &fakeCerts{}, Logger: srvDiscard, Version: srvVersion})
+		app, err := New(Deps{Config: cfg, Providers: provs, Certs: &fakeCerts{}, Logger: srvDiscard, Version: srvVersion})
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
@@ -593,19 +590,19 @@ type redeemInvalidBody struct {
 		Message   string `json:"message"`
 		Retryable bool   `json:"retryable"`
 	} `json:"error"`
-	Diagnostics certauth.Diagnostics `json:"diagnostics"`
+	Diagnostics certcheck.Diagnostics `json:"diagnostics"`
 }
 
 func TestRedeem(t *testing.T) {
 	w := newSrvWorld(t, srvOptions{})
-	res, err := w.checker.Check(t.Context(), "alpha", []*x509.Certificate{w.leaf.Cert})
+	res, err := w.handler.VerifyAs(t.Context(), "alpha", []*x509.Certificate{w.leaf.Cert})
 	if err != nil {
-		t.Fatalf("Check: %v", err)
+		t.Fatalf("VerifyAs: %v", err)
 	}
-	_, checkErr := w.checker.Check(t.Context(), "alpha", nil)
-	valErr, ok := errors.AsType[*certauth.Error](checkErr)
-	if !ok || valErr.Code != certauth.CodeNoCertificate {
-		t.Fatalf("Check(no chain) = %v, want *certauth.Error no_certificate", checkErr)
+	_, checkErr := w.handler.VerifyAs(t.Context(), "alpha", nil)
+	valErr, ok := errors.AsType[*certcheck.Error](checkErr)
+	if !ok || valErr.Code != certcheck.CodeNoCertificate {
+		t.Fatalf("VerifyAs(no chain) = %v, want *certcheck.Error no_certificate", checkErr)
 	}
 	cleared := regexp.MustCompile(`^__Host-certcheck_tx=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax$`)
 
@@ -646,8 +643,8 @@ func TestRedeem(t *testing.T) {
 		}
 		checkHeaders(t, rec.Header(), mainAPIHeaders)
 		var got struct {
-			Status string           `json:"status"`
-			Result *certauth.Result `json:"result"`
+			Status string            `json:"status"`
+			Result *certcheck.Result `json:"result"`
 		}
 		strictDecode(t, rec.Body.Bytes(), &got)
 		if got.Status != "success" || got.Result == nil {
@@ -680,7 +677,7 @@ func TestRedeem(t *testing.T) {
 		if got.Status != "error" || got.Error.Code != "no_certificate" || got.Error.Retryable || got.Error.Message != message("no_certificate") {
 			t.Errorf("error = %+v, want no_certificate, not retryable, with its message", got.Error)
 		}
-		if got.Diagnostics.DiagnosticID != valErr.Diagnostics.DiagnosticID || got.Diagnostics.Code != certauth.CodeNoCertificate {
+		if got.Diagnostics.DiagnosticID != valErr.Diagnostics.DiagnosticID || got.Diagnostics.Code != certcheck.CodeNoCertificate {
 			t.Errorf("diagnostics = {id %q code %q}, want {%q no_certificate}", got.Diagnostics.DiagnosticID, got.Diagnostics.Code, valErr.Diagnostics.DiagnosticID)
 		}
 		if sc := rec.Header().Values("Set-Cookie"); len(sc) != 1 || !cleared.MatchString(sc[0]) {
@@ -790,7 +787,7 @@ func TestCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConsumeState: %v", err)
 	}
-	if _, err := w.app.store.Complete(ref, Outcome{Err: &certauth.Error{Code: certauth.CodeInternal}}); err != nil {
+	if _, err := w.app.store.Complete(ref, Outcome{Err: &certcheck.Error{Code: certcheck.CodeInternal}}); err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
 	if got := get(t, cookie); got.Status != "completed" || got.AuthHost != srvAlphaHost || got.AuthPort != srvAuthPort {
@@ -885,7 +882,7 @@ func TestStaticUI(t *testing.T) {
 func TestMessagesCoverAllCodes(t *testing.T) {
 	codes := []string{"invalid_or_expired", "unknown_provider", "unsupported_media_type", "rate_limited",
 		"store_full", "forbidden", "bad_request", "invalid_state"}
-	for _, c := range certauth.Codes {
+	for _, c := range certcheck.Codes {
 		codes = append(codes, string(c))
 	}
 	for _, c := range codes {
@@ -897,7 +894,7 @@ func TestMessagesCoverAllCodes(t *testing.T) {
 			t.Errorf("message for %q contains an en or em dash: %q", c, m)
 		}
 	}
-	if got, want := message("no-such-code"), messages[string(certauth.CodeInternal)]; got != want {
+	if got, want := message("no-such-code"), messages[string(certcheck.CodeInternal)]; got != want {
 		t.Errorf("message(unknown) = %q, want the internal message %q", got, want)
 	}
 }

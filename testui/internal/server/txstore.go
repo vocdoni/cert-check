@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
+	certcheck "github.com/vocdoni/cert-check"
 )
 
 // Store limits (spec "Main listener", transaction store).
@@ -72,8 +72,8 @@ const (
 
 // Outcome is the stored validation outcome: exactly one of Result, Err.
 type Outcome struct {
-	Result *certauth.Result
-	Err    *certauth.Error
+	Result *certcheck.Result
+	Err    *certcheck.Error
 }
 
 // TxRef identifies a transaction whose state was consumed (input to Complete).

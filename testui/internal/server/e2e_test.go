@@ -25,7 +25,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
+	certcheck "github.com/vocdoni/cert-check"
+	"github.com/vocdoni/cert-check/internal/engine"
 	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
@@ -37,10 +38,10 @@ import (
 
 // The end-to-end world (spec AC6, AC7, AC13): the App served by Run on
 // loopback listeners; a synthetic CA whose delegated responder answers on the
-// fake host ocsp.test; the providers alpha and beta (one profile each, nonce
-// on). Auth clients dial the auth listener whatever the URL host says, with
-// the authUrl host as SNI. The main API is called with an explicit Cookie
-// header: cookiejar does not send Secure cookies over http.
+// fake host ocsp.test; the providers alpha and beta (one profile and one CA
+// each, nonce on). Auth clients dial the auth listener whatever the URL host
+// says, with the authUrl host as SNI. The main API is called with an explicit
+// Cookie header: cookiejar does not send Secure cookies over http.
 const (
 	e2eAuthDomain = "auth.test"
 	e2eAlphaHost  = "alpha." + e2eAuthDomain
@@ -127,10 +128,10 @@ func (l *e2eLogs) withMsg(t *testing.T, msg string) []map[string]any {
 
 // redeemResponse is every redeem body (ruling R41: a test-local error type).
 type redeemResponse struct {
-	Status      string                `json:"status"`
-	Result      *certauth.Result      `json:"result"`
-	Error       *redeemError          `json:"error"`
-	Diagnostics *certauth.Diagnostics `json:"diagnostics"`
+	Status      string                 `json:"status"`
+	Result      *certcheck.Result      `json:"result"`
+	Error       *redeemError           `json:"error"`
+	Diagnostics *certcheck.Diagnostics `json:"diagnostics"`
 }
 
 type redeemError struct {
@@ -168,9 +169,9 @@ type e2eServer struct {
 	diagIDs []string // diagnostic IDs of failures
 }
 
-// startE2E serves an App over checker on loopback listeners until the test
+// startE2E serves an App over providers on loopback listeners until the test
 // ends; the cleanup asserts that Run returned nil.
-func startE2E(t *testing.T, checker *certauth.Checker, logs *e2eLogs, clk *e2eClock) *e2eServer {
+func startE2E(t *testing.T, providers []certcheck.Provider, logs *e2eLogs, clk *e2eClock) *e2eServer {
 	t.Helper()
 	mainLn, authLn := e2eListen(t), e2eListen(t)
 	s := &e2eServer{mainURL: "http://" + mainLn.Addr().String(), mainAddr: mainLn.Addr().String(),
@@ -187,8 +188,8 @@ func startE2E(t *testing.T, checker *certauth.Checker, logs *e2eLogs, clk *e2eCl
 	serverCert, pool := testpki.ServerTLS(t, "*."+e2eAuthDomain)
 	s.pool = pool
 	app, err := server.New(server.Deps{
-		Config:  config.Config{PublicURL: public, AuthDomain: e2eAuthDomain, AuthPublicPort: authPort, TrustedProxyHops: 1},
-		Checker: checker, Certs: acme.NewStatic(serverCert), Logger: logs.logger(), Version: e2eVersion, Now: clk.Now,
+		Config:    config.Config{PublicURL: public, AuthDomain: e2eAuthDomain, AuthPublicPort: authPort, TrustedProxyHops: 1},
+		Providers: providers, Certs: acme.NewStatic(serverCert), Logger: logs.logger(), Version: e2eVersion, Now: clk.Now,
 	})
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
@@ -505,14 +506,14 @@ func (s *e2eServer) invalidState(t *testing.T, c *http.Client, rawURL string) st
 	return diag
 }
 
-// e2ePKI is the synthetic CA, its OCSP responder on the fake network and a
-// checker over the alpha and beta providers.
+// e2ePKI is the synthetic CA, its OCSP responder on the fake network and the
+// alpha and beta providers.
 type e2ePKI struct {
-	now     time.Time
-	ocsp    *testpki.OCSPServer
-	leaf    *testpki.Leaf
-	leafTLS tls.Certificate
-	checker *certauth.Checker
+	now       time.Time
+	ocsp      *testpki.OCSPServer
+	leaf      *testpki.Leaf
+	leafTLS   tls.Certificate
+	providers []certcheck.Provider
 }
 
 func newE2EPKI(t *testing.T, logger *slog.Logger) *e2ePKI {
@@ -530,13 +531,14 @@ func newE2EPKI(t *testing.T, logger *slog.Logger) *e2ePKI {
 	if err != nil {
 		t.Fatalf("revocation.NewChecker: %v", err)
 	}
-	reg, err := profiles.New(profiles.Config{Providers: e2eProviders(ca), Reserved: identity.DefaultReserved(), Now: now, Logger: logger})
-	if err != nil {
-		t.Fatalf("profiles.New: %v", err)
-	}
-	checker, err := certauth.NewChecker(certauth.Options{Registry: reg, Revocation: rc, Now: clock, Version: e2eVersion})
-	if err != nil {
-		t.Fatalf("certauth.NewChecker: %v", err)
+	betaCA := testpki.NewRoot(t, "E2E Beta Test CA", testpki.CertSpec{Now: now})
+	var providers []certcheck.Provider
+	for _, d := range e2eProviders(ca, betaCA) {
+		p, err := engine.New(engine.Config{Provider: d, Revocation: rc, Now: clock, Logger: logger, Version: e2eVersion})
+		if err != nil {
+			t.Fatalf("engine.New(%s): %v", d.ID, err)
+		}
+		providers = append(providers, p)
 	}
 	leaf := ca.Leaf(t, testpki.CertSpec{
 		Now: now,
@@ -552,18 +554,19 @@ func newE2EPKI(t *testing.T, logger *slog.Logger) *e2ePKI {
 		Policies:    []asn1.ObjectIdentifier{e2ePolicyAlpha},
 		OCSPServers: []string{"http://" + e2eOCSPHost + "/"},
 	})
-	return &e2ePKI{now: now, ocsp: ocsp, leaf: leaf, leafTLS: leaf.TLSCertificate(), checker: checker}
+	return &e2ePKI{now: now, ocsp: ocsp, leaf: leaf, leafTLS: leaf.TLSCertificate(), providers: providers}
 }
 
-// e2eProviders: alpha and beta, one profile each under the same CA, told
-// apart by policy (1.2.3.1 / 1.2.3.2); OCSP on ocsp.test with a nonce.
-func e2eProviders(ca *testpki.CA) []profiles.Provider {
+// e2eProviders: alpha (under alphaCA) and beta (under betaCA), one profile
+// each, policies 1.2.3.1 / 1.2.3.2; OCSP on ocsp.test with a nonce. Each has
+// its own CA because a Handler rejects two providers that advertise one CA.
+func e2eProviders(alphaCA, betaCA *testpki.CA) []profiles.Provider {
 	adapter := identity.Adapter{
 		Documents: []identity.DocumentRule{{Encoding: identity.EncodingIDCES, Types: []identity.DocumentType{identity.DocumentDNI, identity.DocumentNIE}}},
 		Surnames:  identity.SurnamesFromSN, SAN: identity.SANCheck{Kind: identity.SANNone},
 		BirthDate: identity.BirthDateNone, Organization: identity.OrganizationNone,
 	}
-	profile := func(id, provider string, policy asn1.ObjectIdentifier) profiles.Profile {
+	profile := func(id, provider string, ca *testpki.CA, policy asn1.ObjectIdentifier) profiles.Profile {
 		return profiles.Profile{ID: id, ProviderID: provider, Name: id, HolderRole: profiles.RoleNaturalPerson,
 			Anchors: []profiles.Anchor{profiles.TestAnchor(ca.Cert)}, PolicyOIDs: []string{policy.String()},
 			EKU: profiles.EKURequireClientAuth, Identity: adapter,
@@ -571,9 +574,9 @@ func e2eProviders(ca *testpki.CA) []profiles.Provider {
 	}
 	return []profiles.Provider{
 		{ID: "alpha", Name: "Alpha - Test", Description: "Alpha test provider",
-			Profiles: []profiles.Profile{profile("alpha-a", "alpha", e2ePolicyAlpha)}},
+			Profiles: []profiles.Profile{profile("alpha-a", "alpha", alphaCA, e2ePolicyAlpha)}},
 		{ID: "beta", Name: "Beta - Test", Description: "Beta test provider", Beta: true,
-			Profiles: []profiles.Profile{profile("beta-a", "beta", e2ePolicyBeta)}},
+			Profiles: []profiles.Profile{profile("beta-a", "beta", betaCA, e2ePolicyBeta)}},
 	}
 }
 
@@ -587,7 +590,7 @@ func newE2EWorld(t *testing.T) *e2eWorld {
 	t.Helper()
 	logs := &e2eLogs{}
 	pki := newE2EPKI(t, logs.logger())
-	return &e2eWorld{e2eServer: startE2E(t, pki.checker, logs, &e2eClock{t: pki.now}), pki: pki}
+	return &e2eWorld{e2eServer: startE2E(t, pki.providers, logs, &e2eClock{t: pki.now}), pki: pki}
 }
 
 // client returns an auth client for provider's SNI presenting the test leaf.
@@ -660,11 +663,11 @@ func (w *e2eWorld) flowNoClientCertificate(t *testing.T) []byte {
 	if got.Status != "error" || got.Result != nil || got.Error == nil || got.Diagnostics == nil {
 		t.Fatalf("redeem body = %s, want status error with error and diagnostics", body)
 	}
-	if e := got.Error; e.Code != string(certauth.CodeNoCertificate) || e.Retryable || e.Message == "" {
+	if e := got.Error; e.Code != string(certcheck.CodeNoCertificate) || e.Retryable || e.Message == "" {
 		t.Errorf("error = %+v, want no_certificate, not retryable, with a message", e)
 	}
 	d := got.Diagnostics
-	if !e2eHex32.MatchString(d.DiagnosticID) || d.Code != certauth.CodeNoCertificate || d.Provider != "alpha" ||
+	if !e2eHex32.MatchString(d.DiagnosticID) || d.Code != certcheck.CodeNoCertificate || d.Provider != "alpha" ||
 		d.ServerVersion != e2eVersion || d.TLS == nil || d.TLS.ClientCertificatePresented || d.TLS.SNI != e2eAlphaHost {
 		t.Errorf("diagnostics = %+v (TLS %+v), want no_certificate for alpha with SNI %s and no certificate", d, d.TLS, e2eAlphaHost)
 	}
