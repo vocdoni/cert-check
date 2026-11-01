@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/cryptobyte"
 	cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
@@ -46,6 +47,11 @@ func FuzzParseResponse(f *testing.F) {
 			if r.TBSResponseData != nil || r.Responses != nil || r.Certificates != nil || r.Signature != nil {
 				t.Fatalf("non-successful status %d carries response fields", r.Status)
 			}
+			switch r.Status {
+			case ResponseMalformedRequest, ResponseInternalError, ResponseTryLater, ResponseSigRequired, ResponseUnauthorized:
+			default:
+				t.Fatalf("undefined responseStatus %d accepted", r.Status)
+			}
 			return
 		}
 		// TBSResponseData is one complete DER SEQUENCE taken from the input.
@@ -69,12 +75,24 @@ func FuzzParseResponse(f *testing.F) {
 		if r.ResponderKeyHash != nil && len(r.ResponderKeyHash) != 20 {
 			t.Fatalf("len(ResponderKeyHash) = %d, want 20", len(r.ResponderKeyHash))
 		}
+		if n := len(r.Extensions); n > maxExtensions {
+			t.Fatalf("len(Extensions) = %d, want <= %d", n, maxExtensions)
+		}
+		if r.ProducedAt.IsZero() || r.ProducedAt.Location() != time.UTC {
+			t.Fatalf("ProducedAt = %v, want a non-zero UTC time", r.ProducedAt)
+		}
 		for _, sr := range r.Responses {
 			if sr.CertID.SerialNumber == nil {
 				t.Fatal("SingleResponse without a serial number")
 			}
 			if sr.Status < CertGood || sr.Status > CertUnknown {
 				t.Fatalf("certStatus = %d, want good, revoked or unknown", sr.Status)
+			}
+			if n := len(sr.Extensions); n > maxExtensions {
+				t.Fatalf("len(singleExtensions) = %d, want <= %d", n, maxExtensions)
+			}
+			if sr.ThisUpdate.IsZero() || sr.ThisUpdate.Location() != time.UTC || sr.NextUpdate.Location() != time.UTC {
+				t.Fatalf("thisUpdate %v, nextUpdate %v, want non-zero UTC thisUpdate and UTC nextUpdate", sr.ThisUpdate, sr.NextUpdate)
 			}
 		}
 	})

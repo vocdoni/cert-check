@@ -45,6 +45,7 @@ var signatureAlgorithms = []struct {
 const (
 	maxSingleResponses = 32
 	maxEmbeddedCerts   = 8
+	maxExtensions      = 16 // per list; real responses carry 0-2
 	NonceLength        = 32
 )
 
@@ -59,6 +60,9 @@ type CertID struct {
 // NewCertID builds the CertID for cert from the verified issuer. h is
 // crypto.SHA1 (what every observed responder uses) or crypto.SHA256.
 func NewCertID(h crypto.Hash, cert, issuer *x509.Certificate) (CertID, error) {
+	if cert.SerialNumber == nil {
+		return CertID{}, errors.New("ocsp: certificate without serial number")
+	}
 	keyBits, err := spkiBits(issuer.RawSubjectPublicKeyInfo)
 	if err != nil {
 		return CertID{}, err
@@ -102,6 +106,9 @@ func spkiBits(spki []byte) ([]byte, error) {
 // non-nil it adds the nonce extension whose extnValue is OCTET STRING(nonce)
 // (RFC 8954) and returns that extnValue for the echo comparison.
 func MarshalRequest(id CertID, nonce []byte) (der, nonceExtValue []byte, err error) {
+	if id.SerialNumber == nil || len(id.HashAlgorithm) == 0 || id.IssuerNameHash == nil || id.IssuerKeyHash == nil {
+		return nil, nil, errors.New("ocsp: incomplete CertID")
+	}
 	var b cryptobyte.Builder
 	if nonce != nil {
 		var nb cryptobyte.Builder
@@ -217,7 +224,14 @@ func ParseResponse(der []byte) (*Response, error) {
 	}
 	resp := &Response{Status: ResponseStatus(status)}
 	if resp.Status != ResponseSuccessful {
-		return resp, nil
+		if !top.Empty() {
+			return nil, errMalformed
+		}
+		switch resp.Status {
+		case ResponseMalformedRequest, ResponseInternalError, ResponseTryLater, ResponseSigRequired, ResponseUnauthorized:
+			return resp, nil
+		}
+		return nil, errMalformed
 	}
 	var rbExplicit, rb, rbType cryptobyte.String
 	if !top.ReadASN1(&rbExplicit, cbasn1.Tag(0).Constructed().ContextSpecific()) || !top.Empty() ||
@@ -333,7 +347,7 @@ func parseResponseData(s cryptobyte.String, resp *Response) error {
 	default:
 		return errMalformed
 	}
-	if !s.ReadASN1GeneralizedTime(&resp.ProducedAt) {
+	if !readGeneralizedTime(&s, &resp.ProducedAt) {
 		return errMalformed
 	}
 	var singles cryptobyte.String
@@ -401,7 +415,7 @@ func parseSingleResponse(s cryptobyte.String) (SingleResponse, error) {
 		sr.Status = CertGood
 	case cbasn1.Tag(1).Constructed().ContextSpecific():
 		sr.Status = CertRevoked
-		if !st.ReadASN1GeneralizedTime(&sr.RevokedAt) {
+		if !readGeneralizedTime(&st, &sr.RevokedAt) {
 			return sr, errMalformed
 		}
 		var reason cryptobyte.String
@@ -422,7 +436,7 @@ func parseSingleResponse(s cryptobyte.String) (SingleResponse, error) {
 	default:
 		return sr, errMalformed
 	}
-	if !s.ReadASN1GeneralizedTime(&sr.ThisUpdate) {
+	if !readGeneralizedTime(&s, &sr.ThisUpdate) {
 		return sr, errMalformed
 	}
 	var next cryptobyte.String
@@ -431,7 +445,7 @@ func parseSingleResponse(s cryptobyte.String) (SingleResponse, error) {
 		return sr, errMalformed
 	}
 	if hasNext {
-		if !next.ReadASN1GeneralizedTime(&sr.NextUpdate) || !next.Empty() {
+		if !readGeneralizedTime(&next, &sr.NextUpdate) || !next.Empty() {
 			return sr, errMalformed
 		}
 	}
@@ -444,6 +458,24 @@ func parseSingleResponse(s cryptobyte.String) (SingleResponse, error) {
 		return sr, errMalformed
 	}
 	return sr, nil
+}
+
+// readGeneralizedTime reads a GeneralizedTime in its DER form
+// YYYYMMDDHHMMSSZ (X.690 §11.7, RFC 5280 §4.1.2.5.2): no offset, no
+// fractional seconds, no year 0000. The zero time is rejected too: it is the
+// "absent" value of NextUpdate and RevokedAt.
+func readGeneralizedTime(s *cryptobyte.String, out *time.Time) bool {
+	const layout = "20060102150405Z"
+	var raw cryptobyte.String
+	if !s.ReadASN1(&raw, cbasn1.GeneralizedTime) || len(raw) != len(layout) {
+		return false
+	}
+	t, err := time.Parse(layout, string(raw))
+	if err != nil || t.Format(layout) != string(raw) || t.Year() < 1 || t.IsZero() {
+		return false
+	}
+	*out = t
+	return true
 }
 
 // readExplicitExtensions reads an optional [n] EXPLICIT Extensions.
@@ -462,6 +494,9 @@ func readExplicitExtensions(s *cryptobyte.String, n uint8) ([]Extension, error) 
 	}
 	var out []Extension
 	for !seq.Empty() {
+		if len(out) == maxExtensions {
+			return nil, errMalformed
+		}
 		var ext cryptobyte.String
 		var e Extension
 		if !seq.ReadASN1(&ext, cbasn1.SEQUENCE) || !ext.ReadASN1ObjectIdentifier(&e.ID) {
