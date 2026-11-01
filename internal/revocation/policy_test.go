@@ -132,6 +132,8 @@ func TestPolicyValidateHostEntries(t *testing.T) {
 		{"ocsp.example.es:080", true},
 		{"ocsp.example.es: 80", true},
 		{":8080", true},
+		{"ocsp.example.es:80", true},  // default port: hostAllowed strips it
+		{"ocsp.example.es:443", true}, // from the URL, so the entry never matches
 		// Control characters.
 		{"ocsp.example.es\x00", true},
 		{"ocsp\t.example.es", true},
