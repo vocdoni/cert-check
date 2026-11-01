@@ -149,9 +149,10 @@ type Diagnostics struct {
 
 func (d Diagnostics) LogAttrs() []slog.Attr
     LogAttrs returns the non-PII fields allowed in logs: id, code, step,
-    provider, candidates (x509 error class only), issuer DN, policy OIDs,
-    revocation host/status/duration, TLS version/cipher. Never subject, names,
-    document, serial, leaf hash, URL paths or technicalDetail.
+    provider, candidates (x509 error class only), policy OIDs, revocation
+    host/status/duration, TLS version/cipher. Never subject, issuer or any other
+    DN the client presented, names, document, serial, leaf hash, URL paths or
+    technicalDetail.
 
 type Document = identity.Document
     Field types owned by internal packages, aliased so that a program can name
@@ -208,11 +209,12 @@ func NewHandler(providers []Provider, options ...Option) (*Handler, error)
     NewHandler returns a Handler for providers. It needs at least one provider,
     unique provider IDs, no inert provider (one whose CAs are empty because no
     profile is valid at construction) and no ambiguity: no CA subject may be
-    advertised by two providers, and no two profiles of different providers may
-    share an anchor key and a policy OID. Acceptance therefore never depends
-    on the order of providers. A nil entry is an error; a typed nil (a nil
-    pointer stored in a non-nil Provider) is a programmer error and may panic.
-    NewHandler uses WithClock and WithVersion; other options are ignored.
+    advertised by two providers, and no two profiles of different providers
+    may share a pinned CA key (anchor or pinned intermediate) and a policy OID.
+    Acceptance therefore never depends on the order of providers. A nil entry
+    is an error; a typed nil (a nil pointer stored in a non-nil Provider) is a
+    programmer error and may panic. NewHandler uses WithClock and WithVersion;
+    other options are ignored.
 
 func (h *Handler) Auth(r *http.Request) (*Result, error)
     Auth verifies the client certificate chain of r (Verify on
@@ -250,10 +252,12 @@ func (h *Handler) RequireCertificate() bool
 func (h *Handler) TLSConfig(getCert func(*tls.ClientHelloInfo) (*tls.Certificate, error), options ...TLSOption) *tls.Config
     TLSConfig returns the server configuration of a listener that authenticates
     with h: TLS 1.2 (see WithTLS13), ECDHE AEAD suites, curves X25519,
-    P-256 and P-384, a client certificate requested but not required with h's
-    CAs advertised, session tickets disabled (every connection presents its
-    certificate again) and ALPN http/1.1 only. getCert supplies the server
-    certificate; it may be nil when the caller sets Certificates.
+    P-256 and P-384, a client certificate requested but not required with
+    h's CAs advertised, session tickets disabled (every connection presents
+    its certificate again) and ALPN http/1.1 only. An http.Server adds
+    h2 to NextProtos unless its Protocols allow HTTP/1 only: set them,
+    as the Handler.Auth example does. getCert supplies the server certificate;
+    it may be nil when the caller sets Certificates.
 
 func (h *Handler) Verify(ctx context.Context, chain []*x509.Certificate) (*Result, error)
     Verify selects the provider whose CAs include the issuer of chain[0] (by

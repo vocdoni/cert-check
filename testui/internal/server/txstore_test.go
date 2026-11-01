@@ -275,8 +275,9 @@ func TestCompleteTwiceAndUnknownRef(t *testing.T) {
 	if _, err := s.Complete(ref, successOutcome()); !errors.Is(err, ErrInvalidState) {
 		t.Errorf("second Complete = %v, want %v", err, ErrInvalidState)
 	}
-	if _, err := s.Complete(TxRef{}, successOutcome()); !errors.Is(err, ErrExpired) {
-		t.Errorf("Complete(zero ref) = %v, want %v", err, ErrExpired)
+	// A transaction that no longer exists (replaced, evicted) is not "expired" (U11-FABLE-5).
+	if _, err := s.Complete(TxRef{}, successOutcome()); !errors.Is(err, ErrInvalidState) {
+		t.Errorf("Complete(zero ref) = %v, want %v", err, ErrInvalidState)
 	}
 }
 
@@ -284,8 +285,11 @@ func TestCapacity(t *testing.T) {
 	clk := newClock()
 	s := NewStore(TxCapacity, clk.Now)
 	var last txSecrets
-	for range TxCapacity {
+	for range TxCapacity { // consumed states: nothing to evict
 		last = mustCreate(t, s, "alpha", "")
+		if _, err := s.ConsumeState(last.state, "alpha"); err != nil {
+			t.Fatalf("ConsumeState: %v", err)
+		}
 	}
 	if _, _, _, err := s.Create("alpha", ""); !errors.Is(err, ErrStoreFull) {
 		t.Fatalf("Create beyond capacity = %v, want %v", err, ErrStoreFull)
@@ -303,6 +307,54 @@ func TestCapacity(t *testing.T) {
 	}
 	if n := s.Len(); n != 1 {
 		t.Errorf("Len after sweep = %d, want 1", n)
+	}
+}
+
+// TestStoreEvictsOldestPendingWhenFull: a full store evicts its oldest
+// transaction whose state was never consumed instead of refusing everyone;
+// a transaction whose validation started or finished stays (U11-FABLE-1).
+func TestStoreEvictsOldestPendingWhenFull(t *testing.T) {
+	clk := newClock()
+	s := NewStore(4, clk.Now)
+	consumed := mustCreate(t, s, "alpha", "") // the oldest, but its state is spent
+	if _, err := s.ConsumeState(consumed.state, "alpha"); err != nil {
+		t.Fatalf("ConsumeState: %v", err)
+	}
+	clk.Advance(time.Second)
+	completed := mustComplete(t, s, "alpha", successOutcome())
+	clk.Advance(time.Second)
+	oldest := mustCreate(t, s, "alpha", "")
+	clk.Advance(time.Second)
+	newer := mustCreate(t, s, "alpha", "")
+	clk.Advance(time.Second)
+
+	next := mustCreate(t, s, "beta", "")
+	if got := s.Current(oldest.cookie).Status; got != TxNone {
+		t.Errorf("oldest pending transaction = %q, want evicted", got)
+	}
+	if _, err := s.ConsumeState(oldest.state, "alpha"); !errors.Is(err, ErrInvalidState) {
+		t.Errorf("ConsumeState of the evicted transaction = %v, want %v", err, ErrInvalidState)
+	}
+	for name, sec := range map[string]txSecrets{"consumed": consumed, "completed": completed, "newer": newer, "next": next} {
+		if got := s.Current(sec.cookie).Status; got == TxNone {
+			t.Errorf("%s transaction evicted", name)
+		}
+	}
+	if n := s.Len(); n != 4 {
+		t.Errorf("Len = %d, want 4", n)
+	}
+
+	// Full of consumed or completed transactions: still refused.
+	for sec, provider := range map[*txSecrets]string{&newer: "alpha", &next: "beta"} {
+		if _, err := s.ConsumeState(sec.state, provider); err != nil {
+			t.Fatalf("ConsumeState: %v", err)
+		}
+	}
+	if _, _, _, err := s.Create("alpha", ""); !errors.Is(err, ErrStoreFull) {
+		t.Errorf("Create into a store of consumed transactions = %v, want %v", err, ErrStoreFull)
+	}
+	if _, err := s.Redeem(completed.code, completed.cookie); err != nil {
+		t.Errorf("Redeem of the completed transaction: %v", err)
 	}
 }
 

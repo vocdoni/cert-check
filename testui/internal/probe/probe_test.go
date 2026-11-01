@@ -7,12 +7,14 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -56,7 +58,17 @@ var probeOCSPHosts = map[string]func(testpki.Request) testpki.OCSPSpec{
 	"ocsp-nononce.test": func(testpki.Request) testpki.OCSPSpec {
 		return testpki.OCSPSpec{Now: probeNow, NextUpdate: probeNow.Add(time.Hour), Nonce: testpki.NonceOmit}
 	},
+	// Refuses a request without a nonce (unauthorized), answers one with a nonce.
+	"ocsp-needs-nonce.test": func(r testpki.Request) testpki.OCSPSpec {
+		if r.Nonce == nil {
+			return testpki.OCSPSpec{ResponseStatus: 6}
+		}
+		return testpki.OCSPSpec{Now: probeNow, NextUpdate: probeNow.Add(time.Hour)}
+	},
 }
+
+// probeCRLURL is the URL of a CRL served by the fake world at path.
+func probeCRLURL(path string) string { return "http://crl.test" + path }
 
 func newProbeFakeWorld(t *testing.T) *probeFakeWorld {
 	t.Helper()
@@ -84,6 +96,20 @@ func newProbeFakeWorld(t *testing.T) *probeFakeWorld {
 	mux.Handle("/stale.crl", crl(testpki.CRLSpec{Now: probeNow, Number: 2,
 		ThisUpdate: probeNow.Add(-48 * time.Hour), NextUpdate: probeNow.Add(-24 * time.Hour)}))
 	mux.Handle("/badsig.crl", crl(testpki.CRLSpec{Now: probeNow, Number: 3, Signer: other}))
+	// CRLs the checker rejects although they are signed, fresh and not expired.
+	idp := func(path string, spec testpki.IDPSpec) {
+		if spec.URIs == nil {
+			spec.URIs = []string{probeCRLURL(path)}
+		}
+		mux.Handle(path, crl(testpki.CRLSpec{Now: probeNow, Number: 4, IDP: &spec}))
+	}
+	idp("/idp-match.crl", testpki.IDPSpec{})
+	idp("/idp-reasons.crl", testpki.IDPSpec{OnlySomeReasons: true})
+	idp("/idp-other.crl", testpki.IDPSpec{URIs: []string{probeCRLURL("/other.crl")}})
+	idp("/idp-onlyca.crl", testpki.IDPSpec{OnlyCA: true})
+	idp("/idp-onlyuser.crl", testpki.IDPSpec{OnlyUser: true})
+	mux.Handle("/next-before-this.crl", crl(testpki.CRLSpec{Now: probeNow, Number: 5,
+		ThisUpdate: probeNow.Add(2 * time.Minute), NextUpdate: probeNow.Add(time.Minute)})) // inside the clock skew
 	w.net.Serve(t, "crl.test", mux) // any other path: 404
 	return w
 }
@@ -130,9 +156,9 @@ func TestProbeAgainstFakeNetwork(t *testing.T) {
 			VerdictOK, []string{"p-good ocsp ocsp-good.test/ http=200 ", "outcome=good", `responder="` + respSubject + `"`,
 				"nonce=required/echoed", "thisUpdate=" + probeNow.Add(-time.Minute).Format(time.RFC3339),
 				"nextUpdate=" + probeNow.Add(time.Hour).Format(time.RFC3339)}},
-		{"ocsp good, nonce optional but echoed",
+		{"ocsp good, nonce optional (none sent)",
 			Target{Profile: "p-opt", Kind: KindOCSP, URL: "http://ocsp-good.test/", Issuer: w.ca.Cert, Policy: optional},
-			VerdictOK, []string{"outcome=good", "nonce=optional/echoed"}},
+			VerdictOK, []string{"outcome=good", "nonce=- "}},
 		{"ocsp revoked (never-issued serial)",
 			Target{Profile: "p-rev", Kind: KindOCSP, URL: "http://ocsp-revoked.test/", Issuer: w.ca.Cert, Policy: w.policy},
 			VerdictOK, []string{"outcome=revoked", "nonce=required/echoed", `detail="revoked (reason 6)"`}},
@@ -145,9 +171,9 @@ func TestProbeAgainstFakeNetwork(t *testing.T) {
 		{"ocsp nonce required, not echoed",
 			Target{Profile: "p-nonce", Kind: KindOCSP, URL: "http://ocsp-nononce.test/", Issuer: w.ca.Cert, Policy: w.policy},
 			VerdictFail, []string{"outcome=invalid_evidence", "nonce=required/absent", "nonce sent but not echoed"}},
-		{"ocsp nonce optional, not echoed",
+		{"ocsp nonce optional, none sent",
 			Target{Profile: "p-nonce-opt", Kind: KindOCSP, URL: "http://ocsp-nononce.test/", Issuer: w.ca.Cert, Policy: optional},
-			VerdictOK, []string{"outcome=good", "nonce=optional/absent"}},
+			VerdictOK, []string{"outcome=good", "nonce=- "}},
 		{"ocsp endpoint down",
 			Target{Profile: "p-down", Kind: KindOCSP, URL: "http://ocsp-down.test/", Issuer: w.ca.Cert, Policy: w.policy},
 			VerdictWarn, []string{"p-down ocsp ocsp-down.test/ http=0 ", "outcome=unavailable"}},
@@ -214,13 +240,11 @@ func TestProbeAgainstFakeNetwork(t *testing.T) {
 		t.Error("Failed() = false with FAIL lines")
 	}
 
-	// Every OCSP request carries a nonce and a fresh random 16-byte serial.
+	// Every OCSP request carries a fresh random 16-byte serial; a nonce only
+	// when the profile requires one (TestProbeOCSPNonceMirrorsChecker).
 	serials := map[string]bool{}
 	for host, s := range w.servers {
 		for _, r := range s.Requests() {
-			if r.Nonce == nil {
-				t.Errorf("%s: request without a nonce", host)
-			}
 			if n := len(r.Serial.Bytes()); n != 16 {
 				t.Errorf("%s: serial is %d bytes, want 16", host, n)
 			}
@@ -278,6 +302,139 @@ func TestRunStopsOnCancel(t *testing.T) {
 	var out bytes.Buffer
 	if _, err := run(ctx, nil, w.fetcher(), []Target{tg}, probeNow, &out); !errors.Is(err, context.Canceled) {
 		t.Errorf("run with a cancelled context = %v, want context.Canceled", err)
+	}
+}
+
+// runLines runs targets on the fake network and returns the report lines.
+func (w *probeFakeWorld) runLines(t *testing.T, targets []Target) (Summary, []string) {
+	t.Helper()
+	var out bytes.Buffer
+	sum, err := run(t.Context(), w.checker(t), w.fetcher(), targets, probeNow, &out)
+	if err != nil {
+		t.Fatalf("run: %v\n%s", err, out.String())
+	}
+	lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+	if len(lines) != len(targets)+1 {
+		t.Fatalf("got %d lines, want %d:\n%s", len(lines), len(targets)+1, out.String())
+	}
+	return sum, lines
+}
+
+// TestProbeOCSPNonceMirrorsChecker: the probe sends a nonce only when the
+// profile requires one, as the checker does (U13-FABLE-2). A responder that
+// refuses nonce-less requests is a WARN for a nonce-less profile, as the
+// checker's verdict on a certificate of that profile is unavailable.
+func TestProbeOCSPNonceMirrorsChecker(t *testing.T) {
+	w := newProbeFakeWorld(t)
+	optional := w.policy
+	optional.OCSPNonce = false
+	const responder = "http://ocsp-needs-nonce.test/"
+	_, lines := w.runLines(t, []Target{
+		{Profile: "p-req", Kind: KindOCSP, URL: responder, Issuer: w.ca.Cert, Policy: w.policy},
+		{Profile: "p-opt", Kind: KindOCSP, URL: responder, Issuer: w.ca.Cert, Policy: optional},
+		{Profile: "p-spec", Kind: KindSpecimen, Issuer: w.ca.Cert, Specimen: w.specimen(t, responder), Policy: optional},
+	})
+	want := []struct {
+		verdict Verdict
+		parts   []string
+	}{
+		{VerdictOK, []string{"outcome=good", "nonce=required/echoed"}},
+		{VerdictWarn, []string{"outcome=unavailable", "nonce=- ", "responseStatus 6"}},
+		{VerdictWarn, []string{"outcome=unavailable", "responseStatus 6"}},
+	}
+	for i, wl := range want {
+		if v, _, _ := strings.Cut(lines[i], " "); Verdict(v) != wl.verdict {
+			t.Errorf("line %d verdict = %q, want %q; line %q", i, v, wl.verdict, lines[i])
+		}
+		for _, s := range wl.parts {
+			if !strings.Contains(lines[i], s) {
+				t.Errorf("line %q lacks %q", lines[i], s)
+			}
+		}
+	}
+	reqs := w.servers["ocsp-needs-nonce.test"].Requests()
+	if len(reqs) != 3 || reqs[0].Nonce == nil || reqs[1].Nonce != nil || reqs[2].Nonce != nil {
+		t.Errorf("requests = %+v, want three: a nonce for the required profile only", reqs)
+	}
+}
+
+// TestProbeCRLMatchesChecker: CRL rows are judged by revocation.EvaluateCRL
+// (freshness, IDP name and scope flags), so a CRL the checker rejects is
+// never OK in the probe (U13-FABLE-3).
+func TestProbeCRLMatchesChecker(t *testing.T) {
+	w := newProbeFakeWorld(t)
+	cases := []struct {
+		path    string
+		scope   revocation.Scope
+		verdict Verdict
+		detail  string
+	}{
+		{"/fresh.crl", 0, VerdictOK, "1 entries"}, // zero scope: leaf
+		{"/idp-match.crl", revocation.ScopeLeaf, VerdictOK, "0 entries"},
+		{"/idp-reasons.crl", revocation.ScopeLeaf, VerdictFail, "idp scope flag unsupported"},
+		{"/idp-other.crl", revocation.ScopeLeaf, VerdictFail, "idp distributionPoint does not match"},
+		{"/next-before-this.crl", revocation.ScopeLeaf, VerdictFail, "crl nextUpdate before thisUpdate"},
+		{"/idp-onlyca.crl", revocation.ScopeLeaf, VerdictFail, "idp onlyContainsCACerts for a leaf"},
+		{"/idp-onlyca.crl", revocation.ScopeCA, VerdictOK, "0 entries"},
+		{"/idp-onlyuser.crl", revocation.ScopeCA, VerdictFail, "idp onlyContainsUserCerts for a CA"},
+	}
+	targets := make([]Target, 0, len(cases))
+	for _, c := range cases {
+		targets = append(targets, Target{Profile: "p", Kind: KindCRL, URL: probeCRLURL(c.path), Issuer: w.ca.Cert, Policy: w.policy, Scope: c.scope})
+	}
+	_, lines := w.runLines(t, targets)
+	rc := w.checker(t)
+	for i, c := range cases {
+		line := lines[i]
+		if v, _, _ := strings.Cut(line, " "); Verdict(v) != c.verdict {
+			t.Errorf("%s scope %d: verdict = %q, want %q; line %q", c.path, c.scope, v, c.verdict, line)
+		}
+		if !strings.Contains(line, `detail="`+c.detail) {
+			t.Errorf("%s scope %d: line %q lacks detail %q", c.path, c.scope, line, c.detail)
+		}
+		if c.scope == revocation.ScopeCA {
+			continue
+		}
+		// The checker on a leaf whose only revocation source is this CRL agrees.
+		leaf := w.ca.Leaf(t, testpki.CertSpec{Now: probeNow, Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, "probe crl leaf")},
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, CDP: []testpki.DistributionPoint{{URIs: []string{probeCRLURL(c.path)}}}}).Cert
+		res, err := rc.Check(t.Context(), leaf, w.ca.Cert, w.policy)
+		if err != nil {
+			t.Fatalf("Check: %v", err)
+		}
+		if ok := res.Status == revocation.StatusGood; ok != (c.verdict == VerdictOK) {
+			t.Errorf("%s: checker status %s (%s), probe verdict %s", c.path, res.Status, res.Detail, c.verdict)
+		}
+	}
+}
+
+// TestRunNothingVerifiedFails: a run whose lines are all WARN verified
+// nothing and fails (U13-FABLE-4).
+func TestRunNothingVerifiedFails(t *testing.T) {
+	w := newProbeFakeWorld(t)
+	sum, lines := w.runLines(t, []Target{
+		{Profile: "p-down", Kind: KindOCSP, URL: "http://ocsp-down.test/", Issuer: w.ca.Cert, Policy: w.policy},
+		{Profile: "p-404", Kind: KindCRL, URL: probeCRLURL("/missing.crl"), Issuer: w.ca.Cert, Policy: w.policy},
+	})
+	if sum != (Summary{Warn: 2}) || !sum.Failed() {
+		t.Errorf("summary = %+v, Failed() = %v; want 2 warn and failed", sum, sum.Failed())
+	}
+	if got, want := lines[len(lines)-1], "summary: 0 ok, 2 warn, 0 fail (no endpoint verified)"; got != want {
+		t.Errorf("summary line = %q, want %q", got, want)
+	}
+	for _, c := range []struct {
+		sum  Summary
+		want bool
+	}{
+		{Summary{}, false},
+		{Summary{OK: 1}, false},
+		{Summary{OK: 1, Warn: 5}, false},
+		{Summary{Warn: 1}, true},
+		{Summary{OK: 3, Fail: 1}, true},
+	} {
+		if got := c.sum.Failed(); got != c.want {
+			t.Errorf("%+v.Failed() = %v, want %v", c.sum, got, c.want)
+		}
 	}
 }
 
@@ -380,8 +537,16 @@ func TestDefaultTargets(t *testing.T) {
 		}
 	}
 
-	// DNIe: OCSP per pinned intermediate, the root CRL and ARL against the root.
+	// DNIe: OCSP per pinned intermediate, the root CRL and ARL against the
+	// root at CA scope (they cover the intermediates); every other CRL at leaf scope.
 	for _, tg := range targets {
+		wantScope := revocation.ScopeLeaf
+		if tg.Profile == "dnie-auth" {
+			wantScope = revocation.ScopeCA
+		}
+		if tg.Kind == KindCRL && tg.Scope != wantScope {
+			t.Errorf("%s %s: scope %d, want %d", tg.Profile, tg.URL, tg.Scope, wantScope)
+		}
 		if tg.Profile != "dnie-auth" {
 			continue
 		}
@@ -415,5 +580,90 @@ func TestLoadSpecimens(t *testing.T) {
 
 	if _, err := LoadSpecimens(fstest.MapFS{"bad.pem": {Data: []byte("not a certificate")}}); err == nil {
 		t.Error("LoadSpecimens accepted a .pem file without a certificate")
+	}
+}
+
+// TestLoadSpecimensUnreadableDir: a specimen directory that does not exist,
+// is not a directory or cannot be read is an error, not an empty list
+// (U13-FABLE-1: fs.Glob ignores I/O errors).
+func TestLoadSpecimensUnreadableDir(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "file.pem")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sub, err := fs.Sub(fstest.MapFS{"a.pem": {Data: []byte("x")}}, "a.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]fs.FS{
+		"missing directory": os.DirFS(filepath.Join(dir, "missing")),
+		"a file":            os.DirFS(file),
+		"empty root":        os.DirFS(""),
+		"a MapFS file":      sub,
+	}
+	if os.Geteuid() != 0 { // root reads a mode-0 directory
+		locked := filepath.Join(dir, "locked")
+		if err := os.Mkdir(locked, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(locked, 0o700) }) // let TempDir remove it
+		cases["unreadable directory"] = os.DirFS(locked)
+	}
+	for name, fsys := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got, err := LoadSpecimens(fsys); err == nil {
+				t.Errorf("LoadSpecimens = %d targets, nil; want an error", len(got))
+			}
+		})
+	}
+}
+
+// countingFS serves a MapFS through Open and Stat only (no ReadFile),
+// counting the files opened and the bytes read.
+type countingFS struct {
+	m      fstest.MapFS
+	opened []string
+	read   int
+}
+
+func (c *countingFS) Open(name string) (fs.File, error) {
+	f, err := c.m.Open(name)
+	if err != nil || name == "." {
+		return f, err
+	}
+	c.opened = append(c.opened, name)
+	return countingFile{File: f, n: &c.read}, nil
+}
+
+func (c *countingFS) Stat(name string) (fs.FileInfo, error) { return c.m.Stat(name) }
+
+type countingFile struct {
+	fs.File
+	n *int
+}
+
+func (f countingFile) Read(p []byte) (int, error) {
+	n, err := f.File.Read(p)
+	*f.n += n
+	return n, err
+}
+
+// TestLoadSpecimensBounded: a specimen read stops at maxSpecimenBytes and
+// a non-regular *.pem (a FIFO would block) is rejected unopened (U13-FABLE-10).
+func TestLoadSpecimensBounded(t *testing.T) {
+	large := &countingFS{m: fstest.MapFS{"big.pem": {Data: bytes.Repeat([]byte("A"), 1<<20)}}}
+	if _, err := LoadSpecimens(large); err == nil {
+		t.Error("LoadSpecimens accepted a 1 MiB .pem file")
+	}
+	if large.read > maxSpecimenBytes+1 {
+		t.Errorf("read %d bytes of a 1 MiB file, want at most %d", large.read, maxSpecimenBytes+1)
+	}
+	fifo := &countingFS{m: fstest.MapFS{"fifo.pem": {Data: []byte("x"), Mode: fs.ModeNamedPipe}}}
+	if _, err := LoadSpecimens(fifo); err == nil {
+		t.Error("LoadSpecimens accepted a named pipe")
+	}
+	if len(fifo.opened) != 0 {
+		t.Errorf("opened %q, want the named pipe left unopened", fifo.opened)
 	}
 }

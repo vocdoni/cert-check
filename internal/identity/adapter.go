@@ -4,7 +4,10 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"errors"
+	"slices"
 	"strings"
+	"time"
+	"unicode"
 )
 
 // Subject attribute OIDs used by adapters.
@@ -63,7 +66,8 @@ type BirthDateRule int
 const (
 	// BirthDateNone: SDA is ignored; a malformed SDA is noted, not an error.
 	BirthDateNone BirthDateRule = iota + 1
-	// BirthDateOptional: dateOfBirth from SDA when present; malformed → ErrInvalid.
+	// BirthDateOptional: dateOfBirth from SDA when present; malformed or
+	// later than the certificate NotBefore → ErrInvalid.
 	BirthDateOptional
 )
 
@@ -90,15 +94,28 @@ type Adapter struct {
 	Organization         OrganizationRule
 }
 
-// Validate checks the adapter declaration. Every returned error wraps
-// ErrInvalid (ruling R54).
+// Validate checks the adapter declaration: every rule is set and known, and
+// every field Extract relies on is present (R5.4). Every returned error
+// wraps ErrInvalid (ruling R54).
 func (a Adapter) Validate() error {
 	var errs []error
 	if len(a.Documents) == 0 {
 		errs = append(errs, invalidf("adapter has no document rules"))
 	}
-	if a.Surnames == 0 || a.SAN.Kind == 0 || a.BirthDate == 0 || a.Organization == 0 {
-		errs = append(errs, invalidf("adapter has unset rules"))
+	if a.Surnames < SurnamesFromSN || a.Surnames > SurnamesDNIeCN {
+		errs = append(errs, invalidf("adapter surname rule unset or unknown"))
+	}
+	if a.SAN.Kind < SANNone || a.SAN.Kind > SANPipeCN {
+		errs = append(errs, invalidf("adapter SAN kind unset or unknown"))
+	}
+	if a.BirthDate < BirthDateNone || a.BirthDate > BirthDateOptional {
+		errs = append(errs, invalidf("adapter birth date rule unset or unknown"))
+	}
+	if a.Organization < OrganizationNone || a.Organization > OrganizationFromSubject {
+		errs = append(errs, invalidf("adapter organization rule unset or unknown"))
+	}
+	if a.SAN.Kind == SANAttributes && a.SAN.FirstSurnameOID == nil {
+		errs = append(errs, invalidf("adapter SANAttributes needs FirstSurnameOID"))
 	}
 	if a.SAN.Kind == SANPipeCN && a.SAN.DocumentOID == nil {
 		errs = append(errs, invalidf("adapter SANPipeCN needs DocumentOID"))
@@ -106,7 +123,26 @@ func (a Adapter) Validate() error {
 	if a.SAN.DocumentOID != nil && len(a.SAN.DocumentRules) == 0 {
 		errs = append(errs, invalidf("adapter SAN document without rules"))
 	}
+	for _, r := range slices.Concat(a.Documents, a.SAN.DocumentRules) {
+		if !validRule(r) {
+			errs = append(errs, invalidf("adapter document rule has an unknown encoding or no known types"))
+		}
+	}
+	if a.Kinds != nil && (len(a.Kinds) == 0 || slices.ContainsFunc(a.Kinds, func(k StringKind) bool { return k < KindUTF8 || k > KindIA5 })) {
+		errs = append(errs, invalidf("adapter kinds empty or outside KindUTF8..KindIA5"))
+	}
 	return errors.Join(errs...)
+}
+
+// validRule reports whether r has a known encoding and at least one document
+// type, all of them known.
+func validRule(r DocumentRule) bool {
+	switch r.Encoding {
+	case EncodingIDCES, EncodingPNOES, EncodingBare:
+	default:
+		return false
+	}
+	return len(r.Types) > 0 && !slices.ContainsFunc(r.Types, func(t DocumentType) bool { return t != DocumentDNI && t != DocumentNIE })
 }
 
 // Identity is the typed identity extracted from validated fields.
@@ -220,6 +256,11 @@ func (a Adapter) Extract(cert *x509.Certificate) (Extracted, error) {
 	if err := a.crossCheckSAN(cert, &id, kinds); err != nil {
 		return Extracted{}, err
 	}
+	for _, s := range []string{id.FirstSurname, id.SecondSurname} {
+		if s != "" && !hasLetter(s) {
+			return Extracted{}, invalidf("surname without a letter")
+		}
+	}
 
 	out := Extracted{}
 	switch a.BirthDate {
@@ -229,6 +270,10 @@ func (a Adapter) Extract(cert *x509.Certificate) (Extracted, error) {
 			return Extracted{}, err
 		}
 		if found {
+			// R10.2: nobody is certified before birth.
+			if time.Date(d.Year, d.Month, d.Day, 0, 0, 0, 0, time.UTC).After(cert.NotBefore) {
+				return Extracted{}, invalidf("sda: dateOfBirth later than the certificate validity start")
+			}
 			id.BirthDate = &d
 			src["birthDate"] = "sda.1.3.6.1.5.5.7.9.1"
 		}
@@ -250,7 +295,8 @@ func (a Adapter) Extract(cert *x509.Certificate) (Extracted, error) {
 		if err != nil {
 			return Extracted{}, err
 		}
-		out.Organization = &Organization{Name: NormalizeName(name), Identifier: strings.TrimSpace(ident)}
+		ident = NormalizeName(ident)
+		out.Organization = &Organization{Name: NormalizeName(name), Identifier: ident}
 		src["organization"] = "subject.2.5.4.10"
 		if ident != "" {
 			src["organizationIdentifier"] = "subject.2.5.4.97"
@@ -268,13 +314,18 @@ func requiredName(n Name, oid asn1.ObjectIdentifier, kinds KindSet) (string, err
 		return "", err
 	}
 	v = NormalizeName(v)
-	if !ok || v == "" {
-		return "", invalidf("subject %s absent or empty", oid)
+	if !ok || !hasLetter(v) {
+		return "", invalidf("subject %s absent, empty or without a letter", oid)
 	}
 	return v, nil
 }
 
-// dnieSurnames applies the DNIe CN grammar against the known SN and GN.
+// hasLetter reports whether s holds a letter. checkText has already rejected
+// the invisible ones (the Hangul fillers), so the letter is visible (R5.1).
+func hasLetter(s string) bool { return strings.IndexFunc(s, unicode.IsLetter) >= 0 }
+
+// dnieSurnames applies the DNIe CN grammar against the known SN and GN. The
+// surnames must be a normalised word sequence without ',' or parentheses.
 func dnieSurnames(cn, sn, given string) (string, error) {
 	var rest string
 	var ok bool
@@ -289,6 +340,9 @@ func dnieSurnames(cn, sn, given string) (string, error) {
 	full, ok := strings.CutSuffix(rest, ", "+given)
 	if !ok {
 		return "", invalidf("DNIe CN given name does not match GN")
+	}
+	if full != NormalizeName(full) || strings.ContainsAny(full, ",()") {
+		return "", invalidf("DNIe CN surnames are not a plain word sequence")
 	}
 	if full != sn && !strings.HasPrefix(full, sn+" ") {
 		return "", invalidf("DNIe CN surnames do not start with SN")

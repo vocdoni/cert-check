@@ -113,13 +113,14 @@ func (a *App) handleRedeem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error",
 			"error": apiError{Code: "invalid_or_expired", Message: message("invalid_or_expired")}, "diagnostics": diag})
 	}
-	cookie, ok := txCookie(r)
-	if !ok {
-		invalid("cookie_missing")
-		return
-	}
+	// Redeem even without a cookie: every attempt spends the code, and an
+	// empty cookie never matches.
+	cookie, hasCookie := txCookie(r)
 	o, err := a.store.Redeem(Secret(body.Code), cookie)
 	switch {
+	case !hasCookie:
+		invalid("cookie_missing")
+		return
 	case errors.Is(err, ErrCookie):
 		invalid("cookie_mismatch")
 		return

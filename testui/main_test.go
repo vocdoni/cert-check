@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -44,6 +45,7 @@ func TestProbeSubcommandDispatch(t *testing.T) {
 		{"clean probe", []string{"probe"}, probe.Summary{OK: 3, Warn: 1}, nil, true, []string{}, 0, ""},
 		{"specimen directories", []string{"probe", "dir-a", "dir-b"}, probe.Summary{OK: 1}, nil, true, []string{"dir-a", "dir-b"}, 0, ""},
 		{"a FAIL line", []string{"probe"}, probe.Summary{OK: 2, Fail: 1}, nil, true, []string{}, 1, ""},
+		{"only WARN lines: nothing verified", []string{"probe"}, probe.Summary{Warn: 2}, nil, true, []string{}, 1, ""},
 		{"probe error", []string{"probe"}, probe.Summary{}, errProbe, true, []string{}, 1, "probe broke"},
 		{"no subcommand serves (configuration error)", nil, probe.Summary{}, nil, false, nil, 1, "configuration"},
 	}
@@ -74,6 +76,30 @@ func TestProbeSubcommandDispatch(t *testing.T) {
 			}
 			if !strings.Contains(stderr.String(), c.wantErr) {
 				t.Errorf("stderr = %q, want it to contain %q", stderr.String(), c.wantErr)
+			}
+		})
+	}
+}
+
+// TestProbeSpecimenDirErrors: a specimen directory that cannot be read or
+// holds no known live specimen fails the probe before any target is probed
+// (U13-FABLE-1), with the directory named on stderr.
+func TestProbeSpecimenDirErrors(t *testing.T) {
+	dir := t.TempDir()
+	for name, d := range map[string]string{
+		"missing directory": filepath.Join(dir, "missing"),
+		"no known specimen": dir,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr strings.Builder
+			if got := dispatch([]string{"probe", "../testdata/specimens", d}, func(string) string { return "" }, runProbe, &stdout, &stderr); got != 1 {
+				t.Errorf("exit = %d, want 1", got)
+			}
+			if !strings.Contains(stderr.String(), d) {
+				t.Errorf("stderr = %q, want it to name %s", stderr.String(), d)
+			}
+			if stdout.Len() != 0 {
+				t.Errorf("stdout = %q, want nothing probed", stdout.String())
 			}
 		})
 	}

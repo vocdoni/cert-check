@@ -508,6 +508,38 @@ func TestCheckCodes(t *testing.T) {
 	}
 }
 
+// TestVerifyCanceledContextWithGoodCache: cached good evidence answers
+// without a fetch, yet a cancelled or expired validation is never a success
+// (the Provider contract: a deadline hit is a retryable internal error).
+func TestVerifyCanceledContextWithGoodCache(t *testing.T) {
+	t.Parallel()
+	w := newCodeWorld(t)
+	leaf := w.leaf(t, w.rootA, nil)
+	if _, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf}); err != nil {
+		t.Fatalf("first VerifyAs = %v, want success (caches the good OCSP response)", err)
+	}
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	expired, cancel2 := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel2()
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{"canceled", canceled},
+		{"deadline exceeded", expired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := w.chk.VerifyAs(tc.ctx, "alpha", []*x509.Certificate{leaf})
+			e := tErr(t, err)
+			if res != nil || e.Code != CodeInternal || !e.Retryable || e.Diagnostics.FailedStep != StepRevocation {
+				t.Errorf("got (%v, %s at %s, retryable %v); want (nil, %s at %s, true)", res, e.Code, e.Diagnostics.FailedStep, e.Retryable,
+					CodeInternal, StepRevocation)
+			}
+		})
+	}
+}
+
 func TestRetryableCodes(t *testing.T) {
 	retryable := []ErrorCode{CodeRevocationUnavailable, CodeInternal}
 	seen := map[ErrorCode]bool{}
@@ -540,6 +572,33 @@ func TestNewCheckerOptions(t *testing.T) {
 	unparsed.HandledCriticalExtensions = []string{"1.3.6.1.4.1.99999.3.9"}
 	declUnparsed := profiles.Provider{ID: "opt", Name: "Opt", Profiles: []profiles.Profile{unparsed}}
 
+	// A profile disabled at load (anchor not yet valid) still has its handled
+	// extensions checked: enabling it later must not fail at startup.
+	futureRoot := testpki.NewRoot(t, "Options Future Root", testpki.CertSpec{Now: now, NotBefore: now.Add(24 * time.Hour), NotAfter: now.AddDate(1, 0, 0),
+		KeyPair: tKey(t, "opt-future", testpki.ECDSAP256)})
+	future := unparsed
+	future.ID, future.Anchors = "opt-future", []profiles.Anchor{profiles.TestAnchor(futureRoot.Cert)}
+	declFuture := profiles.Provider{ID: "opt", Name: "Opt", Profiles: []profiles.Profile{prof, future}}
+
+	// A cross-certificate of root (same subject and key, issued by crossRoot)
+	// pinned as an intermediate of a second profile with the same policy OID:
+	// a leaf issued by root would match both profiles. The registry rejects
+	// the declaration, so step 4's "more than one profile" branch stays unreachable.
+	crossRoot := testpki.NewRoot(t, "Options Cross Root", testpki.CertSpec{Now: now, KeyPair: tKey(t, "opt-cross", testpki.ECDSAP256)})
+	cross := crossRoot.Intermediate(t, "Options Root", testpki.CertSpec{Now: now, KeyPair: root.Key})
+	viaCross := prof
+	viaCross.ID, viaCross.Anchors = "opt-x", []profiles.Anchor{profiles.TestAnchor(crossRoot.Cert)}
+	viaCross.Intermediates = []profiles.Anchor{profiles.TestAnchor(cross.Cert)}
+	declCross := profiles.Provider{ID: "opt", Name: "Opt", Profiles: []profiles.Profile{prof, viaCross}}
+	crossRoots, crossInter := x509.NewCertPool(), x509.NewCertPool()
+	crossRoots.AddCert(crossRoot.Cert)
+	crossInter.AddCert(cross.Cert)
+	crossLeaf := root.Leaf(t, testpki.CertSpec{Now: now, Subject: tPerson("IDCES-"+cwDNI, cwGiven, cwSurnames),
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}).Cert
+	if _, err := crossLeaf.Verify(verifyOptions(crossRoots, crossInter, now)); err != nil {
+		t.Fatalf("fixture: a leaf of root does not chain through the cross-certificate: %v", err)
+	}
+
 	for _, tc := range []struct {
 		name string
 		cfg  Config
@@ -548,6 +607,9 @@ func TestNewCheckerOptions(t *testing.T) {
 		{"invalid declaration", Config{Revocation: rc}, "invalid provider"},
 		{"no revocation", Config{Provider: decl}, "required"},
 		{"handled extension without a parser", Config{Provider: declUnparsed, Revocation: rc}, "opt-a handles 1.3.6.1.4.1.99999.3.9 without a parser"},
+		{"handled extension without a parser on a disabled profile", Config{Provider: declFuture, Revocation: rc, Logger: tDiscard},
+			"opt-future handles 1.3.6.1.4.1.99999.3.9 without a parser"},
+		{"cross-signed pinned intermediate with a shared OID", Config{Provider: declCross, Revocation: rc}, "opt-a and opt-x share an anchor and policy 1.3.6.1.4.1.99999.3.1"},
 		{"defaults", Config{Provider: decl, Revocation: rc}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

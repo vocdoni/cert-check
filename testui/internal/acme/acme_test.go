@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -178,6 +179,10 @@ func TestNewACMEConfig(t *testing.T) {
 			if provider.APIToken != testToken {
 				t.Errorf("APIToken = %q, want the configured token", provider.APIToken)
 			}
+			// Without a timeout libdns/cloudflare uses http.DefaultClient (U12-ASTRA-2).
+			if client, ok := provider.HTTPClient.(*http.Client); !ok || client.Timeout != 30*time.Second {
+				t.Errorf("HTTPClient = %#v, want an *http.Client with a 30s timeout", provider.HTTPClient)
+			}
 			if solver.OverrideDomain != tc.override {
 				t.Errorf("OverrideDomain = %q, want %q", solver.OverrideDomain, tc.override)
 			}
@@ -215,6 +220,41 @@ func TestObtainBackoffSchedule(t *testing.T) {
 	m := newTestACME(t, validOptions(t))
 	if !slices.Equal(m.backoff, want) {
 		t.Errorf("Manager backoff = %v, want %v", m.backoff, want)
+	}
+	if m.attempt != 5*time.Minute {
+		t.Errorf("Manager attempt = %v, want 5m", m.attempt)
+	}
+}
+
+// TestRunBoundsEachAttempt: a stalled attempt ends at its deadline and Run
+// goes on retrying (U12-ASTRA-2).
+func TestRunBoundsEachAttempt(t *testing.T) {
+	m := newTestACME(t, validOptions(t))
+	m.backoff = []time.Duration{time.Millisecond}
+	m.attempt = 50 * time.Millisecond
+	var calls int
+	m.manage = func(ctx context.Context, _ []string) error {
+		calls++
+		if _, ok := ctx.Deadline(); !ok {
+			t.Errorf("attempt %d has no deadline", calls)
+		}
+		if calls == 1 { // stalls, as a Cloudflare call without a timeout would
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+				t.Error("the stalled attempt was not cancelled within 5s")
+				return errors.New("stalled")
+			}
+		}
+		_, err := m.cfg.CacheUnmanagedTLSCertificate(ctx, wildcardCert(t), nil)
+		return err
+	}
+	if err := m.Run(t.Context()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls != 2 || !m.Ready() {
+		t.Errorf("calls = %d, Ready() = %v, want 2, true", calls, m.Ready())
 	}
 }
 
@@ -307,6 +347,7 @@ func TestReadyACMERequiresValidCertificate(t *testing.T) {
 	}{
 		{"valid wildcard", wildcardCert(t), true},
 		{"expired wildcard", selfSigned(t, now.Add(-48*time.Hour), now.Add(-time.Hour), "*."+testDomain), false},
+		{"not yet valid wildcard", selfSigned(t, now.Add(time.Hour), now.Add(48*time.Hour), "*."+testDomain), false},
 		{"other name", selfSigned(t, now.Add(-time.Hour), now.Add(time.Hour), "*.other.example.test"), false},
 	}
 	for _, tc := range tests {
@@ -369,6 +410,33 @@ func TestStatic(t *testing.T) {
 		m := NewStatic(selfSigned(t, now.Add(-48*time.Hour), now.Add(-time.Hour), testDomain))
 		if m.Ready() {
 			t.Error("Ready() = true for an expired certificate, want false")
+		}
+	})
+
+	// Readiness needs NotBefore <= now < NotAfter; a nil Leaf is parsed (U12-ASTRA-6).
+	t.Run("validity", func(t *testing.T) {
+		now := time.Now()
+		withoutLeaf := func(c tls.Certificate) tls.Certificate {
+			c.Leaf = nil
+			return c
+		}
+		tests := []struct {
+			name string
+			cert tls.Certificate
+			want bool
+		}{
+			{"not yet valid", selfSigned(t, now.Add(time.Hour), now.Add(48*time.Hour), testDomain), false},
+			{"expired without leaf", withoutLeaf(selfSigned(t, now.Add(-48*time.Hour), now.Add(-time.Hour), testDomain)), false},
+			{"not yet valid without leaf", withoutLeaf(selfSigned(t, now.Add(time.Hour), now.Add(48*time.Hour), testDomain)), false},
+			{"valid without leaf", withoutLeaf(selfSigned(t, now.Add(-time.Hour), now.Add(time.Hour), testDomain)), true},
+			{"no certificate", tls.Certificate{}, false},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				if got := NewStatic(tc.cert).Ready(); got != tc.want {
+					t.Errorf("Ready() = %v, want %v", got, tc.want)
+				}
+			})
 		}
 	})
 

@@ -257,6 +257,31 @@ func nameFieldTextCases(tb testing.TB) []fieldCase {
 		{name: "decomposed accents", der: utf8("PEN\u0303A GU\u0308ELL"), oid: oidGN, kinds: k, want: "PEN\u0303A GU\u0308ELL", found: true},
 		{name: "teletex Latin-1 letters", der: nameDER(atvDER(tb, oidGN, testpki.TagTeletex, []byte("PE\xd1A \xc7\xc0\xdc\xb7L'O-K"))), oid: oidGN, kinds: all, want: "PEÑA ÇÀÜ·L'O-K", found: true},
 		{name: "bmp Spanish letters", der: bmp('P', 'E', 0x00d1, 'A', ' ', 0x00b7), oid: oidGN, kinds: all, want: "PEÑA ·", found: true},
+		{name: "decomposed Catalan lower case", der: utf8(decomposedCatalan), oid: oidGN, kinds: k, want: decomposedCatalan, found: true},
+
+		// R10.1 (U6-FABLE-1): Latin letters mixed with Cyrillic or Greek
+		// homoglyphs are rejected; a value wholly in one script is not.
+		{name: "Latin with Cyrillic capital A U+0410", der: utf8("PRUEB\u0410S"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "mixed scripts", values: []string{"PRUEB\u0410S"}},
+		{name: "Latin with Cyrillic small a U+0430", der: utf8("Ju\u0430n"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "mixed scripts", values: []string{"Ju\u0430n"}},
+		{name: "Latin with Greek capital alpha U+0391", der: utf8("JU\u0391N"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "mixed scripts", values: []string{"JU\u0391N"}},
+		{name: "Latin and Cyrillic in separate words", der: utf8("JUAN \u0418\u0412\u0410\u041d"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "mixed scripts"},
+		{name: "wholly Cyrillic", der: utf8("ИВАН ПЕТРОВ"), oid: oidGN, kinds: k, want: "ИВАН ПЕТРОВ", found: true},
+		{name: "wholly Greek", der: utf8("ΓΙΩΡΓΟΣ"), oid: oidGN, kinds: k, want: "ΓΙΩΡΓΟΣ", found: true},
+
+		// R10.3 (U6-FABLE-3): overlong and out-of-range UTF-8 is rejected.
+		{name: "overlong 2-byte U+0020", der: utf8("JU\xc0\xa0AN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xc0\xa0AN"}},
+		{name: "overlong 3-byte U+002F", der: utf8("JU\xe0\x80\xafAN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xe0\x80\xafAN"}},
+		{name: "overlong 4-byte U+002F", der: utf8("JU\xf0\x80\x80\xafAN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xf0\x80\x80\xafAN"}},
+		{name: "beyond U+10FFFF", der: utf8("JU\xf4\x90\x80\x80AN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xf4\x90\x80\x80AN"}},
+
+		// R5.1: a run of more than 4 combining marks is rejected; x/text
+		// itself inserts U+034F after 30 non-starters.
+		{name: "four combining marks", der: utf8(combiningRun(4)), oid: oidGN, kinds: k, want: combiningRun(4), found: true},
+		{name: "five combining marks", der: utf8(combiningRun(5)), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "too many combining marks", values: []string{combiningRun(5)}},
+		{name: "31 combining marks", der: utf8(combiningRun(31)), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "too many combining marks", values: []string{combiningRun(31)}},
+		{name: "five combining marks of mixed classes", der: utf8("JU\u0301\u0903\u0302\u20dd\u0303AN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "too many combining marks"},
+		{name: "two runs of four combining marks", der: utf8("JU\u0301\u0302\u0303\u0308A\u0301\u0302\u0303\u0308N"), oid: oidGN, kinds: k,
+			want: "JU\u0301\u0302\u0303\u0308A\u0301\u0302\u0303\u0308N", found: true},
 	}
 	for _, ic := range invisibleChars {
 		v := "JU" + string(ic.r) + "AN"
@@ -268,6 +293,13 @@ func nameFieldTextCases(tb testing.TB) []fieldCase {
 // spanishNames exercises every non-ASCII letter class a Spanish or Catalan
 // name uses; ruling R53 must keep accepting it.
 const spanishNames = "MARÍA ÀNGELS D'ARBÓS-GÜELL PEÑA COL·LEGI ÇALÓ"
+
+// decomposedCatalan is lower-case Catalan and Spanish in NFD: ç, ó, l·l, ñ,
+// ú, à and an apostrophe.
+const decomposedCatalan = "c\u0327alo\u0301 col·l n\u0303u\u0301ria d'a\u0300ngels"
+
+// combiningRun returns "JUA", n combining acute accents, then "N".
+func combiningRun(n int) string { return "JUA" + strings.Repeat("\u0301", n) + "N" }
 
 // invisibleChars has at least one code point per class rejected by ruling
 // R53, with the rule its error must name.
@@ -304,6 +336,17 @@ var invisibleChars = []struct {
 	{"Zs narrow no-break space U+202F", 0x202f, "space other than U+0020"},
 	{"Zs medium math space U+205F", 0x205f, "space other than U+0020"},
 	{"Zs ideographic space U+3000", 0x3000, "space other than U+0020"},
+	// U6-ASTRA-1: invisible code points outside Cf. ComparisonKey drops the
+	// Mn ones, so before R5.1 they also survived the SAN consistency check.
+	{"Mn combining grapheme joiner U+034F", 0x034f, "default-ignorable character"},
+	{"Lo Hangul choseong filler U+115F", 0x115f, "default-ignorable character"},
+	{"Lo Hangul filler U+3164", 0x3164, "default-ignorable character"},
+	{"Mn variation selector-16 U+FE0F", 0xfe0f, "variation selector"},
+	{"Mn Mongolian free variation selector U+180B", 0x180b, "variation selector"},
+	{"Mn variation selector-17 U+E0100", 0xe0100, "variation selector"},
+	// R10.1 (U6-FABLE-1): symbols that render as a blank.
+	{"So Braille pattern blank U+2800", 0x2800, "blank symbol"},
+	{"So object replacement character U+FFFC", 0xfffc, "blank symbol"},
 }
 
 func TestNameFieldText(t *testing.T) { runFieldCases(t, nameFieldTextCases(t)) }

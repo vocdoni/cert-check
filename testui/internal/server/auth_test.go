@@ -1,8 +1,12 @@
 package server
 
 import (
+	"bufio"
+	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,7 +22,8 @@ import (
 	certcheck "github.com/vocdoni/cert-check"
 )
 
-// authListenerHeaders are set on every auth-listener response.
+// authListenerHeaders are set on every auth-listener response, as is
+// Connection: close, which the client turns into Response.Close.
 var authListenerHeaders = map[string]string{
 	"Content-Security-Policy":   "default-src 'none'; frame-ancestors 'none'",
 	"Referrer-Policy":           "no-referrer",
@@ -29,17 +34,22 @@ var authListenerHeaders = map[string]string{
 }
 
 var (
-	codeLocationRe    = regexp.MustCompile(`^https://check\.test/#code=([A-Za-z0-9_-]{43})$`)
-	invalidLocationRe = regexp.MustCompile(`^https://check\.test/#error=invalid_state&diag=([0-9a-f]{32})$`)
+	codeLocationRe     = regexp.MustCompile(`^https://check\.test/#code=([A-Za-z0-9_-]{43})$`)
+	invalidLocationRe  = regexp.MustCompile(`^https://check\.test/#error=invalid_state&diag=([0-9a-f]{32})$`)
+	internalLocationRe = regexp.MustCompile(`^https://check\.test/#error=internal&diag=([0-9a-f]{32})$`)
 )
 
-// checkAuthResponse asserts the status, the auth-listener headers and an empty body (ruling R37).
+// checkAuthResponse asserts the status, the auth-listener headers, the
+// connection close (U11-FABLE-2) and an empty body (ruling R37).
 func checkAuthResponse(t *testing.T, resp *http.Response, body []byte, status int) {
 	t.Helper()
 	if resp.StatusCode != status {
 		t.Errorf("status = %d, want %d", resp.StatusCode, status)
 	}
 	checkHeaders(t, resp.Header, authListenerHeaders)
+	if !resp.Close {
+		t.Error("the response keeps the connection open, want Connection: close")
+	}
 	if len(body) != 0 {
 		t.Errorf("body = %q, want empty (the auth listener renders nothing)", body)
 	}
@@ -127,6 +137,15 @@ func TestAuthInvalidState(t *testing.T) {
 			s := stateOf(t, authURL)
 			return authURL + "&state=" + string(s), s
 		}},
+		// A malformed pair must not hide a second state (U11-ASTRA-3).
+		{"duplicated with a bad escape", func(t *testing.T) (string, Secret) {
+			authURL, _ := w.createTx(t, "alpha")
+			return authURL + "&state=%ZZ", stateOf(t, authURL)
+		}},
+		{"duplicated with a semicolon", func(t *testing.T) (string, Secret) {
+			authURL, _ := w.createTx(t, "alpha")
+			return authURL + "&state=a;b", stateOf(t, authURL)
+		}},
 		{"wrong provider", func(t *testing.T) (string, Secret) {
 			authURL, _ := w.createTx(t, "beta")
 			s := stateOf(t, authURL)
@@ -159,8 +178,9 @@ func TestAuthInvalidState(t *testing.T) {
 					continue
 				}
 				found = true
-				if r["level"] != "WARN" || r["sni"] != srvAlphaHost || r["reason"] == "" || r["reason"] == nil {
-					t.Errorf("log line = %v, want level WARN, sni %q and a reason", r, srvAlphaHost)
+				// INFO: a bad state is user error or scanner noise (U11-FABLE-2).
+				if r["level"] != "INFO" || r["sni"] != srvAlphaHost || r["reason"] == "" || r["reason"] == nil {
+					t.Errorf("log line = %v, want level INFO, sni %q and a reason", r, srvAlphaHost)
 				}
 			}
 			if !found {
@@ -339,6 +359,9 @@ func TestLimitListener(t *testing.T) {
 	if n != 0 || err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("third connection: Read = (%d, %v), want (0, EOF or reset) before any byte", n, err)
 	}
+	if got := ln.dropped.Load(); got != 1 {
+		t.Errorf("dropped = %d, want 1 (U11-FABLE-4)", got)
+	}
 	select {
 	case <-accepted:
 		t.Fatal("the third connection reached Accept's caller")
@@ -358,7 +381,7 @@ func TestAuthServerHTTP11Only(t *testing.T) {
 		t.Errorf("TLSNextProto = %v, want a non-nil empty map", srv.TLSNextProto)
 	}
 	for name, c := range map[string]struct{ got, want time.Duration }{
-		"ReadHeaderTimeout": {srv.ReadHeaderTimeout, 10 * time.Second},
+		"ReadHeaderTimeout": {srv.ReadHeaderTimeout, 5 * time.Second}, // also the TLS handshake bound (U11-FABLE-4)
 		"ReadTimeout":       {srv.ReadTimeout, 30 * time.Second},
 		"WriteTimeout":      {srv.WriteTimeout, 60 * time.Second},
 		"IdleTimeout":       {srv.IdleTimeout, 30 * time.Second},
@@ -412,5 +435,133 @@ func TestServerErrorLogLevels(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAuthResponsesCloseConnection: every auth-listener response closes the
+// connection, so one TLS connection cannot pipeline a stream of requests,
+// each a log line (U11-FABLE-2).
+func TestAuthResponsesCloseConnection(t *testing.T) {
+	w := newSrvWorld(t, srvOptions{})
+	run := w.start(t)
+	for name, path := range map[string]string{
+		"invalid state": authenticatePath + "?state=" + string(NewSecret()),
+		"not found":     "/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			conn, err := tls.Dial("tcp", run.authAddr, &tls.Config{ServerName: srvAlphaHost, RootCAs: w.serverPool})
+			if err != nil {
+				t.Fatalf("tls.Dial: %v", err)
+			}
+			defer func() { _ = conn.Close() }() // test connection
+			if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatalf("SetDeadline: %v", err)
+			}
+			req := "GET " + path + " HTTP/1.1\r\nHost: " + srvAlphaHost + "\r\n\r\n"
+			if _, err := io.WriteString(conn, req+req); err != nil { // pipelined
+				t.Fatalf("write: %v", err)
+			}
+			br := bufio.NewReader(conn)
+			resp, err := http.ReadResponse(br, nil)
+			if err != nil {
+				t.Fatalf("first response: %v", err)
+			}
+			_ = resp.Body.Close() // empty body
+			if !resp.Close {
+				t.Error("first response keeps the connection open, want Connection: close")
+			}
+			if second, err := http.ReadResponse(br, nil); err == nil {
+				t.Errorf("the pipelined second request was served: %s", second.Status)
+			}
+		})
+	}
+	if n := len(w.logs.withMsg(t, "auth state rejected")); n != 1 {
+		t.Errorf("got %d \"auth state rejected\" lines, want 1 (the second request never ran)", n)
+	}
+}
+
+// panicProvider is alpha with a Verify that panics with identity data.
+type panicProvider struct{ certcheck.Provider }
+
+func (panicProvider) Verify(context.Context, []*x509.Certificate) (*certcheck.Result, error) {
+	panic("JUAN GARCÍA LÓPEZ 12345679S")
+}
+
+// TestAuthHandlerPanicIsLoggedAtError: a panic under the auth handler is
+// logged at Error with a fresh diagnostic ID, the provider and the panic
+// value's type only, and the browser goes to #error=internal (U11-FABLE-3).
+func TestAuthHandlerPanicIsLoggedAtError(t *testing.T) {
+	w := newSrvWorld(t, srvOptions{})
+	app, err := New(Deps{Config: srvConfig(t), Providers: []certcheck.Provider{panicProvider{w.providers[0]}, w.providers[1]},
+		Certs: w.certs, Logger: slog.New(slog.NewJSONHandler(w.logs, nil)), Version: srvVersion, Now: w.clk.Now})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	w.app, w.main = app, app.MainHandler()
+	run := w.start(t)
+	c := w.authClient(t, run.authAddr, w.leafCert())
+	authURL, _ := w.createTx(t, "alpha")
+
+	resp, body := authDo(t, c, http.MethodGet, authURL, "")
+	checkAuthResponse(t, resp, body, http.StatusSeeOther)
+	m := internalLocationRe.FindStringSubmatch(resp.Header.Get("Location"))
+	if m == nil {
+		t.Fatalf("Location = %q, want match %s", resp.Header.Get("Location"), internalLocationRe)
+	}
+	recs := w.logs.withMsg(t, "auth handler panic")
+	if len(recs) != 1 || recs[0]["level"] != "ERROR" || recs[0]["diagnosticId"] != m[1] || recs[0]["provider"] != "alpha" ||
+		recs[0]["panicType"] != "string" {
+		t.Errorf("panic log lines = %v, want one ERROR with diagnosticId %s, provider alpha and panicType string", recs, m[1])
+	}
+	if got := len(w.app.auth.slots); got != 0 {
+		t.Errorf("slots held after the panic = %d, want 0", got)
+	}
+	w.logs.noLeak(t, srvIdentityValues...)
+}
+
+// TestAuthCompleteFailureLogsOutcome: a transaction replaced while its
+// validation runs (a second tab) still gets its outcome logged, and the
+// warning names that outcome's diagnostic ID and the right reason
+// (U11-FABLE-5).
+func TestAuthCompleteFailureLogsOutcome(t *testing.T) {
+	w := newSrvWorld(t, srvOptions{ocspDelay: 300 * time.Millisecond})
+	run := w.start(t)
+	c := w.authClient(t, run.authAddr, w.leafCert())
+	authURL, cookie := w.createTx(t, "alpha")
+	type reply struct {
+		location string
+		err      error
+	}
+	done := make(chan reply, 1)
+	go func() {
+		resp, err := c.Get(authURL)
+		if err != nil {
+			done <- reply{err: err}
+			return
+		}
+		_ = resp.Body.Close() // empty body
+		done <- reply{location: resp.Header.Get("Location")}
+	}()
+	waitFor(t, "the validation to take a slot", func() bool { return len(w.app.auth.slots) == 1 })
+	if _, _, _, err := w.app.store.Create("alpha", cookie); err != nil { // the second tab replaces the transaction
+		t.Fatalf("Create: %v", err)
+	}
+	r := <-done
+	if r.err != nil {
+		t.Fatalf("GET %s: %v", authURL, r.err)
+	}
+	m := invalidLocationRe.FindStringSubmatch(r.location)
+	if m == nil {
+		t.Fatalf("Location = %q, want match %s", r.location, invalidLocationRe)
+	}
+	ok := w.logs.withMsg(t, "authentication succeeded")
+	if len(ok) != 1 {
+		t.Fatalf("got %d \"authentication succeeded\" lines, want 1; logs:\n%s", len(ok), w.logs)
+	}
+	recs := w.logs.withMsg(t, "auth transaction gone during validation")
+	if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["diagnosticId"] != m[1] ||
+		recs[0]["outcomeDiagnosticId"] != ok[0]["diagnosticId"] || recs[0]["reason"] != ErrInvalidState.Error() {
+		t.Errorf("warn lines = %v, want one WARN with diagnosticId %s, outcomeDiagnosticId %v and reason %q",
+			recs, m[1], ok[0]["diagnosticId"], ErrInvalidState)
 	}
 }

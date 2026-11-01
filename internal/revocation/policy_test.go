@@ -2,6 +2,7 @@ package revocation
 
 import (
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -99,6 +100,70 @@ func TestPolicyValidate(t *testing.T) {
 			err := tc.policy.Validate()
 			if got := err != nil; got != tc.wantErr {
 				t.Errorf("Validate(%+v) error = %v, want error %v", tc.policy, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestPolicyValidateHostEntries(t *testing.T) {
+	label63 := strings.Repeat("a", 63)
+	name253 := strings.Repeat(label63+".", 3) + strings.Repeat("b", 61) // 253 bytes
+	cases := []struct {
+		host    string
+		wantErr bool
+	}{
+		{"ocsp.example.es", false},
+		{"ocsp.example.es:8080", false},
+		{"ocsp.example.es:1", false},
+		{"ocsp.example.es:65535", false},
+		{"localhost", false},
+		{"ocsp-1.x2.example.es", false},
+		{"0ocsp.example.es", false},
+		{label63 + ".example.es", false},
+		{name253, false},
+		// Ports.
+		{"ocsp.example.es:", true},
+		{"host::8080", true},
+		{"ocsp.example.es:80:80", true},
+		{"ocsp.example.es:0", true},
+		{"ocsp.example.es:65536", true},
+		{"ocsp.example.es:99999999999999999999", true},
+		{"ocsp.example.es:+80", true},
+		{"ocsp.example.es:080", true},
+		{"ocsp.example.es: 80", true},
+		{":8080", true},
+		{"ocsp.example.es:80", true},  // default port: hostAllowed strips it
+		{"ocsp.example.es:443", true}, // from the URL, so the entry never matches
+		// Control characters.
+		{"ocsp.example.es\x00", true},
+		{"ocsp\t.example.es", true},
+		{"ocsp.example.es\r\n", true},
+		{"ocsp.example.es\x7f", true},
+		// Not lowercase LDH labels.
+		{"Ocsp.example.es", true},
+		{"ocsp_1.example.es", true},
+		{"ocsp.exämple.es", true},
+		{"-ocsp.example.es", true},
+		{"ocsp-.example.es", true},
+		{"ocsp..example.es", true},
+		{".ocsp.example.es", true},
+		{"ocsp.example.es.", true},
+		{"ocsp.example.es.:80", true},
+		{label63 + "a.example.es", true},
+		{name253 + "b", true},
+		{"[ocsp.example.es]:80", true},
+		{"2001:db8::1", true},
+		{"[2001:db8::1]", true},
+		{"192.0.2.1", true},
+		{"192.0.2.1:80", true},
+		{"127.1", true},
+		{"ocsp.example.123", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.host, func(t *testing.T) {
+			err := Policy{OCSPHosts: []string{tc.host}}.Validate()
+			if got := err != nil; got != tc.wantErr {
+				t.Errorf("Validate(OCSPHosts %q) error = %v, want error %v", tc.host, err, tc.wantErr)
 			}
 		})
 	}

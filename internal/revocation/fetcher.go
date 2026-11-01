@@ -12,8 +12,10 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // Fetch limits (spec "Fetcher (SSRF controls)").
@@ -26,6 +28,12 @@ const (
 	MaxConcurrent    = 16
 	maxHeaderBytes   = 16 << 10
 	defaultUserAgent = "cert-check/dev"
+	// A dial outlives a cancelled Fetch (the transport detaches it from the
+	// request and the permit is released), so the semaphore alone does not
+	// bound sockets: the transport caps them per host, and idle ones in total.
+	// Fetch also caps its requests per host at maxConnsPerHost.
+	maxConnsPerHost = 4
+	maxIdleConns    = 32
 )
 
 // Fetch errors. All of them map to StatusUnavailable.
@@ -54,6 +62,8 @@ type Fetcher struct {
 	client *http.Client
 	sem    chan struct{}
 	ua     string
+	mu     sync.Mutex
+	hosts  map[string]chan struct{} // host:port -> its permits (maxConnsPerHost)
 }
 
 type allowKey struct{}
@@ -69,11 +79,13 @@ func NewFetcher(o FetcherOptions) *Fetcher {
 	}
 	tr := &http.Transport{
 		Proxy:                  nil,
-		DialContext:            dial,
+		DialContext:            markDialErrors(dial),
 		TLSHandshakeTimeout:    5 * time.Second,
 		ResponseHeaderTimeout:  10 * time.Second,
 		MaxResponseHeaderBytes: maxHeaderBytes,
 		DisableCompression:     true,
+		MaxConnsPerHost:        maxConnsPerHost,
+		MaxIdleConns:           maxIdleConns,
 		MaxIdleConnsPerHost:    2,
 		IdleConnTimeout:        30 * time.Second,
 		ForceAttemptHTTP2:      false,
@@ -90,6 +102,7 @@ func NewFetcher(o FetcherOptions) *Fetcher {
 		client: &http.Client{Transport: tr, CheckRedirect: checkRedirect},
 		sem:    make(chan struct{}, n),
 		ua:     ua,
+		hosts:  make(map[string]chan struct{}),
 	}
 }
 
@@ -121,8 +134,18 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 	if err != nil || !hostAllowed(u, r.AllowedHosts) {
 		return res, ErrHostNotAllowed
 	}
+	u.Host = strings.ToLower(u.Host) // one connection pool per allowlisted host
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
+	// The host's permits first: requests beyond its connection cap wait here
+	// without a global permit, so one hung host cannot starve the others.
+	hp := f.hostPermits(u)
+	select {
+	case hp <- struct{}{}:
+		defer func() { <-hp }()
+	case <-ctx.Done():
+		return res, ctx.Err()
+	}
 	select {
 	case f.sem <- struct{}{}:
 		defer func() { <-f.sem }()
@@ -148,7 +171,7 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 	resp, err := f.client.Do(req)
 	res.Duration = time.Since(start)
 	if err != nil {
-		return res, err
+		return res, fetchError(req, err)
 	}
 	defer resp.Body.Close()
 	res.StatusCode, res.FinalURL = resp.StatusCode, resp.Request.URL.String()
@@ -158,10 +181,10 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 	if resp.ContentLength > r.MaxBytes {
 		return res, ErrTooLarge
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, r.MaxBytes+1))
+	b, err := readBody(resp.Body, resp.ContentLength, r.MaxBytes)
 	res.Duration = time.Since(start)
 	if err != nil {
-		return res, err
+		return res, fetchError(req, err)
 	}
 	if int64(len(b)) > r.MaxBytes {
 		return res, ErrTooLarge
@@ -170,13 +193,147 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 	return res, nil
 }
 
-// hostAllowed: http/https only, no userinfo, host (and non-default port)
-// exactly in the allowlist.
+// readBody reads at most maxBytes+1 bytes of body into one buffer: sized
+// from length when it is known (the transport ends the body there), else
+// doubled from 64 KiB up to maxBytes+1. A body at the cap allocates about 1x
+// its size with a length and 2x without one; io.ReadAll's chunks plus their
+// final copy took 2.3x.
+func readBody(body io.Reader, length, maxBytes int64) ([]byte, error) {
+	if length >= 0 {
+		b := make([]byte, length)
+		if _, err := io.ReadFull(body, b); err != nil {
+			return nil, err
+		}
+		return b, nil
+	}
+	lim := io.LimitReader(body, maxBytes+1)
+	b := make([]byte, 0, min(maxBytes+1, 64<<10))
+	for {
+		if len(b) == cap(b) && int64(cap(b)) <= maxBytes {
+			next := 2 * int64(cap(b))
+			if next >= maxBytes { // never a last step of one byte past a full buffer
+				next = maxBytes + 1
+			}
+			b = append(make([]byte, 0, next), b...)
+		}
+		n, err := lim.Read(b[len(b):cap(b)])
+		b = b[:len(b)+n]
+		if err == io.EOF {
+			return b, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+// hostPermits returns the permits of u's host:port, made on first use. u is
+// allowlisted and lowercase, so the map is bounded by the allowlists.
+func (f *Fetcher) hostPermits(u *url.URL) chan struct{} {
+	port := u.Port()
+	if port == "" {
+		port = "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+	}
+	key := net.JoinHostPort(u.Hostname(), port)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	hp, ok := f.hosts[key]
+	if !ok {
+		hp = make(chan struct{}, maxConnsPerHost)
+		f.hosts[key] = hp
+	}
+	return hp
+}
+
+// dialError marks an error from the dialer, which fetchError reduces to a
+// category.
+type dialError struct{ err error }
+
+func (e dialError) Error() string { return e.err.Error() }
+func (e dialError) Unwrap() error { return e.err }
+
+func markDialErrors(dial DialFunc) DialFunc {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, dialError{err}
+		}
+		return c, nil
+	}
+}
+
+// errTransport stands for any other client or body-read error: their text
+// can quote response bytes (a malformed status or header line, a TLS peer
+// name).
+var errTransport = errors.New("revocation: HTTP transport error")
+
+// Dial error categories. A dialer's own text can name the resolver, a
+// resolved address or an OS error; ErrBlockedAddress stands for an address
+// the dialer refused.
+var (
+	errDialDNS     = errors.New("revocation: DNS lookup failed")
+	errDialTimeout = errors.New("revocation: dial timeout")
+	errDialRefused = errors.New("revocation: connection refused")
+	errDial        = errors.New("revocation: dial failed")
+)
+
+// fetchError rebuilds a client or body-read error around the requested URL,
+// which comes from the certificate, and a fixed classification. The client's
+// *url.Error names the last URL instead: a redirect Location, verbatim when
+// it was rejected.
+func fetchError(req *http.Request, err error) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = ue.Err
+	}
+	var de dialError
+	switch {
+	case errors.As(err, &de):
+		err = dialCategory(de.err)
+	case errors.Is(err, ErrRedirectBlocked): // checkRedirect's fixed text
+	case errors.Is(err, context.DeadlineExceeded):
+		err = context.DeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		err = context.Canceled
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		err = io.ErrUnexpectedEOF
+	default:
+		err = errTransport
+	}
+	return &url.Error{Op: req.Method[:1] + strings.ToLower(req.Method[1:]), URL: req.URL.String(), Err: err}
+}
+
+func dialCategory(err error) error {
+	var dns *net.DNSError
+	var ne net.Error
+	switch {
+	case errors.Is(err, ErrBlockedAddress):
+		return ErrBlockedAddress
+	case errors.As(err, &dns):
+		return errDialDNS
+	case errors.As(err, &ne) && ne.Timeout():
+		return errDialTimeout
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return errDialRefused
+	}
+	return errDial
+}
+
+// hostAllowed: http/https only, no userinfo, an ASCII host (and non-default
+// port) exactly in the allowlist. A non-ASCII host is refused before
+// lowercasing: the transport dials its IDNA form, not the folded name.
 func hostAllowed(u *url.URL, allowed []string) bool {
 	if u.Scheme != "http" && u.Scheme != "https" || u.User != nil || u.Host == "" || u.Opaque != "" {
 		return false
 	}
-	host := strings.ToLower(u.Hostname())
+	host := u.Hostname() // percent-decoded
+	if strings.ContainsFunc(host, func(r rune) bool { return r >= utf8.RuneSelf }) {
+		return false
+	}
+	host = strings.ToLower(host)
 	port := u.Port()
 	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
 		port = ""
@@ -204,6 +361,7 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	if !hostAllowed(req.URL, allowed) {
 		return fmt.Errorf("%w: host not allowlisted", ErrRedirectBlocked)
 	}
+	req.URL.Host = strings.ToLower(req.URL.Host) // as in Fetch: one pool per host
 	return nil
 }
 
@@ -228,9 +386,10 @@ var blockedPrefixes = []netip.Prefix{
 }
 
 // AddressAllowed reports whether a resolved destination IP may be dialed.
+// A zoned address never may (no prefix below would match it).
 func AddressAllowed(ip netip.Addr) bool {
 	ip = ip.Unmap()
-	if !ip.IsValid() || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+	if !ip.IsValid() || ip.Zone() != "" || ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() ||
 		ip.IsUnspecified() || ip == netip.AddrFrom4([4]byte{255, 255, 255, 255}) {
 		return false

@@ -8,6 +8,7 @@ import (
 	"encoding/asn1"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -567,12 +568,33 @@ func TestCreateErrors(t *testing.T) {
 		}
 	})
 
+	// One subscriber's /56 holds 256 /64s: a flood from all of them is one
+	// bucket (U11-FABLE-1).
+	t.Run("rate limited per IPv6 /56", func(t *testing.T) {
+		w := newSrvWorld(t, srvOptions{})
+		created := 0
+		for i := range 256 {
+			r := jsonRequest(http.MethodPost, "/api/v1/transactions", valid)
+			r.Header.Set("X-Forwarded-For", fmt.Sprintf("2001:db8:1:1%02x::1", i))
+			if rec := w.serve(r); rec.Code == http.StatusCreated {
+				created++
+			} else if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("request %d: status = %d, want 201 or 429", i+1, rec.Code)
+			}
+		}
+		if created != createPerMinute {
+			t.Errorf("created %d transactions from 256 /64s of one /56, want %d (one bucket)", created, createPerMinute)
+		}
+	})
+
 	t.Run("store full", func(t *testing.T) {
 		w := newSrvWorld(t, srvOptions{})
 		w.app.store = NewStore(1, w.clk.Now)
 		w.app.auth.store = w.app.store
-		if rec := w.serve(create(valid, nil)()); rec.Code != http.StatusCreated {
-			t.Fatalf("first create: status = %d, want 201", rec.Code)
+		authURL, _ := w.createTx(t, "alpha")
+		// A transaction whose validation started is never evicted.
+		if _, err := w.app.store.ConsumeState(stateOf(t, authURL), "alpha"); err != nil {
+			t.Fatalf("ConsumeState: %v", err)
 		}
 		rec := w.serve(create(valid, nil)())
 		if rec.Code != http.StatusServiceUnavailable {
@@ -591,6 +613,31 @@ type redeemInvalidBody struct {
 		Retryable bool   `json:"retryable"`
 	} `json:"error"`
 	Diagnostics certcheck.Diagnostics `json:"diagnostics"`
+}
+
+// TestOriginMatchesNormalisedPublicURL: a public URL configured with an
+// uppercase host and the default port still accepts the browser's Origin,
+// which has neither (U12-ASTRA-4).
+func TestOriginMatchesNormalisedPublicURL(t *testing.T) {
+	w := newSrvWorld(t, srvOptions{})
+	env := map[string]string{
+		"CERTCHECK_PUBLIC_URL": "https://CHECK.test:443/", "CERTCHECK_AUTH_DOMAIN": srvAuthDomain,
+		"CERTCHECK_AUTH_PUBLIC_PORT": strconv.Itoa(srvAuthPort),
+		"CERTCHECK_TLS_CERT_FILE":    "cert.pem", "CERTCHECK_TLS_KEY_FILE": "key.pem", // not read by Load
+	}
+	cfg, err := config.Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	app, err := New(Deps{Config: cfg, Providers: w.providers, Certs: w.certs, Logger: srvDiscard, Version: srvVersion, Now: w.clk.Now})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	app.MainHandler().ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/v1/transactions", `{"provider":"alpha"}`)) // Origin https://check.test
+	if rec.Code != http.StatusCreated {
+		t.Errorf("create with Origin %s: status = %d, want 201; body %s", srvPublicURL, rec.Code, rec.Body)
+	}
 }
 
 func TestRedeem(t *testing.T) {
@@ -686,8 +733,10 @@ func TestRedeem(t *testing.T) {
 	})
 
 	t.Run("no cookie", func(t *testing.T) {
-		code, _ := w.completeTx(t, "alpha", Outcome{Result: res})
+		code, cookie := w.completeTx(t, "alpha", Outcome{Result: res})
 		invalid(t, w.redeem(code, ""), "cookie_missing")
+		// The code was spent by the cookie-less attempt (U11-ASTRA-2).
+		invalid(t, w.redeem(code, cookie), "code_unknown_or_expired")
 	})
 
 	t.Run("another valid cookie", func(t *testing.T) {

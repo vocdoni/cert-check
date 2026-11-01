@@ -18,11 +18,16 @@ jobs:
     # build is checked by its own step and by the Dockerfile.
     env:
       GOFLAGS: -mod=readonly
+      # Use the Go that setup-go installed: a go.mod above it fails instead of
+      # downloading a toolchain nobody pinned.
+      GOTOOLCHAIN: local
       # The library is the root module; the testing UI is the nested module
       # testui/ (it requires the root through `replace => ../`).
       MODULES: ". testui"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false # no later step needs the token; keep it off the persistent runner
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.27.x"
@@ -42,12 +47,15 @@ jobs:
         run: for m in $MODULES; do (cd "$m" && CGO_ENABLED=0 go build -trimpath ./...); done
       - name: test
         run: |
+          out="$RUNNER_TEMP/go-test.json" # outside the checkout (and the Docker build context)
           for m in $MODULES; do
-            if ! (cd "$m" && go test -race -count=1 -json ./... > test.json); then
-              grep -E '"Action":"fail"' "$m/test.json" | head -50
+            if ! (cd "$m" && go test -race -count=1 -json ./... > "$out"); then
+              # The output (t.Errorf text, panics) of the failing packages and any build errors.
+              jq -js '(map(select(.Action == "fail") | .Package) | unique) as $failed | .[]
+                | select(.Action == "build-output" or (.Action == "output" and (.Package | IN($failed[])))) | .Output' "$out" | tail -400
               exit 1
             fi
-            skipped="$(grep '"Action":"skip"' "$m/test.json" | grep -c '"Test":' || true)"
+            skipped="$(grep '"Action":"skip"' "$out" | grep -c '"Test":' || true)"
             if [ "$skipped" != "0" ]; then
               echo "$m: $skipped skipped tests"
               exit 1
@@ -57,10 +65,10 @@ jobs:
         run: for m in $MODULES; do (cd "$m" && go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...); done
       - name: fuzz smoke (30 s per target)
         run: |
-          for t in FuzzParseName FuzzParseSANDirectoryNames FuzzParseDateOfBirth FuzzParseDocument FuzzDateUnmarshalJSON; do
+          for t in FuzzParseName FuzzParseSANDirectoryNames FuzzParseDateOfBirth FuzzParseDocument FuzzDateUnmarshalJSON FuzzAdapterExtract; do
             go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/identity
           done
-          for t in FuzzParseResponse FuzzParseIDP FuzzParseCDP; do
+          for t in FuzzParseResponse FuzzParseIDP FuzzParseCDP FuzzParseCRL; do
             go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/revocation
           done
           go test -run '^$' -fuzz '^FuzzParseQCStatements$' -fuzztime 30s ./internal/engine

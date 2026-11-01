@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -172,6 +173,133 @@ func TestCSPCompatible(t *testing.T) {
 		if strings.Contains(js, banned) {
 			t.Errorf("app.js contains %q", banned)
 		}
+	}
+}
+
+// jsFunc returns the source of a function declared at the top level of app.js's wrapper.
+func jsFunc(t *testing.T, js, name string) string {
+	t.Helper()
+	src := regexp.MustCompile(`(?ms)^  (?:async )?function ` + name + `\(.*?^  }$`).FindString(js)
+	if src == "" {
+		t.Fatalf("app.js has no function %s", name)
+	}
+	return src
+}
+
+// TestAppJSCodeTables covers U14-ASTRA-1. An error code from the URL fragment or from the API must
+// never index a plain object: "__proto__" would return Object.prototype and "constructor" would
+// return Object, and the error view would then fail to render. The table lookups are own-property
+// only, so an unknown code falls back to the generic message and guidance.
+func TestAppJSCodeTables(t *testing.T) {
+	js := readStatic(t, "app.js")
+	if loc := regexp.MustCompile(`\b(?:GUIDANCE|CLIENT_MESSAGES)\s*\[`).FindStringIndex(js); loc != nil {
+		t.Errorf("app.js indexes a code table directly near %q, want the own-property lookup", js[loc[0]:min(len(js), loc[0]+40)])
+	}
+	if lookup := jsFunc(t, js, "lookup"); !strings.Contains(lookup, "Object.hasOwn(") {
+		t.Errorf("lookup() = %q, want an Object.hasOwn own-property check", lookup)
+	}
+	for _, fn := range []string{"guidanceFor", "showServerError", "showClientError"} {
+		if src := jsFunc(t, js, fn); !strings.Contains(src, "lookup(") {
+			t.Errorf("%s() does not use lookup() for its code table", fn)
+		}
+	}
+}
+
+// TestAppJSAPIDeadline covers U14-ASTRA-2. One AbortController deadline covers the request and the
+// body read, a timeout is its own recoverable error, and nothing replays a request on its own (a
+// redemption code is single use).
+func TestAppJSAPIDeadline(t *testing.T) {
+	js := readStatic(t, "app.js")
+
+	m := regexp.MustCompile(`const API_TIMEOUT_MS = (\d+) \* 1000;`).FindStringSubmatch(js)
+	if m == nil {
+		t.Fatal("app.js has no API_TIMEOUT_MS constant in seconds")
+	}
+	if secs, _ := strconv.Atoi(m[1]); secs < 1 || secs > 30 {
+		t.Errorf("API_TIMEOUT_MS = %s s, want 1 to 30 s (the server's write timeout is 30 s)", m[1])
+	}
+
+	// The timer starts before the request and stops only after the body was read.
+	api := jsFunc(t, js, "api")
+	at := 0
+	for _, step := range []string{"new AbortController()", "signal: ", "setTimeout(", "await fetch(", "await res.text()", "clearTimeout("} {
+		i := strings.Index(api[at:], step)
+		if i < 0 {
+			t.Errorf("api() lacks %q after the previous deadline step", step)
+			continue
+		}
+		at += i + len(step)
+	}
+	if n := strings.Count(js, "fetch("); n != 1 {
+		t.Errorf("app.js calls fetch( %d times, want the single deadline-bound call in api()", n)
+	}
+	if strings.Contains(api, "res.json()") {
+		t.Error("api() reads the body with res.json(); a read failure must reject, not look like a bad reply")
+	}
+
+	// A timeout is a recoverable error with its own message and guidance.
+	for _, want := range []string{"    timeout: '", "    timeout: TEMPORARY,", "'TimeoutError'"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js lacks %q for the timeout error", want)
+		}
+	}
+	for _, fn := range []string{"authenticate", "redeem"} {
+		if src := jsFunc(t, js, fn); !strings.Contains(src, "failureCode(e)") {
+			t.Errorf("%s() does not map a failed request through failureCode()", fn)
+		}
+	}
+
+	// No automatic replay: one redemption call site and no timer besides the deadline.
+	if n := strings.Count(js, "transactions/redeem"); n != 1 {
+		t.Errorf("app.js names the redeem endpoint %d times, want exactly 1", n)
+	}
+	if n := strings.Count(js, "setTimeout("); n != 1 {
+		t.Errorf("app.js has %d setTimeout( calls, want only the API deadline", n)
+	}
+}
+
+// TestAppJSRepliesAreValidated covers U14-ASTRA-3. Reply envelopes and the members of their arrays
+// are shape-checked before rendering, and any exception while handling a reply ends in the
+// bad_response view instead of a stuck "Checking" view.
+func TestAppJSRepliesAreValidated(t *testing.T) {
+	js := readStatic(t, "app.js")
+
+	for _, fn := range []string{"isObject", "isApiError", "isDiagnostics", "isRedeemReply", "isProviderList", "guard"} {
+		jsFunc(t, js, fn)
+	}
+	// Array members of the diagnostics must be objects: a null entry in chain threw while the
+	// report was built.
+	diag := jsFunc(t, js, "isDiagnostics")
+	for _, key := range []string{"tls", "certificate", "chain", "profileCandidates", "revocationAttempts"} {
+		if !strings.Contains(diag, "'"+key+"'") {
+			t.Errorf("isDiagnostics() does not check %q", key)
+		}
+	}
+	for fn, check := range map[string]string{
+		"redeem":        "isRedeemReply(",
+		"authenticate":  "isApiError(",
+		"loadProviders": "isProviderList(",
+	} {
+		if src := jsFunc(t, js, fn); !strings.Contains(src, check) {
+			t.Errorf("%s() does not validate its reply with %s", fn, check)
+		}
+	}
+
+	// Whatever the load logic or a click handler throws is routed to the bad_response view.
+	if g := jsFunc(t, js, "guard"); !strings.Contains(g, "catch") || !strings.Contains(g, "code: 'bad_response'") {
+		t.Errorf("guard() = %q, want a catch that renders bad_response", g)
+	}
+	for _, want := range []string{"guard(authenticate)", "guard(init)"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js does not wrap its entry point with %s", want)
+		}
+	}
+	// No entry point runs unguarded: init is only declared (once) and handed to guard.
+	if strings.Contains(js, ", authenticate)") {
+		t.Error("app.js registers authenticate without guard()")
+	}
+	if n := len(regexp.MustCompile(`\binit\(`).FindAllString(js, -1)); n != 1 {
+		t.Errorf("app.js has %d init( occurrences, want only its declaration (callers use the guarded copy)", n)
 	}
 }
 

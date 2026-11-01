@@ -15,7 +15,7 @@ import (
 // TestLiveProbe (AC8) probes every enabled profile's OCSP responders and
 // CRLs over the real network, plus the live specimens: the committed DIGITEL
 // one and the withheld Bewor and Sectigo ones from $CERTCHECK_LIVE_SPECIMENS_DIR.
-// It logs the report and fails on any FAIL line.
+// It logs the report and fails on any FAIL line or when no line is OK.
 func TestLiveProbe(t *testing.T) {
 	dir := os.Getenv("CERTCHECK_LIVE_SPECIMENS_DIR")
 	if dir == "" {
@@ -53,6 +53,6 @@ func TestLiveProbe(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	if sum.Failed() {
-		t.Errorf("%d FAIL lines", sum.Fail)
+		t.Errorf("probe failed: %d ok, %d warn, %d fail", sum.OK, sum.Warn, sum.Fail)
 	}
 }

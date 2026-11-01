@@ -136,6 +136,12 @@ func TestLoadErrors(t *testing.T) {
 		{"public url without host", withVar("CERTCHECK_PUBLIC_URL", "https:///"), "CERTCHECK_PUBLIC_URL"},
 		{"public url unsupported scheme", withVar("CERTCHECK_PUBLIC_URL", "ftp://example.org"), "CERTCHECK_PUBLIC_URL"},
 		{"http on a lookalike host", withVar("CERTCHECK_PUBLIC_URL", "http://localhost.example.org"), "CERTCHECK_PUBLIC_URL"},
+		{"public url port zero", withVar("CERTCHECK_PUBLIC_URL", "https://example.org:0"), "CERTCHECK_PUBLIC_URL"},
+		{"public url port too large", withVar("CERTCHECK_PUBLIC_URL", "https://example.org:65536"), "CERTCHECK_PUBLIC_URL"},
+		{"public url empty port", withVar("CERTCHECK_PUBLIC_URL", "https://example.org:"), "CERTCHECK_PUBLIC_URL"},
+		{"public url port not a number", withVar("CERTCHECK_PUBLIC_URL", "https://example.org:abc"), "CERTCHECK_PUBLIC_URL"},
+		{"public url with empty query", withVar("CERTCHECK_PUBLIC_URL", "https://example.org/?"), "CERTCHECK_PUBLIC_URL"},
+		{"public url with empty userinfo", withVar("CERTCHECK_PUBLIC_URL", "https://@example.org"), "CERTCHECK_PUBLIC_URL"},
 		{"auth domain uppercase", withVar("CERTCHECK_AUTH_DOMAIN", "Auth.Example.org"), "CERTCHECK_AUTH_DOMAIN"},
 		{"auth domain single label", withVar("CERTCHECK_AUTH_DOMAIN", "x"), "CERTCHECK_AUTH_DOMAIN"},
 		{"auth domain empty", withVar("CERTCHECK_AUTH_DOMAIN", ""), "CERTCHECK_AUTH_DOMAIN"},
@@ -146,6 +152,12 @@ func TestLoadErrors(t *testing.T) {
 		{"auth port too large", withVar("CERTCHECK_AUTH_PUBLIC_PORT", "70000"), "CERTCHECK_AUTH_PUBLIC_PORT"},
 		{"auth port not a number", withVar("CERTCHECK_AUTH_PUBLIC_PORT", "abc"), "CERTCHECK_AUTH_PUBLIC_PORT"},
 		{"auth port missing", without("CERTCHECK_AUTH_PUBLIC_PORT"), "CERTCHECK_AUTH_PUBLIC_PORT"},
+		{"auth listen port zero", withVar("CERTCHECK_AUTH_LISTEN", ":0"), "CERTCHECK_AUTH_LISTEN"},
+		{"auth listen empty port", withVar("CERTCHECK_AUTH_LISTEN", "127.0.0.1:"), "CERTCHECK_AUTH_LISTEN"},
+		{"auth listen port too large", withVar("CERTCHECK_AUTH_LISTEN", ":65536"), "CERTCHECK_AUTH_LISTEN"},
+		{"auth listen port not a number", withVar("CERTCHECK_AUTH_LISTEN", ":https"), "CERTCHECK_AUTH_LISTEN"},
+		{"auth listen signed port", withVar("CERTCHECK_AUTH_LISTEN", ":+8443"), "CERTCHECK_AUTH_LISTEN"},
+		{"auth listen without port", withVar("CERTCHECK_AUTH_LISTEN", "8443"), "CERTCHECK_AUTH_LISTEN"},
 		{"static cert without key", func() map[string]string {
 			env := staticEnv(dir)
 			delete(env, "CERTCHECK_TLS_KEY_FILE")
@@ -280,6 +292,55 @@ func TestLoadLocalhostHTTP(t *testing.T) {
 			}
 			if c.PublicURL.Host != tc.wantHost {
 				t.Errorf("PublicURL.Host = %q, want %q", c.PublicURL.Host, tc.wantHost)
+			}
+		})
+	}
+}
+
+// TestLoadPublicURLNormalised: the public URL is the origin a browser sends
+// (lowercase host, no default port), so the Origin check can compare it
+// exactly (U12-ASTRA-4).
+func TestLoadPublicURLNormalised(t *testing.T) {
+	tests := []struct{ raw, want string }{
+		{"https://cert.example.org", "https://cert.example.org"},
+		{"https://Cert.Example.ORG", "https://cert.example.org"},
+		{"https://cert.example.org:443", "https://cert.example.org"},
+		{"https://cert.example.org:443/", "https://cert.example.org"},
+		{"https://cert.example.org:0443", "https://cert.example.org"},
+		{"https://cert.example.org:8443", "https://cert.example.org:8443"},
+		{"https://cert.example.org:08443", "https://cert.example.org:8443"},
+		{"HTTPS://cert.example.org", "https://cert.example.org"},
+		{"https://[2001:DB8::1]:443", "https://[2001:db8::1]"},
+		{"https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"},
+		{"http://LOCALHOST:8080", "http://localhost:8080"},
+		{"http://localhost:80", "http://localhost"},
+		{"http://127.0.0.1:80/", "http://127.0.0.1"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.raw, func(t *testing.T) {
+			c, err := Load(getenvFrom(withVar("CERTCHECK_PUBLIC_URL", tc.raw)()))
+			if err != nil {
+				t.Fatalf("Load(%q): %v", tc.raw, err)
+			}
+			if got := c.PublicURL.Scheme + "://" + c.PublicURL.Host; got != tc.want {
+				t.Errorf("origin = %q, want %q", got, tc.want)
+			}
+			if got := c.PublicURL.String(); got != tc.want {
+				t.Errorf("PublicURL = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadAuthListen(t *testing.T) {
+	for _, v := range []string{":8443", "127.0.0.1:1", "[::1]:65535", "localhost:9443"} {
+		t.Run(v, func(t *testing.T) {
+			c, err := Load(getenvFrom(withVar("CERTCHECK_AUTH_LISTEN", v)()))
+			if err != nil {
+				t.Fatalf("Load(%q): %v", v, err)
+			}
+			if c.AuthListen != v {
+				t.Errorf("AuthListen = %q, want %q", c.AuthListen, v)
 			}
 		})
 	}

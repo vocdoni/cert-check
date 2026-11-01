@@ -1,9 +1,11 @@
 package identity_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/vocdoni/cert-check/internal/identity"
+	"github.com/vocdoni/cert-check/internal/testpki"
 )
 
 func extracted(doc, given, surnames string, org *identity.Organization) identity.Extracted {
@@ -36,7 +38,29 @@ func TestReservedMatch(t *testing.T) {
 		tests = append(tests, row{"document " + doc, extracted(doc, "JUAN", "GARCIA LOPEZ", nil), identity.MarkerDocument, true})
 	}
 	const doc = "12345679S" // valid, not reserved
+	// split reports the given first and second surnames, as a SAN would.
+	split := func(surnames, first, second string) identity.Extracted {
+		x := extracted(doc, "JUAN", surnames, nil)
+		x.Identity.FirstSurname, x.Identity.SecondSurname = first, second
+		return x
+	}
 	tests = append(tests, []row{
+		// R5.2: markers fold like the SAN consistency check (ComparisonKey),
+		// and every surname spelling is screened.
+		{"surname ESPÉCIMEN accented", extracted(doc, "JUAN", "ESPÉCIMEN DIEZ", nil), identity.MarkerSurname, true},
+		{"surname ESPECÍMEN accented", extracted(doc, "JUAN", "ESPECÍMEN LOPEZ", nil), identity.MarkerSurname, true},
+		{"surname PRÚEBAS accented", extracted(doc, "JUAN", "EIDAS PRÚEBAS", nil), identity.MarkerSurname, true},
+		{"surname FICTÍCIO accented", extracted(doc, "JUAN", "FICTÍCIO", nil), identity.MarkerSurname, true},
+		{"surname DE PRÒVES accented", extracted(doc, "JUAN", "DE PRÒVES", nil), identity.MarkerSurname, true},
+		{"first surname only", split("GARCIA LOPEZ", "ESPECIMEN", "LOPEZ"), identity.MarkerSurname, true},
+		{"second surname only", split("GARCIA LOPEZ", "GARCIA", "FICTÍCIO"), identity.MarkerSurname, true},
+		{"given NÓMBRE accented", extracted(doc, "NÓMBRE", "GARCIA LOPEZ", nil), identity.MarkerGivenName, true},
+		{"given CIUDADÁNO accented", extracted(doc, "CIUDADÁNO", "GARCIA LOPEZ", nil), identity.MarkerGivenName, true},
+		{"given NOM DÓS pattern accented", extracted(doc, "NOM DÓS", "GARCIA LOPEZ", nil), identity.MarkerGivenName, true},
+		{"given NOM D\u2019DIEZ typographic apostrophe", extracted(doc, "NOM D\u2019DIEZ", "GARCIA LOPEZ", nil), identity.MarkerGivenName, true},
+		{"organization accented", extracted(doc, "JUAN", "GARCIA LOPEZ", &identity.Organization{Name: "ENTIDAD DE PRÚEBAS"}), identity.MarkerOrganization, true},
+		{"accented real names", split("PEÑA DÍEZ", "PEÑA", "DÍEZ"), "", false},
+
 		{"surname mixed case", extracted(doc, "JUAN", "De La Peça De Proves", nil), identity.MarkerSurname, true},
 		{"surname decomposed", extracted(doc, "JUAN", "de la Pec\u0327a de Proves", nil), identity.MarkerSurname, true},
 		{"surname DE PROVES without cedilla", extracted(doc, "JUAN", "DE LA PECA DE PROVES", nil), identity.MarkerSurname, true},
@@ -78,11 +102,64 @@ func TestReservedMatch(t *testing.T) {
 		})
 	}
 
+	// R10.1 (U6-FABLE-1): ComparisonKey does not fold scripts, so a Cyrillic
+	// A would miss the PRUEBAS marker; Extract rejects it before Match.
+	t.Run("given PRUEBAS with a Cyrillic A never reaches Match", func(t *testing.T) {
+		ca := testpki.NewRoot(t, "reserved-homoglyph-root", testpki.CertSpec{})
+		leaf := ca.Leaf(t, testpki.CertSpec{Subject: person("IDCES-"+doc, "PRUEB\u0410S", "GARCIA LOPEZ")})
+		x, err := shapePlain().Extract(leaf.Cert)
+		if !errors.Is(err, identity.ErrInvalid) {
+			kind, hit := r.Match(x)
+			t.Fatalf("Extract err = %v, want ErrInvalid; Match = (%q, %v)", err, kind, hit)
+		}
+	})
+
 	t.Run("empty registry", func(t *testing.T) {
 		if kind, hit := (identity.Reserved{}).Match(extracted("00000000T", "NOMBRE", "FICTICIO", nil)); hit {
 			t.Errorf("empty registry Match = (%q, true), want no match", kind)
 		}
 	})
+}
+
+// TestReservedMatchAcceptedSpellings: a certificate with a nonreserved
+// document whose subject and SAN spell a marker differently, which the SAN
+// consistency check accepts, still hits the marker; the reported identity
+// keeps the certified spellings (R5.2, U7-ASTRA-1).
+func TestReservedMatchAcceptedSpellings(t *testing.T) {
+	const doc = "12345679S" // valid, not reserved
+	ca := testpki.NewRoot(t, "reserved-root", testpki.CertSpec{})
+	r := identity.DefaultReserved()
+	tests := []struct {
+		name                       string
+		subjectGN, subjectSN       string
+		sanGN, sanFirst, sanSecond string
+		wantKind                   identity.MarkerKind
+		wantHit                    bool
+	}{
+		{"subject ESPECÍMEN, SAN ESPECIMEN", "JUAN", "ESPECÍMEN LOPEZ", "JUAN", "ESPECIMEN", "LOPEZ", identity.MarkerSurname, true},
+		{"subject ESPECIMEN, SAN ESPECÍMEN", "JUAN", "ESPECIMEN LOPEZ", "JUAN", "ESPECÍMEN", "LOPEZ", identity.MarkerSurname, true},
+		{"subject NÓMBRE, SAN NOMBRE", "NÓMBRE", "GARCIA LOPEZ", "NOMBRE", "GARCIA", "LOPEZ", identity.MarkerGivenName, true},
+		{"subject NOMBRE, SAN NÓMBRE", "NOMBRE", "GARCIA LOPEZ", "NÓMBRE", "GARCIA", "LOPEZ", identity.MarkerGivenName, true},
+		{"real name with accents only in the SAN", "JOSE", "PENA DIEZ", "JOSÉ", "PEÑA", "DÍEZ", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			leaf := ca.Leaf(t, testpki.CertSpec{Subject: person("IDCES-"+doc, tc.subjectGN, tc.subjectSN),
+				SANDirNames: []testpki.Name{fnmtDir(doc, tc.sanGN, tc.sanFirst, tc.sanSecond)}})
+			x, err := shapeFNMTCitizenRSA().Extract(leaf.Cert)
+			if err != nil {
+				t.Fatalf("Extract err = %v, want nil", err)
+			}
+			id := x.Identity
+			if id.GivenNames != tc.subjectGN || id.Surnames != tc.subjectSN || id.FirstSurname != tc.sanFirst || id.SecondSurname != tc.sanSecond {
+				t.Errorf("Identity names = (%q, %q, %q, %q), want the certified spellings (%q, %q, %q, %q)",
+					id.GivenNames, id.Surnames, id.FirstSurname, id.SecondSurname, tc.subjectGN, tc.subjectSN, tc.sanFirst, tc.sanSecond)
+			}
+			if kind, hit := r.Match(x); kind != tc.wantKind || hit != tc.wantHit {
+				t.Errorf("Match = (%q, %v), want (%q, %v)", kind, hit, tc.wantKind, tc.wantHit)
+			}
+		})
+	}
 }
 
 func TestDefaultReservedVersion(t *testing.T) {

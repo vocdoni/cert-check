@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -72,6 +75,143 @@ func TestRunShutdown(t *testing.T) {
 	}
 }
 
+// TestRunShutdownSlowRequests: both listeners drain concurrently under one
+// deadline. An auth validation that finishes within the drain gets its code;
+// one stuck past the deadline is cancelled, and the connections left are
+// closed (U12-ASTRA-3).
+func TestRunShutdownSlowRequests(t *testing.T) {
+	type authResult struct {
+		resp *http.Response
+		err  error
+		at   time.Time
+	}
+	// running starts Run on w and one auth request for a fresh alpha
+	// transaction, and returns once its validation holds a slot.
+	running := func(t *testing.T, w *srvWorld) (cancel context.CancelFunc, done <-chan error, mainAddr string, auth <-chan authResult, cookie Secret) {
+		t.Helper()
+		mainLn, authLn := srvListen(t), srvListen(t)
+		ctx, cancel := context.WithCancel(t.Context())
+		runDone, authDone := make(chan error, 1), make(chan authResult, 1)
+		var wg sync.WaitGroup
+		t.Cleanup(wg.Wait)
+		t.Cleanup(cancel)
+		wg.Go(func() { runDone <- w.app.Run(ctx, mainLn, authLn) })
+		authURL, cookie := w.createTx(t, "alpha")
+		c := w.authClient(t, authLn.Addr().String(), w.leafCert())
+		wg.Go(func() {
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, authURL, nil)
+			if err != nil {
+				authDone <- authResult{err: err}
+				return
+			}
+			resp, err := c.Do(req)
+			if err == nil {
+				_ = resp.Body.Close() // empty body
+			}
+			authDone <- authResult{resp, err, time.Now()}
+		})
+		waitFor(t, "the auth validation", func() bool { return len(w.app.auth.slots) == 1 })
+		return cancel, runDone, mainLn.Addr().String(), authDone, cookie
+	}
+
+	t.Run("validation within the drain", func(t *testing.T) {
+		w := newSrvWorld(t, srvOptions{ocspDelay: 300 * time.Millisecond})
+		w.app.shutdownWait = 5 * time.Second
+		cancel, done, _, auth, cookie := running(t, w)
+		start := time.Now()
+		cancel()
+		r := <-auth
+		if r.err != nil {
+			t.Fatalf("auth request: %v", r.err)
+		}
+		m := codeLocationRe.FindStringSubmatch(r.resp.Header.Get("Location"))
+		if r.resp.StatusCode != http.StatusSeeOther || m == nil {
+			t.Fatalf("auth response = %d %q, want 303 with a code", r.resp.StatusCode, r.resp.Header.Get("Location"))
+		}
+		if o := w.storedOutcome(t, Secret(m[1]), cookie); o.Result == nil {
+			t.Errorf("outcome error = %+v, want the validation to complete with a result", o.Err)
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Run = %v, want nil", err)
+			}
+			if d := time.Since(start); d > 2*time.Second {
+				t.Errorf("Run returned %v after cancel, want as soon as the validation finished", d)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Run did not return within 10s of cancel")
+		}
+	})
+
+	t.Run("validation past the deadline", func(t *testing.T) {
+		w := newSrvWorld(t, srvOptions{ocspDelay: 3 * time.Second})
+		const drain = 500 * time.Millisecond
+		w.app.shutdownWait = drain
+		cancel, done, mainAddr, auth, cookie := running(t, w)
+
+		// Slow main request: the handler waits for a body that never comes.
+		slow, err := net.DialTimeout("tcp", mainAddr, time.Second)
+		if err != nil {
+			t.Fatalf("dial main: %v", err)
+		}
+		defer func() { _ = slow.Close() }() // test teardown
+		if _, err := io.WriteString(slow, "POST /api/v1/transactions HTTP/1.1\r\nHost: check.test\r\n"+
+			"Content-Type: application/json\r\nContent-Length: 64\r\n\r\n{"); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		waitFor(t, "the main request", func() bool {
+			w.app.createLimiter.mu.Lock()
+			defer w.app.createLimiter.mu.Unlock()
+			return len(w.app.createLimiter.entries) == 2 // createTx's client and this one
+		})
+
+		start := time.Now()
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("Run = %v, want the drain deadline exceeded", err)
+			}
+			if d := time.Since(start); d > drain+time.Second {
+				t.Errorf("Run returned %v after cancel, want about the %v drain", d, drain)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("Run did not return within 10s of cancel")
+		}
+		// The deadline closed the slow main connection and the stuck auth one.
+		if err := slow.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		if n, err := slow.Read(make([]byte, 512)); n != 0 || err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Errorf("slow main connection: Read = (%d, %v), want (0, EOF or reset): closed at the deadline", n, err)
+		}
+		if r := <-auth; r.at.Sub(start) > drain+time.Second {
+			t.Errorf("the auth request ended %v after cancel (%v), want at the %v deadline", r.at.Sub(start), r.err, drain)
+		}
+		// The stuck validation was cancelled at the deadline, long before its
+		// 3s OCSP answer: the slot is free and the outcome is stored.
+		waitFor(t, "the cancelled validation", func() bool {
+			return len(w.app.auth.slots) == 0 && w.app.store.Current(cookie).Status == TxCompleted
+		})
+		if d := time.Since(start); d > 2*time.Second {
+			t.Errorf("the validation ended %v after cancel, want it cancelled at the %v deadline", d, drain)
+		}
+	})
+}
+
+// waitFor polls cond every 10ms and fails the test after 5s.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s did not happen within 5s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestRunAuthWaitsForCert(t *testing.T) {
 	w := newSrvWorld(t, srvOptions{notReady: true})
 	run := w.start(t)
@@ -96,6 +236,110 @@ func TestRunAuthWaitsForCert(t *testing.T) {
 	w.certs.ready.Store(true)
 	if err := handshake(t, 5*time.Second); err != nil {
 		t.Fatalf("handshake after the certificate is ready: %v", err)
+	}
+}
+
+// TestRunMainConnectionCap: the main listener holds at most mainConns
+// connections; one more is closed before anything is read (U12-ASTRA-1).
+func TestRunMainConnectionCap(t *testing.T) {
+	w := newSrvWorld(t, srvOptions{})
+	if w.app.mainConns != MainMaxConns {
+		t.Fatalf("mainConns = %d, want MainMaxConns (%d)", w.app.mainConns, MainMaxConns)
+	}
+	const capacity = 2
+	w.app.mainConns = capacity
+	run := w.start(t)
+	dial := func(t *testing.T) net.Conn {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", run.mainAddr, time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() }) // test teardown; a second Close is harmless
+		if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatalf("SetDeadline: %v", err)
+		}
+		return c
+	}
+	// healthz sends one keep-alive request on c and returns the status.
+	healthz := func(c net.Conn) (int, error) {
+		if _, err := io.WriteString(c, "GET /healthz HTTP/1.1\r\nHost: check.test\r\n\r\n"); err != nil {
+			return 0, err
+		}
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil {
+			return 0, err
+		}
+		_ = resp.Body.Close() // empty body
+		return resp.StatusCode, nil
+	}
+
+	held := make([]net.Conn, capacity)
+	for i := range held {
+		held[i] = dial(t)
+		if st, err := healthz(held[i]); err != nil || st != http.StatusOK {
+			t.Fatalf("connection %d: /healthz = (%d, %v), want 200", i+1, st, err)
+		}
+	}
+	extra := dial(t)
+	if n, err := extra.Read(make([]byte, 1)); n != 0 || err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("connection %d: Read = (%d, %v), want (0, EOF or reset) before any byte", capacity+1, n, err)
+	}
+
+	// A released slot serves a new connection (the server notices the close asynchronously).
+	_ = held[0].Close() // frees a slot
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st, err := healthz(dial(t))
+		if err == nil && st == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no connection served within 5s of freeing a slot (last: %d, %v)", st, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRunReportsDroppedConnections: connections closed over a listener's
+// capacity are counted and reported, as counts only, in at most one Warn
+// line per interval and only after drops (U11-FABLE-4).
+func TestRunReportsDroppedConnections(t *testing.T) {
+	w := newSrvWorld(t, srvOptions{})
+	if w.app.dropReport != time.Minute {
+		t.Fatalf("dropReport = %v, want one minute", w.app.dropReport)
+	}
+	const interval = 50 * time.Millisecond
+	w.app.mainConns, w.app.dropReport = 1, interval
+	run := w.start(t)
+	dial := func(t *testing.T) net.Conn {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", run.mainAddr, time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() }) // test teardown
+		if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatalf("SetDeadline: %v", err)
+		}
+		return c
+	}
+	held := dial(t)
+	if _, err := io.WriteString(held, "GET /healthz HTTP/1.1\r\nHost: check.test\r\n\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if resp, err := http.ReadResponse(bufio.NewReader(held), nil); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("held connection: /healthz = (%v, %v), want 200", resp, err)
+	}
+	if n, err := dial(t).Read(make([]byte, 1)); n != 0 || err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("connection over capacity: Read = (%d, %v), want it closed", n, err)
+	}
+	const msg = "connections dropped over capacity"
+	waitFor(t, "a drop report", func() bool { return len(w.logs.withMsg(t, msg)) > 0 })
+	time.Sleep(4 * interval) // intervals without drops add no line
+	recs := w.logs.withMsg(t, msg)
+	if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["mainDropped"] != float64(1) || recs[0]["authDropped"] != float64(0) {
+		t.Errorf("drop reports = %v, want one WARN with mainDropped 1 and authDropped 0", recs)
 	}
 }
 

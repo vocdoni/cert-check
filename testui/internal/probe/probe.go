@@ -29,7 +29,8 @@ type Kind string
 const (
 	// KindOCSP sends one request for a random serial under Issuer.
 	KindOCSP Kind = "ocsp"
-	// KindCRL fetches a CRL, checks its signature against Issuer and its freshness.
+	// KindCRL fetches a CRL, checks its signature against Issuer and
+	// evaluates it as the checker does (freshness, IDP name and scope).
 	KindCRL Kind = "crl"
 	// KindSpecimen runs the full revocation check of a live specimen.
 	KindSpecimen Kind = "specimen"
@@ -48,6 +49,7 @@ type Target struct {
 	Issuer   *x509.Certificate // pinned CA: OCSP CertID issuer, CRL signer or the specimen's issuer
 	Specimen *x509.Certificate // KindSpecimen only: a live certificate expected to be good
 	Policy   revocation.Policy // the profile's policy: host allowlists and nonce
+	Scope    revocation.Scope  // KindCRL: what the CRL is evaluated for; zero means ScopeLeaf
 }
 
 func (t Target) validate(rc *revocation.Checker) error {
@@ -84,8 +86,11 @@ type Summary struct {
 	OK, Warn, Fail int
 }
 
-// Failed reports whether any target failed (the probe exits non-zero).
-func (s Summary) Failed() bool { return s.Fail > 0 }
+// Failed reports whether any target failed, or whether nothing was verified
+// (no OK line and at least one WARN); the probe then exits non-zero.
+func (s Summary) Failed() bool { return s.Fail > 0 || s.nothingVerified() }
+
+func (s Summary) nothingVerified() bool { return s.OK == 0 && s.Warn > 0 }
 
 func (s *Summary) add(v Verdict) {
 	switch v {
@@ -143,7 +148,11 @@ func run(ctx context.Context, rc *revocation.Checker, f *revocation.Fetcher, tar
 			return sum, err
 		}
 	}
-	_, err := fmt.Fprintf(w, "summary: %d ok, %d warn, %d fail\n", sum.OK, sum.Warn, sum.Fail)
+	note := ""
+	if sum.nothingVerified() {
+		note = " (no endpoint verified)"
+	}
+	_, err := fmt.Fprintf(w, "summary: %d ok, %d warn, %d fail%s\n", sum.OK, sum.Warn, sum.Fail, note)
 	return sum, err
 }
 
@@ -159,7 +168,7 @@ type line struct {
 	detail     string
 	signerKey  string // "responder" (OCSP) or "issuer" (CRL)
 	signer     string
-	nonce      string // "required|optional/echoed|absent|mismatch", "-" when not applicable
+	nonce      string // "required/echoed|absent|mismatch", "-" when no nonce was sent
 	thisUpdate time.Time
 	nextUpdate time.Time
 	size       int // CRL bytes
@@ -202,9 +211,8 @@ func (l line) finish(st revocation.Status, detail string, accepted ...revocation
 // never-issued serial may come back revoked, unknown or even good.
 var ocspAnswered = []revocation.Status{revocation.StatusGood, revocation.StatusRevoked, revocation.StatusUnknown}
 
-// probeOCSP sends one request for a random serial under t.Issuer. A nonce
-// is always sent so the report shows whether the responder echoes it; it is
-// required (as the checker requires it) only when the profile says so.
+// probeOCSP sends one request for a random serial under t.Issuer, with a
+// nonce only when the profile requires one, as the checker does.
 func probeOCSP(ctx context.Context, f *revocation.Fetcher, t Target, now time.Time) line {
 	l := line{profile: t.Profile, kind: t.Kind, where: hostPath(t.URL), signerKey: "responder", nonce: "-"}
 	serial, err := randomSerial()
@@ -215,9 +223,12 @@ func probeOCSP(ctx context.Context, f *revocation.Fetcher, t Target, now time.Ti
 	if err != nil {
 		return l.finish(revocation.StatusInvalidEvidence, err.Error())
 	}
-	nonce := make([]byte, revocation.NonceLength)
-	if _, err := rand.Read(nonce); err != nil {
-		return l.finish(revocation.StatusUnavailable, "nonce generation failed")
+	var nonce []byte
+	if t.Policy.OCSPNonce {
+		nonce = make([]byte, revocation.NonceLength)
+		if _, err := rand.Read(nonce); err != nil {
+			return l.finish(revocation.StatusUnavailable, "nonce generation failed")
+		}
 	}
 	reqDER, nonceExt, err := revocation.MarshalRequest(id, nonce)
 	if err != nil {
@@ -235,35 +246,31 @@ func probeOCSP(ctx context.Context, f *revocation.Fetcher, t Target, now time.Ti
 	if err != nil {
 		return l.finish(revocation.StatusInvalidEvidence, err.Error())
 	}
-	in := revocation.OCSPInput{Response: resp, Want: id, Issuer: t.Issuer, Now: now, MaxAge: t.Policy.MaxAge()}
-	if t.Policy.OCSPNonce {
-		in.Nonce = nonceExt
-	}
-	ev, st, detail := revocation.VerifyOCSP(in)
+	ev, st, detail := revocation.VerifyOCSP(revocation.OCSPInput{Response: resp, Want: id, Issuer: t.Issuer, Now: now,
+		MaxAge: t.Policy.MaxAge(), Nonce: nonceExt})
 	l.signer, l.thisUpdate, l.nextUpdate = ev.ResponderSubject, ev.Single.ThisUpdate, ev.Single.NextUpdate
-	l.nonce = nonceState(t.Policy.OCSPNonce, resp, nonceExt)
+	if nonceExt != nil {
+		l.nonce = nonceState(resp, nonceExt)
+	}
 	return l.finish(st, detail, ocspAnswered...)
 }
 
 // nonceState reports whether resp echoes the nonce extension value sent.
-func nonceState(required bool, resp *revocation.Response, sent []byte) string {
-	prefix := "optional/"
-	if required {
-		prefix = "required/"
-	}
+func nonceState(resp *revocation.Response, sent []byte) string {
 	for _, e := range resp.Extensions {
 		if e.ID.Equal(oidOCSPNonce) {
 			if bytes.Equal(e.Value, sent) {
-				return prefix + "echoed"
+				return "required/echoed"
 			}
-			return prefix + "mismatch"
+			return "required/mismatch"
 		}
 	}
-	return prefix + "absent"
+	return "required/absent"
 }
 
 // probeCRL fetches t.URL, checks the signature and issuer against t.Issuer
-// (ParseCRL) and the freshness rules of revocation.EvaluateCRL.
+// (ParseCRL) and evaluates the CRL with revocation.EvaluateCRL for a random
+// serial of a certificate whose CDP names t.URL, at t.Scope.
 func probeCRL(ctx context.Context, f *revocation.Fetcher, t Target, now time.Time) line {
 	l := line{profile: t.Profile, kind: t.Kind, where: hostPath(t.URL), signerKey: "issuer", nonce: "-"}
 	fr, err := f.Fetch(ctx, revocation.FetchRequest{URL: t.URL, MaxBytes: revocation.MaxCRLResponse,
@@ -279,17 +286,25 @@ func probeCRL(ctx context.Context, f *revocation.Fetcher, t Target, now time.Tim
 		}
 		return l.finish(st, err.Error())
 	}
-	rl := parsed.List
-	l.signer, l.thisUpdate, l.nextUpdate = rl.Issuer.String(), rl.ThisUpdate, rl.NextUpdate
-	switch {
-	case rl.ThisUpdate.After(now.Add(revocation.ClockSkew)):
-		return l.finish(revocation.StatusStale, "crl thisUpdate in the future")
-	case rl.NextUpdate.IsZero():
-		return l.finish(revocation.StatusStale, "crl without nextUpdate")
-	case rl.NextUpdate.Before(now):
-		return l.finish(revocation.StatusStale, "crl nextUpdate in the past")
+	l.signer, l.thisUpdate, l.nextUpdate = t.Issuer.Subject.String(), parsed.ThisUpdate, parsed.NextUpdate // ParseCRL checked the issuer name
+	serial, err := randomSerial()
+	if err != nil {
+		return l.finish(revocation.StatusUnavailable, err.Error())
 	}
-	return l.finish(revocation.StatusGood, fmt.Sprintf("%d entries", len(parsed.Listed)), revocation.StatusGood)
+	dp, err := revocation.URIDistributionPoint(t.URL)
+	if err != nil {
+		return l.finish(revocation.StatusInvalidEvidence, err.Error())
+	}
+	scope := t.Scope
+	if scope == 0 {
+		scope = revocation.ScopeLeaf
+	}
+	// Any listing of the random serial counts: the CRL applies and is fresh.
+	st, _, detail := revocation.EvaluateCRL(parsed, &x509.Certificate{SerialNumber: serial}, dp, scope, now)
+	if st == revocation.StatusGood || st == revocation.StatusRevoked {
+		detail = fmt.Sprintf("%d entries", len(parsed.Listed))
+	}
+	return l.finish(st, detail, revocation.StatusGood, revocation.StatusRevoked)
 }
 
 // probeSpecimen runs rc.Check on a live specimen and expects good. The line

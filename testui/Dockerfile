@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1
+# No frontend directive: nothing here needs a newer Dockerfile frontend than the
+# builder's own, and an unpinned one would be fetched by mutable tag on every build.
 
 # Build context: the repository root (Railway: source.rootDirectory unset,
 # build.dockerfilePath testui/Dockerfile; locally: docker build -f testui/Dockerfile .).
@@ -6,6 +7,8 @@
 
 # golang:1.27 (multi-arch index, resolved 2026-10-31 with `docker buildx imagetools inspect golang:1.27`)
 FROM golang:1.27@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b AS build
+# Build with the pinned image's Go only: a go.mod above it fails here instead of downloading a toolchain.
+ENV GOTOOLCHAIN=local
 WORKDIR /src
 COPY go.mod go.sum ./
 COPY testui/go.mod testui/go.sum ./testui/

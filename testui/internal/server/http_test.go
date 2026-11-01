@@ -92,6 +92,7 @@ func TestMainHeaders(t *testing.T) {
 
 func TestAuthHeaders(t *testing.T) {
 	want := map[string]string{
+		"Connection":                "close",
 		"Content-Security-Policy":   "default-src 'none'; frame-ancestors 'none'",
 		"Referrer-Policy":           "no-referrer",
 		"X-Content-Type-Options":    "nosniff",
@@ -238,13 +239,15 @@ func TestClientIP(t *testing.T) {
 		{"entry with port", peer, []string{"1.1.1.1:443"}, 1, "10.0.0.9"},
 		{"whitespace", peer, []string{" 1.1.1.1 ,  2.2.2.2 "}, 1, "2.2.2.2"},
 		{"hops 0", peer, []string{"1.1.1.1, 2.2.2.2"}, 0, "10.0.0.9"},
-		// IPv6 clients are keyed by their /64 (one allocation), IPv4 by address.
+		// IPv6 clients are keyed by their /56 (one subscriber's allocation), IPv4 by address.
 		{"IPv6 entry", peer, []string{"1.1.1.1, 2001:db8::1"}, 1, "2001:db8::"},
 		{"IPv6 entry same /64", peer, []string{"2001:db8::ffff:1234:5678:9abc"}, 1, "2001:db8::"},
-		{"IPv6 entry other /64", peer, []string{"2001:db8:0:1::1"}, 1, "2001:db8:0:1::"},
+		{"IPv6 entry other /64 of the /56", peer, []string{"2001:db8:0:ff::1"}, 1, "2001:db8::"},
+		{"IPv6 entry other /56", peer, []string{"2001:db8:0:100::1"}, 1, "2001:db8:0:100::"},
 		{"IPv4-mapped entry", peer, []string{"::ffff:1.2.3.4"}, 1, "1.2.3.4"},
 		{"IPv6 peer", "[2001:db8::9]:443", nil, 1, "2001:db8::"},
-		{"IPv6 peer other /64", "[2001:db8:0:2::9]:443", nil, 1, "2001:db8:0:2::"},
+		{"IPv6 peer other /64 of the /56", "[2001:db8:0:2::9]:443", nil, 1, "2001:db8::"},
+		{"IPv6 peer other /56", "[2001:db8:0:200::9]:443", nil, 1, "2001:db8:0:200::"},
 		{"IPv6 zoned peer", "[fe80::1%eth0]:443", nil, 1, "fe80::"},
 		{"IPv4-mapped peer", "[::ffff:10.0.0.9]:443", nil, 1, "10.0.0.9"},
 		{"bad peer", "garbage", nil, 1, ""},
@@ -333,5 +336,45 @@ func TestIPLimiterBounded(t *testing.T) {
 	}
 	if n := size(); n != 1 {
 		t.Errorf("entries after pruning = %d, want 1", n)
+	}
+}
+
+// TestIPLimiterFullTableSweepsOncePerInterval: on a full table a newcomer
+// triggers at most one prune scan per limiterSweepInterval; in between,
+// newcomers are refused without scanning (U11-ASTRA-1).
+func TestIPLimiterFullTableSweepsOncePerInterval(t *testing.T) {
+	const perMinute = 20
+	t0 := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	l := newIPLimiter(perMinute)
+	for i := range maxLimiterEntries {
+		if ok, _ := l.allow(netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}), t0); !ok {
+			t.Fatalf("client %d refused while filling the table", i)
+		}
+	}
+	size := func() int {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return len(l.entries)
+	}
+	newcomer := func(i int) netip.Addr { return netip.AddrFrom4([4]byte{192, 0, 2, byte(i)}) }
+
+	// The entries are not idle beyond the prune window yet: this sweep frees nothing.
+	sweep := t0.Add(10 * time.Minute)
+	if ok, _ := l.allow(newcomer(1), sweep); ok {
+		t.Fatal("newcomer allowed on a full table of active clients")
+	}
+	// Every entry is now prunable, but the next sweep is not due: refused, nothing scanned.
+	if ok, _ := l.allow(newcomer(2), sweep.Add(limiterSweepInterval-time.Second)); ok {
+		t.Error("newcomer allowed before the next sweep was due, want refused without a scan")
+	}
+	if n := size(); n != maxLimiterEntries {
+		t.Errorf("entries before the next sweep = %d, want %d (no scan)", n, maxLimiterEntries)
+	}
+	// The next sweep is due: the idle entries go and the newcomer gets in.
+	if ok, _ := l.allow(newcomer(3), sweep.Add(limiterSweepInterval)); !ok {
+		t.Error("newcomer refused once the sweep was due and the table was idle")
+	}
+	if n := size(); n != 1 {
+		t.Errorf("entries after the due sweep = %d, want 1", n)
 	}
 }

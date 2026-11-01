@@ -63,6 +63,7 @@ mkcert -cert-file "$D/cert.pem" -key-file "$D/key.pem" '*.auth.localtest.me'
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
   -subj '/CN=*.auth.localtest.me' -addext 'subjectAltName=DNS:*.auth.localtest.me' \
   -keyout "$D/key.pem" -out "$D/cert.pem"
+chmod 600 "$D/key.pem"   # readable by you only; the container below runs as your UID
 ```
 
 Run the service from the `testui` directory (the module that holds `main.go`):
@@ -83,8 +84,8 @@ locally. Build it from the repository root, because the build context must inclu
 
 ```sh
 docker build -f testui/Dockerfile -t cert-check:local .
-chmod 644 "$D"/*.pem   # the container runs as UID 65532; these are throwaway local files
-docker run --rm -p 8080:8080 -p 8443:8443 -v "$D":/certs:ro \
+# --user: run as your UID so the static binary can read the 0600 key without loosening its mode
+docker run --rm --user "$(id -u):$(id -g)" -p 8080:8080 -p 8443:8443 -v "$D":/certs:ro \
   -e CERTCHECK_PUBLIC_URL=http://localhost:8080 -e CERTCHECK_AUTH_DOMAIN=auth.localtest.me \
   -e CERTCHECK_AUTH_PUBLIC_PORT=8443 -e CERTCHECK_TLS_CERT_FILE=/certs/cert.pem \
   -e CERTCHECK_TLS_KEY_FILE=/certs/key.pem cert-check:local
@@ -113,10 +114,10 @@ a message that lists every problem and never prints a secret.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `8080` | Main listener port (Railway sets it) |
-| `CERTCHECK_PUBLIC_URL` | required | Fixed callback origin, e.g. `https://cert-check.vocdoni.dev`. https only, http for localhost and 127.0.0.1 |
+| `CERTCHECK_PUBLIC_URL` | required | Fixed callback origin, e.g. `https://cert-check.vocdoni.dev`. https only, http for localhost and 127.0.0.1. No path other than `/`, no query, fragment or userinfo; the host is lowercased and a default port dropped |
 | `CERTCHECK_AUTH_DOMAIN` | required | Lowercase DNS name whose wildcard hosts the providers, e.g. `auth.cert-check.vocdoni.dev` |
 | `CERTCHECK_AUTH_PUBLIC_PORT` | `$RAILWAY_TCP_PROXY_PORT` | External auth port used in `authUrl`. Required: set it when `RAILWAY_TCP_PROXY_PORT` is absent |
-| `CERTCHECK_AUTH_LISTEN` | `:8443` | Auth listener address |
+| `CERTCHECK_AUTH_LISTEN` | `:8443` | Auth listener address, `host:port` with a numeric port between 1 and 65535 |
 | `CERTCHECK_DATA_DIR` | `/data` | ACME storage: `<dir>/certmagic` (the Railway volume) |
 | `CERTCHECK_ACME_EMAIL` | required with ACME | ACME account contact (a mailbox the owner controls) |
 | `CERTCHECK_ACME_CA` | `production` | `production` or `staging` (Let's Encrypt) |
@@ -126,11 +127,12 @@ a message that lists every problem and never prints a secret.
 | `CERTCHECK_AUTH_TLS13` | `false` | Allow TLS 1.3 on the auth listener (see [Security notes](#6-security-notes)) |
 | `CERTCHECK_TRUSTED_PROXY_HOPS` | `1` | Trusted proxy hops, 0 to 10. The client IP is the entry that many places from the right of `X-Forwarded-For` |
 | `CERTCHECK_LOG_LEVEL` | `info` | slog level: `debug`, `info`, `warn`, `error` |
-| `RAILWAY_RUN_UID` | set on the service: `0` | Platform setting, not read by the app. Railway mounts volumes as root, so the process must run as root to create `/data/certmagic` |
+| `RAILWAY_RUN_UID` | set on the service: `0` | Platform setting, not read by the app. Railway mounts volumes as root, so the process must run as root to create `/data/certmagic` (accepted, see [Security notes](#6-security-notes)) |
 | `RAILWAY_GIT_COMMIT_SHA` | `dev` | Docker build argument, injected by Railway; becomes the reported `serverVersion` |
 
 The Docker image exposes `8080` and `8443` and runs the static binary in
-`gcr.io/distroless/static-debian12:nonroot` (UID 65532 by default).
+`gcr.io/distroless/static-debian12:nonroot` (UID 65532 by default). On Railway, `RAILWAY_RUN_UID=0`
+overrides that default and the process runs as root (see [Security notes](#6-security-notes)).
 
 ## 4. Operations
 
@@ -146,19 +148,31 @@ Production: Railway project `CertificateCheck`, environment `production`, servic
    job) and govulncheck. The job also runs a 30 s fuzz smoke per target (root module), the dependency
    isolation check (the root module's dependencies contain no certmagic, libdns, zap or `x/time`
    package), the `go doc` golden diff of the root package and a Docker build of `testui/Dockerfile`.
-   The runner needs a C toolchain for `-race`, and Docker for the last step (the step warns and skips
-   when Docker is missing).
+   The runner needs a C toolchain for `-race`, `jq` (a red test step prints the output of the failing
+   packages with it), and Docker for the last step (the step warns and skips when Docker is missing).
 2. Merging to `main` runs the same job. Railway deploys `main` only after the CI check passes
    ("wait for CI"). A cancelled `main` run would leave its commit undeployed, so only pull request
-   runs are cancelled when superseded.
+   runs are cancelled when superseded. Never push or merge to `main` with `[skip ci]`, `[ci skip]`,
+   `[no ci]`, `[skip actions]` or `[actions skip]` in the commit message or squash title: GitHub then
+   creates no `ci` run at all, and wait-for-CI, which blocks only on a failing run, deploys the commit
+   untested. Merge pull requests whose own `ci` run is green.
 3. Railway builds `testui/Dockerfile` with the repository root as the build context, starts the
    container and polls `/readyz` for up to 600 s. The new deployment takes over only when it returns
    200, that is when the providers are loaded, both listeners are up and the auth certificate is
    present and valid.
 4. The runner group `Default` must admit the repository, otherwise the job queues forever:
    `gh api orgs/vocdoni/actions/runner-groups --jq '.runner_groups[]|{name,visibility,allows_public_repositories}'`.
-5. If the org plan allows branch protection on private repositories, require the status check `ci` on
-   `main`. If not, Railway's wait-for-CI is the only gate.
+   A `pull_request` run executes the workflow file of the pull request's head on these runners, with
+   the Docker daemon (root on the host) and the Go caches that later `main` runs reuse, so nothing in
+   `ci.yml` can protect them. The protection is these settings, all required:
+   - runner group: `visibility` `selected`, listing this repository only, and
+     `allows_public_repositories` `false`;
+   - the repository stays private; in its Actions settings, running workflows from fork pull requests
+     is disabled, and fork pull request workflows require approval for all outside collaborators;
+   - runners are registered with `--ephemeral`, so every job starts with fresh `GOMODCACHE` and
+     `GOCACHE` and no job can poison the caches of the next.
+5. Branch protection (or a ruleset) on `main` requires the status check `ci`. Railway's wait-for-CI is
+   the second gate, not a substitute: it never blocks a commit that has no `ci` run (step 2).
 
 ### Railway service settings
 
@@ -331,31 +345,36 @@ responder outage.
 
 `cert-check probe [specimen-dir...]` checks every default OCSP responder and CRL endpoint from the
 network it runs in. It needs no configuration and starts no server. For each enabled profile it asks
-each responder about a never-issued serial (a nonce is always sent), and it fetches each CRL and checks
-its signature against the pinned CA and its freshness window. For DNIe that means the root's
-`CRL.crl` and `ARL.crl`, which together cover the pinned intermediates. Each `specimen-dir` argument
-is a directory of `*.pem` files. The known live specimens found there get the full revocation check and
-must come back `good`; other certificates are ignored. The DIGITEL specimen is committed in
-`testdata/specimens` (repository root). The Bewor and Sectigo specimens are withheld and kept outside
-the repository.
+each responder about a never-issued serial, with a nonce only when the profile requires one, as the
+checker does. It fetches each CRL, checks its signature against the pinned CA and evaluates it with
+the checker's own rules: its dates and freshness, and its Issuing Distribution Point (the name must
+include the CRL's URL, and no scope flag the checker rejects). For DNIe that means the root's
+`CRL.crl` and `ARL.crl`, evaluated at CA scope because together they cover the pinned intermediates.
+Each `specimen-dir` argument is a directory of `*.pem` files (regular files of at most 64 KiB). The
+known live specimens found there get the full revocation check and must come back `good`; other
+certificates are ignored, but a directory with no known live specimen is an error. The DIGITEL
+specimen is committed in `testdata/specimens` (repository root). The Bewor and Sectigo specimens are
+withheld and kept outside the repository.
 
 It prints one line per target: verdict, profile, method, host and path, HTTP status, milliseconds,
 outcome, responder or CRL issuer subject, nonce state, `thisUpdate` and `nextUpdate` (CRLs also print
-`bytes`), and a detail. The nonce state is `required/…` when the profile demands the echo and
-`optional/…` otherwise, followed by `echoed`, `absent` or `mismatch`. The last line is
-`summary: N ok, N warn, N fail`.
+`bytes`), and a detail. The nonce state is `required/` followed by `echoed`, `absent` or `mismatch`
+when the profile requires a nonce, and `-` when none was sent. The last line is
+`summary: N ok, N warn, N fail`, followed by `(no endpoint verified)` when no line is OK.
 
-- **OK**: evidence the checker accepts. Any certStatus for the random serial counts, as does a fresh,
-  correctly signed CRL or a specimen that comes back `good`.
+- **OK**: evidence the checker accepts. Any certStatus for the random serial counts, as does a
+  correctly signed CRL the checker would use, or a specimen that comes back `good`.
 - **WARN**: `unavailable`. The endpoint could not be reached, or it answered with an HTTP error or a
   non-successful OCSP `responseStatus`. The idCAT G3, Sectigo and Firmaprofesional responders answer
   `responseStatus 6` (unauthorized) for a never-issued serial, so their lines are WARN by design.
 - **FAIL**: any other outcome. That is evidence the checker would reject (`invalid_evidence`,
   `stale`, `unsupported_method`), or a specimen that comes back `revoked` or `unknown`.
 
-Exit codes: `0` when no line is FAIL. `1` when any line is FAIL, or when the probe cannot run (a
-specimen directory that cannot be read, a `*.pem` file without a certificate, an interrupted run); the
-reason goes to stderr.
+Exit codes: `0` when no line is FAIL and at least one is OK. `1` when any line is FAIL, when no line
+is OK (every line WARN, for example without egress: nothing was verified), or when the probe cannot
+run (a specimen directory that cannot be read or holds no known live specimen, a `*.pem` file that is
+not a regular file, is larger than 64 KiB or holds no certificate, an interrupted run); the reason goes
+to stderr.
 
 Run it from the deployment network with a temporary service in the same project and repository. The
 image carries no specimens, so this run covers the endpoints only:
@@ -399,7 +418,7 @@ go test -tags live -race -count=1 -run 'TestWithheldSpecimensRejectedTwice' ./..
   success; with the production markers it is `test_certificate`.
 - `TestLiveProbe` (`testui/internal/probe`) runs the probe above, with the committed DIGITEL specimen
   and the withheld Bewor and Sectigo specimens from `CERTCHECK_LIVE_SPECIMENS_DIR`. It fails on any FAIL
-  line.
+  line, or when no line is OK.
 - `TestWithheldSpecimensRejectedTwice` (`internal/engine`, root module) checks that the withheld
   specimens are rejected with the codes in `testdata/specimens/MANIFEST.md`.
 
@@ -466,5 +485,11 @@ The package's own security notes (pinned anchors, test markers, `NewHandler` che
 - **Fail closed.** Only the chain that `x509.Verify` builds from the pinned roots and intermediates is
   used, and only revocation status `good` passes. The certificates a client sends are never used for
   path building or revocation.
-- **CI runners.** The job runs repository code on org self-hosted runners. Keep the repository private
-  and do not enable workflows for forks.
+- **Root on Railway, accepted.** The image's default user is UID 65532 (`nonroot`), but Railway mounts
+  the `/data` volume owned by root and its only documented workaround is `RAILWAY_RUN_UID=0`. In
+  production the process, both listeners and the ACME client therefore run as UID 0 inside the
+  container, and there is no in-process privilege drop. The accepted mitigations: a static Go binary
+  (no cgo, no dynamic loader), a distroless image with no shell or package manager, and no privileged
+  port needed (8080 and 8443).
+- **CI runners.** The job runs repository code on org self-hosted runners. Keep the repository private,
+  do not run workflows from forks, and keep the runner settings of [Deploy flow](#deploy-flow) step 4.

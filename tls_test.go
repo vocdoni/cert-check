@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -144,6 +145,24 @@ func TestAuthenticateErrorCarriesTLS(t *testing.T) {
 	}
 }
 
+// TestAuthenticateForgedIssuerDN: Go's client offers a certificate whose
+// issuer DN matches an advertised CA, so a leaf with alpha's CA subject as
+// issuer but another signer reaches the handler, which rejects it.
+func TestAuthenticateForgedIssuerDN(t *testing.T) {
+	w := newHWorld(t)
+	as := w.startServer(t)
+	forged := testpki.NewRoot(t, "Handler Alpha Root", testpki.CertSpec{Now: w.now})
+	leaf := w.issue(t, forged, hPolicyA, nil).TLSCertificate()
+	call := as.get(t, as.client(t, &tls.Config{RootCAs: as.pool, Certificates: []tls.Certificate{leaf}}), alphaHost)
+	e := hErr(t, call.err)
+	if e.Code != certcheck.CodeUntrustedIssuer || e.Diagnostics.FailedStep != certcheck.StepPath {
+		t.Errorf("got %s at %q, want %s at %q", e.Code, e.Diagnostics.FailedStep, certcheck.CodeUntrustedIssuer, certcheck.StepPath)
+	}
+	if got := e.Diagnostics.TLS; got == nil || !got.ClientCertificatePresented {
+		t.Errorf("Diagnostics.TLS = %+v, want the certificate presented (the issuer filter passed)", got)
+	}
+}
+
 func TestAuthenticateRunsEveryRequest(t *testing.T) {
 	w := newHWorld(t)
 	as := w.startServer(t)
@@ -158,6 +177,136 @@ func TestAuthenticateRunsEveryRequest(t *testing.T) {
 	}
 	if a, b := first.res.Diagnostics.DiagnosticID, second.res.Diagnostics.DiagnosticID; a == "" || a == b {
 		t.Errorf("DiagnosticIDs = %q, %q, want two distinct IDs", a, b)
+	}
+}
+
+// sharedProvider returns the same outcome to every call: a consumer Provider
+// may hand out a package-level *Error or *Result.
+type sharedProvider struct {
+	ca  *x509.Certificate
+	res *certcheck.Result
+	err error
+}
+
+func (sharedProvider) Info() certcheck.ProviderInfo {
+	return certcheck.ProviderInfo{ID: "shared", Name: "Shared"}
+}
+func (p sharedProvider) CAs() []*x509.Certificate { return []*x509.Certificate{p.ca} }
+func (p sharedProvider) Verify(context.Context, []*x509.Certificate) (*certcheck.Result, error) {
+	return p.res, p.err
+}
+
+// TestAuthSharedOutcome: Auth and AuthAs add the handshake details to a copy
+// of the provider's outcome, never to the shared value (run with -race).
+func TestAuthSharedOutcome(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	leaf := w.leaf(t, w.rootU, hPolicyA, nil)
+	sharedErr := &certcheck.Error{Code: certcheck.CodeRevoked, Detail: "revoked",
+		Diagnostics: certcheck.Diagnostics{Provider: "shared", FailedStep: certcheck.StepRevocation, Code: certcheck.CodeRevoked}}
+	sharedRes := &certcheck.Result{Provider: certcheck.ProviderRef{ID: "shared", Name: "Shared"}}
+	for _, tc := range []struct {
+		name     string
+		provider sharedProvider
+		tlsOf    func() *certcheck.TLSInfo // the shared value's TLS details
+	}{
+		{"*Error", sharedProvider{ca: w.rootU.Cert, err: sharedErr}, func() *certcheck.TLSInfo { return sharedErr.Diagnostics.TLS }},
+		{"wrapped *Error", sharedProvider{ca: w.rootU.Cert, err: fmt.Errorf("wrapped: %w", sharedErr)}, func() *certcheck.TLSInfo { return sharedErr.Diagnostics.TLS }},
+		{"*Result", sharedProvider{ca: w.rootU.Cert, res: sharedRes}, func() *certcheck.TLSInfo { return sharedRes.Diagnostics.TLS }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, err := certcheck.NewHandler([]certcheck.Provider{tc.provider})
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+			var wg sync.WaitGroup
+			for i := range 8 {
+				wg.Go(func() {
+					sni := fmt.Sprintf("host%d.auth.test", i)
+					r := httptest.NewRequest(http.MethodGet, "https://"+sni+"/login", nil)
+					r.TLS = &tls.ConnectionState{Version: tls.VersionTLS12, ServerName: sni, PeerCertificates: []*x509.Certificate{leaf}}
+					var res *certcheck.Result
+					var err error
+					if i%2 == 0 {
+						res, err = h.Auth(r)
+					} else {
+						res, err = h.AuthAs(r, "shared")
+					}
+					var got *certcheck.TLSInfo
+					if e, ok := errors.AsType[*certcheck.Error](err); ok {
+						got = e.Diagnostics.TLS
+					} else if res != nil {
+						got = res.Diagnostics.TLS
+					}
+					if got == nil || got.SNI != sni {
+						t.Errorf("call %d: Diagnostics.TLS = %+v, want SNI %s", i, got, sni)
+					}
+				})
+			}
+			wg.Wait()
+			if got := tc.tlsOf(); got != nil {
+				t.Errorf("shared outcome's Diagnostics.TLS = %+v, want nil (untouched)", got)
+			}
+		})
+	}
+}
+
+// TestTLSConfigALPN: TLSConfig offers http/1.1 only, but net/http adds h2
+// unless http.Server.Protocols allows HTTP/1 only (the TLSConfig doc and the
+// Handler.Auth example say so). If a Go release stops adding h2, the first
+// case fails and the doc can be relaxed.
+func TestTLSConfigALPN(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	serverCert, pool := testpki.ServerTLS(t, alphaHost)
+	var http1 http.Protocols
+	http1.SetHTTP1(true)
+	for _, tc := range []struct {
+		name      string
+		protocols *http.Protocols
+		h2        string // protocol an h2-only client negotiates; "" = the handshake fails
+	}{
+		{"Protocols unset", nil, "h2"},
+		{"Protocols HTTP/1 only", &http1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			srv := &http.Server{Handler: http.NotFoundHandler(), Protocols: tc.protocols,
+				ErrorLog:  slog.NewLogLogger(slog.DiscardHandler, slog.LevelError),
+				TLSConfig: w.h.TLSConfig(func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &serverCert, nil })}
+			done := make(chan error, 1)
+			go func() { done <- srv.ServeTLS(ln, "", "") }()
+			t.Cleanup(func() {
+				if err := srv.Close(); err != nil {
+					t.Errorf("Close: %v", err)
+				}
+				if err := <-done; !errors.Is(err, http.ErrServerClosed) {
+					t.Errorf("ServeTLS = %v, want %v", err, http.ErrServerClosed)
+				}
+			})
+			dial := func(protos ...string) (string, error) {
+				d := tls.Dialer{Config: &tls.Config{RootCAs: pool, ServerName: alphaHost, NextProtos: protos}}
+				conn, err := d.DialContext(t.Context(), "tcp", ln.Addr().String())
+				if err != nil {
+					return "", err
+				}
+				defer conn.Close()
+				return conn.(*tls.Conn).ConnectionState().NegotiatedProtocol, nil
+			}
+			if got, err := dial("http/1.1"); err != nil || got != "http/1.1" {
+				t.Errorf("http/1.1 client: (%q, %v), want http/1.1", got, err)
+			}
+			got, err := dial("h2")
+			switch {
+			case tc.h2 == "" && err == nil:
+				t.Errorf("h2-only client negotiated %q, want a handshake failure", got)
+			case tc.h2 != "" && (err != nil || got != tc.h2):
+				t.Errorf("h2-only client: (%q, %v), want %q", got, err, tc.h2)
+			}
+		})
 	}
 }
 

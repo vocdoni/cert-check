@@ -63,9 +63,12 @@ func mainHeaders(next http.Handler) http.Handler {
 
 // authHeaders sets the auth-listener headers (redirects and 404s alike). The
 // Content-Type is fixed so that http.Redirect writes no HTML body: the auth
-// listener never renders HTML (spec "Authentication flow" step 4).
+// listener never renders HTML (spec "Authentication flow" step 4). Every
+// response is terminal (the browser leaves for the public origin), so the
+// connection closes after it: one connection cannot pipeline a request flood.
 func authHeaders(w http.ResponseWriter) {
 	h := w.Header()
+	h.Set("Connection", "close")
 	h.Set("Content-Security-Policy", authCSP)
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Content-Type-Options", "nosniff")
@@ -137,21 +140,23 @@ func clientIP(r *http.Request, trustedHops int) netip.Addr {
 	return bucket(a)
 }
 
-// bucket keys IPv6 clients by their /64 (one allocation), IPv4 by address.
-// One /64 holder cannot fill the limiter table with distinct addresses.
+// bucket keys IPv6 clients by their /56 (a residential subscriber's
+// allocation: 256 /64s), IPv4 by address. One subscriber cannot spread its
+// requests over many buckets or fill the limiter table.
 func bucket(a netip.Addr) netip.Addr {
 	a = a.Unmap()
 	if a.Is6() {
-		return netip.PrefixFrom(a, 64).Masked().Addr()
+		return netip.PrefixFrom(a, 56).Masked().Addr()
 	}
 	return a
 }
 
 // ipLimiter is a per-IP token bucket with bounded memory.
 type ipLimiter struct {
-	mu      sync.Mutex
-	perMin  int
-	entries map[netip.Addr]*ipEntry
+	mu        sync.Mutex
+	perMin    int
+	entries   map[netip.Addr]*ipEntry
+	nextSweep time.Time // earliest prune scan of a full table
 }
 
 type ipEntry struct {
@@ -160,6 +165,10 @@ type ipEntry struct {
 }
 
 const maxLimiterEntries = 100_000
+
+// limiterSweepInterval is the minimum time between prune scans of a full
+// table; newcomers in between are refused without a scan.
+const limiterSweepInterval = time.Minute
 
 func newIPLimiter(perMinute int) *ipLimiter {
 	return &ipLimiter{perMin: perMinute, entries: map[netip.Addr]*ipEntry{}}
@@ -172,7 +181,10 @@ func (l *ipLimiter) allow(ip netip.Addr, now time.Time) (ok bool, retryAfter tim
 	e, found := l.entries[ip]
 	if !found {
 		if len(l.entries) >= maxLimiterEntries {
-			l.pruneLocked(now)
+			if !now.Before(l.nextSweep) {
+				l.nextSweep = now.Add(limiterSweepInterval)
+				l.pruneLocked(now)
+			}
 			if len(l.entries) >= maxLimiterEntries {
 				return false, time.Minute / time.Duration(l.perMin) // table full: refuse new clients, memory stays bounded
 			}

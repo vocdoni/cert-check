@@ -123,7 +123,9 @@ func NewStore(capacity int, now func() time.Time) *Store {
 }
 
 // Create starts a transaction for provider. prev, when it names an existing
-// transaction (the request's old cookie), is deleted first.
+// transaction (the request's old cookie), is deleted first. A full store
+// evicts its oldest transaction whose state was never consumed; ErrStoreFull
+// means every transaction is being validated or holds an outcome.
 func (s *Store) Create(provider string, prev Secret) (cookie, state Secret, expiresAt time.Time, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -135,7 +137,7 @@ func (s *Store) Create(provider string, prev Secret) (cookie, state Secret, expi
 	}
 	if len(s.byCookie) >= s.capacity {
 		s.sweepLocked(now)
-		if len(s.byCookie) >= s.capacity {
+		if len(s.byCookie) >= s.capacity && !s.evictPendingLocked() {
 			return "", "", time.Time{}, ErrStoreFull
 		}
 	}
@@ -169,12 +171,17 @@ func (s *Store) ConsumeState(state Secret, provider string) (TxRef, error) {
 	return TxRef{id: t.id}, nil
 }
 
-// Complete stores the outcome and issues the one-use code.
+// Complete stores the outcome and issues the one-use code. It returns
+// ErrInvalidState when the transaction is gone (replaced or evicted) and
+// ErrExpired when it outlived TxLifetime.
 func (s *Store) Complete(ref TxRef, o Outcome) (Secret, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t, found := s.byCookie[ref.id]
-	if !found || !s.now().Before(t.expiresAt) {
+	if !found {
+		return "", ErrInvalidState
+	}
+	if !s.now().Before(t.expiresAt) {
 		return "", ErrExpired
 	}
 	if t.completed || !t.stateUsed {
@@ -265,6 +272,23 @@ func (s *Store) sweepLocked(now time.Time) {
 			s.deleteLocked(t)
 		}
 	}
+}
+
+// evictPendingLocked deletes the oldest transaction whose state was never
+// consumed, the kind a flood creates; a user's state is consumed seconds
+// after creation. It reports whether one was found.
+func (s *Store) evictPendingLocked() bool {
+	var oldest *tx
+	for _, t := range s.byCookie {
+		if !t.stateUsed && (oldest == nil || t.createdAt.Before(oldest.createdAt)) {
+			oldest = t
+		}
+	}
+	if oldest == nil {
+		return false
+	}
+	s.deleteLocked(oldest)
+	return true
 }
 
 func (s *Store) deleteLocked(t *tx) {
