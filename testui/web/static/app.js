@@ -6,6 +6,8 @@
   const PENDING_KEY = 'certcheck.pending';
   const VERSION_KEY = 'certcheck.serverVersion';
   const PENDING_MAX_AGE_MS = 5 * 60 * 1000;
+  // One deadline for an API call, request and body read together. The server's write timeout is 30 s.
+  const API_TIMEOUT_MS = 20 * 1000;
   const REPORT_TITLE = 'Vocdoni Certificate Authentication Checker - diagnostic report';
   const NEVER_REACHED_RESULT = 'Result: authentication step never reached the server';
 
@@ -23,6 +25,7 @@
     invalid_or_expired: 'This authentication link is no longer valid. Please start again.',
     never_reached: 'The authentication step never reached our server.',
     network_error: 'We could not reach the server. Check your connection and try again.',
+    timeout: 'The server took too long to answer.',
     bad_response: 'The server sent a reply this page could not understand.',
     generic: 'Something went wrong.',
   };
@@ -58,6 +61,7 @@
     rate_limited: TEMPORARY,
     store_full: TEMPORARY,
     network_error: TEMPORARY,
+    timeout: TEMPORARY,
     revocation_unknown: ['The issuer does not recognise this certificate. Contact the organization that issued it.'],
     identity_invalid: ['The identity data in this certificate could not be read in a supported form. Try another certificate.'],
     identity_unsupported_document: ['This certificate identifies its holder with a document other than a Spanish DNI or NIE. Try another certificate.'],
@@ -171,20 +175,37 @@
     }
   }
 
+  // Rejects with a TimeoutError when the server does not finish its reply in API_TIMEOUT_MS. Nothing
+  // here retries: a redemption code is single use, so the user starts again instead.
   async function api(method, path, body) {
-    const init = { method, credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } };
+    const deadline = new AbortController();
+    const init = {
+      method, credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' }, signal: deadline.signal,
+    };
     if (body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
-    const res = await fetch(path, init);
-    let json = null;
+    const timer = setTimeout(() => deadline.abort(new DOMException('API deadline exceeded', 'TimeoutError')), API_TIMEOUT_MS);
     try {
-      json = await res.json();
-    } catch (e) {
-      // The body is not JSON; callers treat a null body as a bad reply.
+      const res = await fetch(path, init);
+      // A stalled or failed body read rejects here, under the same deadline.
+      const text = await res.text();
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch (e) {
+        // The body is not JSON; callers treat a null body as a bad reply.
+      }
+      return { status: res.status, body: json };
+    } finally {
+      clearTimeout(timer);
     }
-    return { status: res.status, body: json };
+  }
+
+  // The error code for a request that produced no reply: the deadline, or the network.
+  function failureCode(e) {
+    return e && e.name === 'TimeoutError' ? 'timeout' : 'network_error';
   }
 
   // ---------- views ----------
@@ -303,7 +324,7 @@
     try {
       reply = await api('POST', '/api/v1/transactions', { provider });
     } catch (e) {
-      showClientError({ code: 'network_error', provider });
+      showClientError({ code: failureCode(e), provider });
       return;
     }
     const body = reply.body;
@@ -563,7 +584,7 @@
       reply = await api('POST', '/api/v1/transactions/redeem', { code });
     } catch (e) {
       clearPending();
-      showClientError({ code: 'network_error', entry });
+      showClientError({ code: failureCode(e), entry });
       return;
     }
     clearPending();

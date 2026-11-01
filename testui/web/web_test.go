@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -201,6 +202,59 @@ func TestAppJSCodeTables(t *testing.T) {
 		if src := jsFunc(t, js, fn); !strings.Contains(src, "lookup(") {
 			t.Errorf("%s() does not use lookup() for its code table", fn)
 		}
+	}
+}
+
+// TestAppJSAPIDeadline covers U14-ASTRA-2. One AbortController deadline covers the request and the
+// body read, a timeout is its own recoverable error, and nothing replays a request on its own (a
+// redemption code is single use).
+func TestAppJSAPIDeadline(t *testing.T) {
+	js := readStatic(t, "app.js")
+
+	m := regexp.MustCompile(`const API_TIMEOUT_MS = (\d+) \* 1000;`).FindStringSubmatch(js)
+	if m == nil {
+		t.Fatal("app.js has no API_TIMEOUT_MS constant in seconds")
+	}
+	if secs, _ := strconv.Atoi(m[1]); secs < 1 || secs > 30 {
+		t.Errorf("API_TIMEOUT_MS = %s s, want 1 to 30 s (the server's write timeout is 30 s)", m[1])
+	}
+
+	// The timer starts before the request and stops only after the body was read.
+	api := jsFunc(t, js, "api")
+	at := 0
+	for _, step := range []string{"new AbortController()", "signal: ", "setTimeout(", "await fetch(", "await res.text()", "clearTimeout("} {
+		i := strings.Index(api[at:], step)
+		if i < 0 {
+			t.Errorf("api() lacks %q after the previous deadline step", step)
+			continue
+		}
+		at += i + len(step)
+	}
+	if n := strings.Count(js, "fetch("); n != 1 {
+		t.Errorf("app.js calls fetch( %d times, want the single deadline-bound call in api()", n)
+	}
+	if strings.Contains(api, "res.json()") {
+		t.Error("api() reads the body with res.json(); a read failure must reject, not look like a bad reply")
+	}
+
+	// A timeout is a recoverable error with its own message and guidance.
+	for _, want := range []string{"    timeout: '", "    timeout: TEMPORARY,", "'TimeoutError'"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js lacks %q for the timeout error", want)
+		}
+	}
+	for _, fn := range []string{"authenticate", "redeem"} {
+		if src := jsFunc(t, js, fn); !strings.Contains(src, "failureCode(e)") {
+			t.Errorf("%s() does not map a failed request through failureCode()", fn)
+		}
+	}
+
+	// No automatic replay: one redemption call site and no timer besides the deadline.
+	if n := strings.Count(js, "transactions/redeem"); n != 1 {
+		t.Errorf("app.js names the redeem endpoint %d times, want exactly 1", n)
+	}
+	if n := strings.Count(js, "setTimeout("); n != 1 {
+		t.Errorf("app.js has %d setTimeout( calls, want only the API deadline", n)
 	}
 }
 
