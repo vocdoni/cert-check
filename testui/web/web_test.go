@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/web"
+	"github.com/vocdoni/cert-check/testui/web"
 )
 
 // requiredStatic lists every file the UI ships (Task 11 file list).

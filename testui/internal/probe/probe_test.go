@@ -393,7 +393,7 @@ func TestDefaultTargets(t *testing.T) {
 }
 
 func TestLoadSpecimens(t *testing.T) {
-	targets, err := LoadSpecimens(os.DirFS("../../testdata/specimens"))
+	targets, err := LoadSpecimens(os.DirFS("../../../testdata/specimens"))
 	if err != nil {
 		t.Fatalf("LoadSpecimens: %v", err)
 	}

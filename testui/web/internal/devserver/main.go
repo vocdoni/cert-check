@@ -1,6 +1,6 @@
 // Command devserver serves the embedded UI with a mocked API backed by the JSON fixtures in
 // web/testdata/fixtures. It exists for the offline UI checks (AC9: Playwright, axe) and is not
-// part of the shipped image. Run it from the repository root:
+// part of the shipped image. Run it from testui/:
 //
 //	go run ./web/internal/devserver
 //
@@ -34,7 +34,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vocdoni/cert-check/web"
+	"github.com/vocdoni/cert-check/testui/web"
 )
 
 // csp is the production Content-Security-Policy (spec, "Main listener").

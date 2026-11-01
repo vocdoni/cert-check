@@ -1,6 +1,6 @@
 internal/profiles/anchors/** -text
 internal/revocation/testdata/** -text
 internal/profiles/testdata/** -text
-web/static/fonts/** -text
-web/static/favicon.ico -text
+testui/web/static/fonts/** -text
+testui/web/static/favicon.ico -text
 testdata/** -text

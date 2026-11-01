@@ -24,11 +24,11 @@ import (
 	"time"
 
 	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/internal/config"
 	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
 	"github.com/vocdoni/cert-check/internal/testpki"
+	"github.com/vocdoni/cert-check/testui/internal/config"
 )
 
 // The test world of api_test.go, auth_test.go and app_test.go: providers

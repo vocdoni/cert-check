@@ -15,9 +15,8 @@ import (
 	"time"
 
 	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/certauth/tlsauth"
-	"github.com/vocdoni/cert-check/internal/config"
-	"github.com/vocdoni/cert-check/web"
+	"github.com/vocdoni/cert-check/testui/internal/config"
+	"github.com/vocdoni/cert-check/testui/web"
 )
 
 // CertSource provides the auth listener certificate (internal/acme.Manager).
@@ -73,13 +72,13 @@ func New(d Deps) (*App, error) {
 	a := &App{cfg: d.Config, checker: d.Checker, certs: d.Certs, log: d.Logger, version: d.Version, now: now,
 		publicOrigin: d.Config.PublicURL.Scheme + "://" + d.Config.PublicURL.Host,
 		store:        NewStore(TxCapacity, now), createLimiter: newIPLimiter(createPerMinute), redeemLimiter: newIPLimiter(redeemPerMinute)}
-	tcfg, err := tlsauth.ServerConfig(tlsauth.ConfigOptions{Checker: d.Checker, AuthDomain: d.Config.AuthDomain,
+	tcfg, err := ServerConfig(ConfigOptions{Checker: d.Checker, AuthDomain: d.Config.AuthDomain,
 		GetCertificate: d.Certs.GetCertificate, AllowTLS13: d.Config.AuthTLS13, Logger: d.Logger})
 	if err != nil {
 		return nil, err
 	}
 	a.authTLS = tcfg
-	a.auth = &authHandler{store: a.store, tls: tlsauth.NewHandler(d.Checker, d.Config.AuthDomain),
+	a.auth = &authHandler{store: a.store, tls: NewHandler(d.Checker, d.Config.AuthDomain),
 		publicURL: a.publicOrigin, slots: make(chan struct{}, ValidationSlots), slotWait: ValidationSlotWait,
 		budget: ValidationBudget, log: d.Logger, version: d.Version, now: now}
 	return a, nil

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/certauth/tlsauth"
 )
 
 // Auth listener limits (spec "TLS on the auth listener", "Rate limiting").
@@ -29,7 +28,7 @@ const (
 // http.Redirect writes no HTML.
 type authHandler struct {
 	store     *Store
-	tls       *tlsauth.Handler
+	tls       *Handler
 	publicURL string // fixed origin, never taken from the request
 	slots     chan struct{}
 	slotWait  time.Duration // ValidationSlotWait; tests shorten it
@@ -45,7 +44,7 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	if err := tlsauth.CheckHost(r); err != nil {
+	if err := CheckHost(r); err != nil {
 		w.WriteHeader(http.StatusMisdirectedRequest)
 		return
 	}

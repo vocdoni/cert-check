@@ -18,7 +18,7 @@ import (
 	"github.com/vocdoni/cert-check/internal/testpki"
 )
 
-const goldenDir = "../../testdata/golden"
+const goldenDir = "../../../testdata/golden"
 
 // goldenCA is one certificate_authorities entry of a handshake.
 type goldenCA struct {

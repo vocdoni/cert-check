@@ -15,12 +15,12 @@ import (
 	"time"
 
 	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/internal/acme"
-	"github.com/vocdoni/cert-check/internal/config"
-	"github.com/vocdoni/cert-check/internal/probe"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
-	"github.com/vocdoni/cert-check/internal/server"
+	"github.com/vocdoni/cert-check/testui/internal/acme"
+	"github.com/vocdoni/cert-check/testui/internal/config"
+	"github.com/vocdoni/cert-check/testui/internal/probe"
+	"github.com/vocdoni/cert-check/testui/internal/server"
 )
 
 // version is set with -ldflags "-X main.version=<git describe>".

@@ -1,4 +1,4 @@
-package tlsauth_test
+package server_test
 
 import (
 	"bytes"
@@ -19,11 +19,11 @@ import (
 	"time"
 
 	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/certauth/tlsauth"
 	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
 	"github.com/vocdoni/cert-check/internal/testpki"
+	"github.com/vocdoni/cert-check/testui/internal/server"
 )
 
 // The test world: providers "alpha" and "beta" under the auth domain
@@ -124,7 +124,7 @@ func newWorld(t *testing.T) *world {
 // config returns the auth listener configuration of the world.
 func (w *world) config(t *testing.T, allowTLS13 bool, log *slog.Logger) *tls.Config {
 	t.Helper()
-	cfg, err := tlsauth.ServerConfig(tlsauth.ConfigOptions{
+	cfg, err := server.ServerConfig(server.ConfigOptions{
 		Checker:        w.checker,
 		AuthDomain:     authDomain,
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &w.serverCert, nil },
@@ -209,15 +209,15 @@ func TestServerConfigRequiresOptions(t *testing.T) {
 	getCert := func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &w.serverCert, nil }
 	cases := []struct {
 		name string
-		opts tlsauth.ConfigOptions
+		opts server.ConfigOptions
 	}{
-		{"no checker", tlsauth.ConfigOptions{AuthDomain: authDomain, GetCertificate: getCert}},
-		{"no domain", tlsauth.ConfigOptions{Checker: w.checker, GetCertificate: getCert}},
-		{"no certificate source", tlsauth.ConfigOptions{Checker: w.checker, AuthDomain: authDomain}},
+		{"no checker", server.ConfigOptions{AuthDomain: authDomain, GetCertificate: getCert}},
+		{"no domain", server.ConfigOptions{Checker: w.checker, GetCertificate: getCert}},
+		{"no certificate source", server.ConfigOptions{Checker: w.checker, AuthDomain: authDomain}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			cfg, err := tlsauth.ServerConfig(c.opts)
+			cfg, err := server.ServerConfig(c.opts)
 			if err == nil || cfg != nil {
 				t.Errorf("ServerConfig = (%v, %v), want (nil, error)", cfg, err)
 			}
@@ -434,7 +434,7 @@ type authServer struct {
 
 func (w *world) startServer(t *testing.T) *authServer {
 	t.Helper()
-	h := tlsauth.NewHandler(w.checker, authDomain)
+	h := server.NewHandler(w.checker, authDomain)
 	as := &authServer{}
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		res, err := h.Authenticate(r)
@@ -582,7 +582,7 @@ func TestAuthenticateRunsEveryRequest(t *testing.T) {
 
 func TestAuthenticateWithoutTLS(t *testing.T) {
 	w := newWorld(t)
-	res, err := tlsauth.NewHandler(w.checker, authDomain).Authenticate(httptest.NewRequest(http.MethodGet, "http://"+alphaHost+"/v1/authenticate", nil))
+	res, err := server.NewHandler(w.checker, authDomain).Authenticate(httptest.NewRequest(http.MethodGet, "http://"+alphaHost+"/v1/authenticate", nil))
 	if res != nil {
 		t.Fatalf("result = %+v, want nil", res)
 	}
@@ -596,7 +596,7 @@ func TestAuthenticateWithoutTLS(t *testing.T) {
 }
 
 func TestProvider(t *testing.T) {
-	h := tlsauth.NewHandler(nil, "Auth.Test")
+	h := server.NewHandler(nil, "Auth.Test")
 	cases := []struct {
 		serverName string
 		want       string
@@ -628,14 +628,14 @@ func TestCheckHost(t *testing.T) {
 		{name: "host with port", host: "alpha.auth.test:8443", sni: alphaHost},
 		{name: "host without port", host: alphaHost, sni: alphaHost},
 		{name: "case-insensitive", host: "Alpha.AUTH.test", sni: alphaHost},
-		{name: "other provider", host: betaHost, sni: alphaHost, want: tlsauth.ErrMisdirected},
-		{name: "other provider with port", host: "beta.auth.test:443", sni: alphaHost, want: tlsauth.ErrMisdirected},
-		{name: "trailing dot", host: "alpha.auth.test.", sni: alphaHost, want: tlsauth.ErrMisdirected},
-		{name: "empty host", host: "", sni: alphaHost, want: tlsauth.ErrMisdirected},
-		{name: "no SNI", host: alphaHost, sni: "", want: tlsauth.ErrMisdirected},
-		{name: "empty host and no SNI", host: "", sni: "", want: tlsauth.ErrMisdirected},
-		{name: "port only and no SNI", host: ":443", sni: "", want: tlsauth.ErrMisdirected},
-		{name: "no TLS", host: alphaHost, noTLS: true, want: tlsauth.ErrMisdirected},
+		{name: "other provider", host: betaHost, sni: alphaHost, want: server.ErrMisdirected},
+		{name: "other provider with port", host: "beta.auth.test:443", sni: alphaHost, want: server.ErrMisdirected},
+		{name: "trailing dot", host: "alpha.auth.test.", sni: alphaHost, want: server.ErrMisdirected},
+		{name: "empty host", host: "", sni: alphaHost, want: server.ErrMisdirected},
+		{name: "no SNI", host: alphaHost, sni: "", want: server.ErrMisdirected},
+		{name: "empty host and no SNI", host: "", sni: "", want: server.ErrMisdirected},
+		{name: "port only and no SNI", host: ":443", sni: "", want: server.ErrMisdirected},
+		{name: "no TLS", host: alphaHost, noTLS: true, want: server.ErrMisdirected},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -644,7 +644,7 @@ func TestCheckHost(t *testing.T) {
 			if !c.noTLS {
 				r.TLS = &tls.ConnectionState{ServerName: c.sni}
 			}
-			if got := tlsauth.CheckHost(r); !errors.Is(got, c.want) {
+			if got := server.CheckHost(r); !errors.Is(got, c.want) {
 				t.Errorf("CheckHost(Host %q, SNI %q) = %v, want %v", c.host, c.sni, got, c.want)
 			}
 		})

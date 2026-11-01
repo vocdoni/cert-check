@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/vocdoni/cert-check/internal/probe"
+	"github.com/vocdoni/cert-check/testui/internal/probe"
 )
 
 func TestRunConfigError(t *testing.T) {

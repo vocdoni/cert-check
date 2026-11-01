@@ -1,7 +1,4 @@
-// Package tlsauth is the handler-like integration a CSP imports: a per-SNI
-// tls.Config that requests client certificates with the provider's CA list,
-// and Handler.Authenticate, which validates the peer chain of a request.
-package tlsauth
+package server
 
 import (
 	"crypto/tls"
