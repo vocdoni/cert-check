@@ -1053,6 +1053,9 @@ func TestFetchCancelMidBodyNoLeak(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatalf("after 3s: %d handlers open, %d goroutines, want 0 and <= %d", open.Load(), runtime.NumGoroutine(), base)
 		}
+		// A dial that completes after its fetch timed out joins the idle
+		// pool (bounded, and not a leak); drop it so only leaks remain.
+		f.client.CloseIdleConnections()
 		time.Sleep(10 * time.Millisecond)
 	}
 }
