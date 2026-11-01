@@ -214,16 +214,18 @@ func (h *Handler) chainsToPinnedCA(leaf *x509.Certificate) bool {
 }
 
 // fail returns an *Error decided by the handler, with Diagnostics filled as
-// a provider fills them for any failure.
+// a provider fills them for any failure, within the bounds: at most
+// DefaultMaxChainLen+1 chain entries, and no description of a leaf over
+// MaxCertificateDER.
 func (h *Handler) fail(chain []*x509.Certificate, providerID string, step Step, code ErrorCode, detail string) *Error {
 	d := Diagnostics{DiagnosticID: NewDiagnosticID(), Time: h.now().UTC(), ServerVersion: h.version, Provider: providerID,
 		FailedStep: step, Code: code, TechnicalDetail: detail}
-	for _, c := range chain {
+	for _, c := range chain[:min(len(chain), DefaultMaxChainLen+1)] {
 		if c != nil {
 			d.Chain = append(d.Chain, ChainEntry{Subject: c.Subject.String(), Issuer: c.Issuer.String()})
 		}
 	}
-	if len(chain) > 0 && chain[0] != nil {
+	if len(chain) > 0 && chain[0] != nil && len(chain[0].Raw) <= MaxCertificateDER {
 		d.Certificate = DescribeCertificate(chain[0])
 	}
 	return &Error{Code: code, Retryable: code.Retryable(), Detail: detail, Diagnostics: d}

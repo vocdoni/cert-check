@@ -167,30 +167,29 @@ func (c *Provider) Verify(ctx context.Context, chain []*x509.Certificate) (*Resu
 	providerID := c.id
 	now := c.now()
 	r := &run{diag: Diagnostics{DiagnosticID: NewDiagnosticID(), Time: now.UTC(), ServerVersion: c.version, Provider: providerID}}
-	for _, cert := range chain {
-		if cert != nil {
-			r.diag.Chain = append(r.diag.Chain, ChainEntry{Subject: cert.Subject.String(), Issuer: cert.Issuer.String()})
-		}
-	}
-	if len(chain) > 0 && chain[0] != nil {
-		r.diag.Certificate = describeCertificate(chain[0])
-	}
 
-	// 1. Bounds.
+	// 1. Bounds, decided before any certificate-derived diagnostics.
 	prov, ok := c.reg.Provider(providerID)
-	if !ok {
-		return nil, r.fail(StepBounds, CodeProviderMismatch, "provider has no enabled profile")
-	}
-	if len(chain) == 0 || chain[0] == nil {
-		return nil, r.fail(StepBounds, CodeNoCertificate, "no client certificate")
-	}
-	if len(chain) > c.maxLen {
-		return nil, r.fail(StepBounds, CodeInvalidChain, fmt.Sprintf("chain length %d exceeds %d", len(chain), c.maxLen))
-	}
-	for i, cert := range chain {
-		if cert == nil || len(cert.Raw) > MaxCertificateDER {
-			return nil, r.fail(StepBounds, CodeInvalidChain, fmt.Sprintf("certificate %d missing or larger than %d bytes", i, MaxCertificateDER))
+	var code ErrorCode
+	var detail string
+	switch {
+	case !ok:
+		code, detail = CodeProviderMismatch, "provider has no enabled profile"
+	case len(chain) == 0 || chain[0] == nil:
+		code, detail = CodeNoCertificate, "no client certificate"
+	case len(chain) > c.maxLen:
+		code, detail = CodeInvalidChain, fmt.Sprintf("chain length %d exceeds %d", len(chain), c.maxLen)
+	default:
+		for i, cert := range chain {
+			if cert == nil || len(cert.Raw) > MaxCertificateDER {
+				code, detail = CodeInvalidChain, fmt.Sprintf("certificate %d missing or larger than %d bytes", i, MaxCertificateDER)
+				break
+			}
 		}
+	}
+	r.diag.Chain, r.diag.Certificate = describeChain(chain, c.maxLen)
+	if code != "" {
+		return nil, r.fail(StepBounds, code, detail)
 	}
 	leaf := chain[0]
 

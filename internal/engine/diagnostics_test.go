@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -66,14 +68,15 @@ func TestDiagnosticsComplete(t *testing.T) {
 				if d.Provider == "" || d.ServerVersion != "test" {
 					t.Errorf("provider/serverVersion = %q/%q, want set/test", d.Provider, d.ServerVersion)
 				}
-				if leafGiven := len(chain) > 0 && chain[0] != nil; leafGiven {
+				// A leaf over MaxCertificateDER is not described (TestBoundsBeforeDiagnostics).
+				if leafGiven := len(chain) > 0 && chain[0] != nil && len(chain[0].Raw) <= MaxCertificateDER; leafGiven {
 					if d.Certificate == nil {
 						t.Error("certificate = nil, want the presented leaf described")
 					} else if d.Certificate.SHA256 != testpki.SHA256Hex(chain[0].Raw) {
 						t.Errorf("certificate sha256 = %s, want %s", d.Certificate.SHA256, testpki.SHA256Hex(chain[0].Raw))
 					}
 				} else if d.Certificate != nil {
-					t.Errorf("certificate = %+v, want nil without a leaf", d.Certificate)
+					t.Errorf("certificate = %+v, want nil without a leaf within the bounds", d.Certificate)
 				}
 				received := 0
 				for _, cert := range chain {
@@ -98,6 +101,56 @@ func TestDiagnosticsComplete(t *testing.T) {
 	})
 	if len(ids) != len(codeCases()) {
 		t.Errorf("%d distinct diagnostic IDs for %d rows", len(ids), len(codeCases()))
+	}
+}
+
+// TestBoundsBeforeDiagnostics: a chain over the bounds is described within
+// them: at most MaxChainLen+1 entries, and no description of a leaf over
+// MaxCertificateDER.
+func TestBoundsBeforeDiagnostics(t *testing.T) {
+	t.Parallel()
+	w := newCodeWorld(t)
+	value, err := asn1.Marshal(make([]byte, 17<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversized := w.leaf(t, w.rootA, func(s *testpki.CertSpec) {
+		s.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 7, 2}, Value: value}}
+	})
+	leaf := w.leaf(t, w.rootA, nil)
+	long := []*x509.Certificate{leaf}
+	for range 4 * DefaultMaxChainLen {
+		long = append(long, w.rootA.Cert)
+	}
+	for _, tc := range []struct {
+		name         string
+		chain        []*x509.Certificate
+		detail       string
+		entries      int
+		describeLeaf bool
+	}{
+		{"chain of 41", long, "chain length 41", DefaultMaxChainLen + 1, true},
+		{"oversized leaf", []*x509.Certificate{oversized}, "certificate 0 missing or larger than", 1, false},
+		{"oversized intermediate", []*x509.Certificate{leaf, oversized}, "certificate 1 missing or larger than", 2, true},
+		{"nil intermediate", []*x509.Certificate{leaf, nil, w.rootA.Cert}, "certificate 1 missing or larger than", 2, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := w.chk.VerifyAs(t.Context(), "alpha", tc.chain)
+			e := tErr(t, err)
+			d := e.Diagnostics
+			if res != nil || e.Code != CodeInvalidChain || d.FailedStep != StepBounds || !strings.Contains(e.Detail, tc.detail) {
+				t.Fatalf("got (%s at %s, %q), want (%s at %s, %q)", e.Code, d.FailedStep, e.Detail, CodeInvalidChain, StepBounds, tc.detail)
+			}
+			if len(d.Chain) != tc.entries {
+				t.Errorf("%d chain entries, want %d", len(d.Chain), tc.entries)
+			}
+			if described := d.Certificate != nil; described != tc.describeLeaf {
+				t.Errorf("leaf described %v, want %v", described, tc.describeLeaf)
+			}
+			if len(d.ProfileCandidates) != 0 || len(d.RevocationAttempts) != 0 {
+				t.Errorf("profile candidates %v, revocation attempts %v; want none at step bounds", d.ProfileCandidates, d.RevocationAttempts)
+			}
+		})
 	}
 }
 

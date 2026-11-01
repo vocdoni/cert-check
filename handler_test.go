@@ -334,6 +334,50 @@ func TestHandlerVerifyNoCandidate(t *testing.T) {
 	}
 }
 
+// TestHandlerBoundsBeforeDiagnostics: the handler's own failures describe a
+// chain within the bounds, as a provider does: at most DefaultMaxChainLen+1
+// entries, and no description of a leaf over MaxCertificateDER.
+func TestHandlerBoundsBeforeDiagnostics(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	value, err := asn1.Marshal(make([]byte, 17<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversized := w.leaf(t, w.rootU, hPolicyA, func(s *testpki.CertSpec) {
+		s.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 7, 2}, Value: value}}
+	})
+	leaf := w.leaf(t, w.rootU, hPolicyA, nil)
+	long := []*x509.Certificate{leaf}
+	for range 4 * certcheck.DefaultMaxChainLen {
+		long = append(long, w.rootU.Cert)
+	}
+	for _, tc := range []struct {
+		name         string
+		verify       func(context.Context, []*x509.Certificate) (*certcheck.Result, error)
+		chain        []*x509.Certificate
+		entries      int
+		describeLeaf bool
+	}{
+		{"Verify long chain", w.h.Verify, long, certcheck.DefaultMaxChainLen + 1, true},
+		{"Verify oversized leaf", w.h.Verify, []*x509.Certificate{oversized}, 1, false},
+		{"VerifyAs unknown provider, oversized leaf", func(ctx context.Context, chain []*x509.Certificate) (*certcheck.Result, error) {
+			return w.h.VerifyAs(ctx, "nope", chain)
+		}, []*x509.Certificate{oversized, w.rootU.Cert}, 2, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := tc.verify(t.Context(), tc.chain)
+			d := hErr(t, err).Diagnostics
+			if res != nil || len(d.Chain) != tc.entries {
+				t.Errorf("result %v, %d chain entries; want nil and %d", res, len(d.Chain), tc.entries)
+			}
+			if described := d.Certificate != nil; described != tc.describeLeaf {
+				t.Errorf("leaf described %v, want %v", described, tc.describeLeaf)
+			}
+		})
+	}
+}
+
 func TestHandlerVerifyAs(t *testing.T) {
 	t.Parallel()
 	w := newHWorld(t)
