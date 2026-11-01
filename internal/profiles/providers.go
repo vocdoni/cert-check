@@ -59,7 +59,9 @@ func person(id, providerID, name string, anchors []Anchor, oids []string, a iden
 }
 
 // All returns the production providers in display order:
-// standard first, then the Beta group. Each call returns a fresh copy.
+// standard first, then the Beta group. Each call builds new Provider and
+// Profile values, but nested slices (document rules and types) are shared
+// package-level values: callers must not modify them.
 func All() []Provider {
 	return []Provider{
 		FNMT(), IDCAT(), ACCV(), Digitel(), Bewor(), Sectigo(),
