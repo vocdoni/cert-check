@@ -363,6 +363,46 @@ func TestHandlerVerifyNoCandidate(t *testing.T) {
 	}
 }
 
+// TestHandlerForgedIssuerDN: a leaf whose issuer DN is alpha's advertised CA
+// subject but which another key signed is routed to alpha by the DN and
+// fails there at step path; no provider reclassifies it as provider_mismatch.
+func TestHandlerForgedIssuerDN(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	forged := testpki.NewRoot(t, "Handler Alpha Root", testpki.CertSpec{Now: w.now})
+	if !bytes.Equal(forged.Cert.RawSubject, w.rootA.Cert.RawSubject) || forged.Cert.Equal(w.rootA.Cert) {
+		t.Fatal("fixture: want another CA with rootA's subject")
+	}
+	leaf := w.leaf(t, forged, hPolicyA, nil)
+	for _, tc := range []struct {
+		name     string
+		verify   func() (*certcheck.Result, error)
+		provider string
+	}{
+		{"Verify", func() (*certcheck.Result, error) { return w.h.Verify(t.Context(), []*x509.Certificate{leaf}) }, "alpha"},
+		{"VerifyAs alpha", func() (*certcheck.Result, error) {
+			return w.h.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf})
+		}, "alpha"},
+		{"VerifyAs beta", func() (*certcheck.Result, error) { return w.h.VerifyAs(t.Context(), "beta", []*x509.Certificate{leaf}) }, "beta"},
+		{"Verify with the forged CA in the chain", func() (*certcheck.Result, error) {
+			return w.h.Verify(t.Context(), []*x509.Certificate{leaf, forged.Cert})
+		}, "alpha"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := tc.verify()
+			e := hErr(t, err)
+			d := e.Diagnostics
+			if res != nil || e.Code != certcheck.CodeUntrustedIssuer || d.FailedStep != certcheck.StepPath || d.Provider != tc.provider {
+				t.Errorf("got (%v, %s at %q by %q), want (nil, %s at %q by %q)", res, e.Code, d.FailedStep, d.Provider,
+					certcheck.CodeUntrustedIssuer, certcheck.StepPath, tc.provider)
+			}
+			if len(d.ProfileCandidates) != 1 || len(d.RevocationAttempts) != 0 {
+				t.Errorf("profile candidates %+v, revocation attempts %+v; want the provider's profile and none", d.ProfileCandidates, d.RevocationAttempts)
+			}
+		})
+	}
+}
+
 // TestHandlerBoundsBeforeDiagnostics: the handler's own failures describe a
 // chain within the bounds, as a provider does: at most DefaultMaxChainLen+1
 // entries, and no description of a leaf over MaxCertificateDER.

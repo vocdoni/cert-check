@@ -145,6 +145,24 @@ func TestAuthenticateErrorCarriesTLS(t *testing.T) {
 	}
 }
 
+// TestAuthenticateForgedIssuerDN: Go's client offers a certificate whose
+// issuer DN matches an advertised CA, so a leaf with alpha's CA subject as
+// issuer but another signer reaches the handler, which rejects it.
+func TestAuthenticateForgedIssuerDN(t *testing.T) {
+	w := newHWorld(t)
+	as := w.startServer(t)
+	forged := testpki.NewRoot(t, "Handler Alpha Root", testpki.CertSpec{Now: w.now})
+	leaf := w.issue(t, forged, hPolicyA, nil).TLSCertificate()
+	call := as.get(t, as.client(t, &tls.Config{RootCAs: as.pool, Certificates: []tls.Certificate{leaf}}), alphaHost)
+	e := hErr(t, call.err)
+	if e.Code != certcheck.CodeUntrustedIssuer || e.Diagnostics.FailedStep != certcheck.StepPath {
+		t.Errorf("got %s at %q, want %s at %q", e.Code, e.Diagnostics.FailedStep, certcheck.CodeUntrustedIssuer, certcheck.StepPath)
+	}
+	if got := e.Diagnostics.TLS; got == nil || !got.ClientCertificatePresented {
+		t.Errorf("Diagnostics.TLS = %+v, want the certificate presented (the issuer filter passed)", got)
+	}
+}
+
 func TestAuthenticateRunsEveryRequest(t *testing.T) {
 	w := newHWorld(t)
 	as := w.startServer(t)
