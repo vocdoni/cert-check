@@ -593,6 +593,31 @@ type redeemInvalidBody struct {
 	Diagnostics certcheck.Diagnostics `json:"diagnostics"`
 }
 
+// TestOriginMatchesNormalisedPublicURL: a public URL configured with an
+// uppercase host and the default port still accepts the browser's Origin,
+// which has neither (U12-ASTRA-4).
+func TestOriginMatchesNormalisedPublicURL(t *testing.T) {
+	w := newSrvWorld(t, srvOptions{})
+	env := map[string]string{
+		"CERTCHECK_PUBLIC_URL": "https://CHECK.test:443/", "CERTCHECK_AUTH_DOMAIN": srvAuthDomain,
+		"CERTCHECK_AUTH_PUBLIC_PORT": strconv.Itoa(srvAuthPort),
+		"CERTCHECK_TLS_CERT_FILE":    "cert.pem", "CERTCHECK_TLS_KEY_FILE": "key.pem", // not read by Load
+	}
+	cfg, err := config.Load(func(k string) string { return env[k] })
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	app, err := New(Deps{Config: cfg, Providers: w.providers, Certs: w.certs, Logger: srvDiscard, Version: srvVersion, Now: w.clk.Now})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	rec := httptest.NewRecorder()
+	app.MainHandler().ServeHTTP(rec, jsonRequest(http.MethodPost, "/api/v1/transactions", `{"provider":"alpha"}`)) // Origin https://check.test
+	if rec.Code != http.StatusCreated {
+		t.Errorf("create with Origin %s: status = %d, want 201; body %s", srvPublicURL, rec.Code, rec.Body)
+	}
+}
+
 func TestRedeem(t *testing.T) {
 	w := newSrvWorld(t, srvOptions{})
 	res, err := w.handler.VerifyAs(t.Context(), "alpha", []*x509.Certificate{w.leaf.Cert})
@@ -686,8 +711,10 @@ func TestRedeem(t *testing.T) {
 	})
 
 	t.Run("no cookie", func(t *testing.T) {
-		code, _ := w.completeTx(t, "alpha", Outcome{Result: res})
+		code, cookie := w.completeTx(t, "alpha", Outcome{Result: res})
 		invalid(t, w.redeem(code, ""), "cookie_missing")
+		// The code was spent by the cookie-less attempt (U11-ASTRA-2).
+		invalid(t, w.redeem(code, cookie), "code_unknown_or_expired")
 	})
 
 	t.Run("another valid cookie", func(t *testing.T) {

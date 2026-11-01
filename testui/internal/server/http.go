@@ -149,9 +149,10 @@ func bucket(a netip.Addr) netip.Addr {
 
 // ipLimiter is a per-IP token bucket with bounded memory.
 type ipLimiter struct {
-	mu      sync.Mutex
-	perMin  int
-	entries map[netip.Addr]*ipEntry
+	mu        sync.Mutex
+	perMin    int
+	entries   map[netip.Addr]*ipEntry
+	nextSweep time.Time // earliest prune scan of a full table
 }
 
 type ipEntry struct {
@@ -160,6 +161,10 @@ type ipEntry struct {
 }
 
 const maxLimiterEntries = 100_000
+
+// limiterSweepInterval is the minimum time between prune scans of a full
+// table; newcomers in between are refused without a scan.
+const limiterSweepInterval = time.Minute
 
 func newIPLimiter(perMinute int) *ipLimiter {
 	return &ipLimiter{perMin: perMinute, entries: map[netip.Addr]*ipEntry{}}
@@ -172,7 +177,10 @@ func (l *ipLimiter) allow(ip netip.Addr, now time.Time) (ok bool, retryAfter tim
 	e, found := l.entries[ip]
 	if !found {
 		if len(l.entries) >= maxLimiterEntries {
-			l.pruneLocked(now)
+			if !now.Before(l.nextSweep) {
+				l.nextSweep = now.Add(limiterSweepInterval)
+				l.pruneLocked(now)
+			}
 			if len(l.entries) >= maxLimiterEntries {
 				return false, time.Minute / time.Duration(l.perMin) // table full: refuse new clients, memory stays bounded
 			}

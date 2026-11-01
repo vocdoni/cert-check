@@ -3,12 +3,15 @@ package certcheck_test
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -126,6 +129,8 @@ func TestTLSConfig(t *testing.T) {
 	}{
 		{"default TLS 1.2", nil, tls.VersionTLS12},
 		{"WithTLS13", []certcheck.TLSOption{certcheck.WithTLS13()}, tls.VersionTLS13},
+		{"nil option skipped", []certcheck.TLSOption{nil}, tls.VersionTLS12},
+		{"nil option and WithTLS13", []certcheck.TLSOption{nil, certcheck.WithTLS13(), nil}, tls.VersionTLS13},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := w.h.TLSConfig(getCert, tc.opts...)
@@ -163,6 +168,28 @@ func (wrapProvider) Verify(context.Context, []*x509.Certificate) (*certcheck.Res
 	e := &certcheck.Error{Code: certcheck.CodeRevoked, Detail: "revoked", Diagnostics: certcheck.Diagnostics{
 		Provider: "wrap", FailedStep: certcheck.StepRevocation, Code: certcheck.CodeRevoked, TechnicalDetail: "revoked"}}
 	return nil, fmt.Errorf("wrapped: %w", e)
+}
+
+// typedNilProvider breaks the Provider contract with a nil *certcheck.Error
+// in a non-nil error, directly or wrapped.
+type typedNilProvider struct {
+	ca   *x509.Certificate
+	wrap bool
+}
+
+func (p typedNilProvider) Info() certcheck.ProviderInfo {
+	if p.wrap {
+		return certcheck.ProviderInfo{ID: "wrapnil", Name: "Wrapped nil"}
+	}
+	return certcheck.ProviderInfo{ID: "nilerr", Name: "Nil error"}
+}
+func (p typedNilProvider) CAs() []*x509.Certificate { return []*x509.Certificate{p.ca} }
+func (p typedNilProvider) Verify(context.Context, []*x509.Certificate) (*certcheck.Result, error) {
+	var e *certcheck.Error
+	if p.wrap {
+		return nil, fmt.Errorf("wrapped: %w", e)
+	}
+	return nil, e
 }
 
 // TestHandlerProviderErrors: whatever a consumer Provider returns on
@@ -205,6 +232,8 @@ func TestHandlerProviderErrors(t *testing.T) {
 		{"plain error", fakeProvider{id: "fake", cas: []*x509.Certificate{w.rootU.Cert}}, certcheck.CodeInternal, "",
 			"provider returned an error that is not *certcheck.Error"},
 		{"wrapped *Error", wrapProvider{ca: w.rootU.Cert}, certcheck.CodeRevoked, certcheck.StepRevocation, "revoked"},
+		{"typed-nil *Error", typedNilProvider{ca: w.rootU.Cert}, certcheck.CodeInternal, "", "provider returned a nil *certcheck.Error"},
+		{"wrapped typed-nil *Error", typedNilProvider{ca: w.rootU.Cert, wrap: true}, certcheck.CodeInternal, "", "provider returned a nil *certcheck.Error"},
 	} {
 		id := pc.provider.Info().ID
 		h, err := certcheck.NewHandler([]certcheck.Provider{pc.provider},
@@ -329,6 +358,154 @@ func TestHandlerVerifyNoCandidate(t *testing.T) {
 			if res != nil || e.Code != certcheck.CodeNoCertificate || e.Diagnostics.FailedStep != certcheck.StepBounds || e.Detail != "no client certificate" {
 				t.Errorf("got (%v, %s at %q, %q), want (nil, %s at %q, %q)", res, e.Code, e.Diagnostics.FailedStep, e.Detail,
 					certcheck.CodeNoCertificate, certcheck.StepBounds, "no client certificate")
+			}
+		})
+	}
+}
+
+// TestHandlerForgedIssuerDN: a leaf whose issuer DN is alpha's advertised CA
+// subject but which another key signed is routed to alpha by the DN and
+// fails there at step path; no provider reclassifies it as provider_mismatch.
+func TestHandlerForgedIssuerDN(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	forged := testpki.NewRoot(t, "Handler Alpha Root", testpki.CertSpec{Now: w.now})
+	if !bytes.Equal(forged.Cert.RawSubject, w.rootA.Cert.RawSubject) || forged.Cert.Equal(w.rootA.Cert) {
+		t.Fatal("fixture: want another CA with rootA's subject")
+	}
+	leaf := w.leaf(t, forged, hPolicyA, nil)
+	for _, tc := range []struct {
+		name     string
+		verify   func() (*certcheck.Result, error)
+		provider string
+	}{
+		{"Verify", func() (*certcheck.Result, error) { return w.h.Verify(t.Context(), []*x509.Certificate{leaf}) }, "alpha"},
+		{"VerifyAs alpha", func() (*certcheck.Result, error) {
+			return w.h.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf})
+		}, "alpha"},
+		{"VerifyAs beta", func() (*certcheck.Result, error) { return w.h.VerifyAs(t.Context(), "beta", []*x509.Certificate{leaf}) }, "beta"},
+		{"Verify with the forged CA in the chain", func() (*certcheck.Result, error) {
+			return w.h.Verify(t.Context(), []*x509.Certificate{leaf, forged.Cert})
+		}, "alpha"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := tc.verify()
+			e := hErr(t, err)
+			d := e.Diagnostics
+			if res != nil || e.Code != certcheck.CodeUntrustedIssuer || d.FailedStep != certcheck.StepPath || d.Provider != tc.provider {
+				t.Errorf("got (%v, %s at %q by %q), want (nil, %s at %q by %q)", res, e.Code, d.FailedStep, d.Provider,
+					certcheck.CodeUntrustedIssuer, certcheck.StepPath, tc.provider)
+			}
+			if len(d.ProfileCandidates) != 1 || len(d.RevocationAttempts) != 0 {
+				t.Errorf("profile candidates %+v, revocation attempts %+v; want the provider's profile and none", d.ProfileCandidates, d.RevocationAttempts)
+			}
+		})
+	}
+}
+
+// TestHandlerBoundsBeforeDiagnostics: the handler's own failures describe a
+// chain within the bounds, as a provider does: at most DefaultMaxChainLen+1
+// entries, and no description of a leaf over MaxCertificateDER.
+func TestHandlerBoundsBeforeDiagnostics(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	value, err := asn1.Marshal(make([]byte, 17<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversized := w.leaf(t, w.rootU, hPolicyA, func(s *testpki.CertSpec) {
+		s.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 7, 2}, Value: value}}
+	})
+	leaf := w.leaf(t, w.rootU, hPolicyA, nil)
+	long := []*x509.Certificate{leaf}
+	for range 4 * certcheck.DefaultMaxChainLen {
+		long = append(long, w.rootU.Cert)
+	}
+	for _, tc := range []struct {
+		name         string
+		verify       func(context.Context, []*x509.Certificate) (*certcheck.Result, error)
+		chain        []*x509.Certificate
+		entries      int
+		describeLeaf bool
+	}{
+		{"Verify long chain", w.h.Verify, long, certcheck.DefaultMaxChainLen + 1, true},
+		{"Verify oversized leaf", w.h.Verify, []*x509.Certificate{oversized}, 1, false},
+		{"VerifyAs unknown provider, oversized leaf", func(ctx context.Context, chain []*x509.Certificate) (*certcheck.Result, error) {
+			return w.h.VerifyAs(ctx, "nope", chain)
+		}, []*x509.Certificate{oversized, w.rootU.Cert}, 2, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := tc.verify(t.Context(), tc.chain)
+			d := hErr(t, err).Diagnostics
+			if res != nil || len(d.Chain) != tc.entries {
+				t.Errorf("result %v, %d chain entries; want nil and %d", res, len(d.Chain), tc.entries)
+			}
+			if described := d.Certificate != nil; described != tc.describeLeaf {
+				t.Errorf("leaf described %v, want %v", described, tc.describeLeaf)
+			}
+		})
+	}
+}
+
+// TestLogAttrsOmitsClientIssuer: the issuer DN of a presented certificate is
+// client text. A self-signed personal certificate (issuer == subject) must
+// not put the holder's names or document number in the log line.
+func TestLogAttrsOmitsClientIssuer(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	personal := testpki.NewRoot(t, "personal", testpki.CertSpec{Now: w.now, Subject: testpki.Name{
+		testpki.Printable(testpki.OIDCountry, "ES"), testpki.Printable(testpki.OIDSerialNumber, "IDCES-12345678Z"),
+		testpki.UTF8(testpki.OIDGivenName, "JUAN"), testpki.UTF8(testpki.OIDSurname, "GARCÍA LÓPEZ"),
+		testpki.UTF8(testpki.OIDCommonName, "JUAN GARCÍA LÓPEZ - 12345678Z")}}).Cert
+	chain := []*x509.Certificate{personal}
+	for _, tc := range []struct {
+		name   string
+		verify func() (*certcheck.Result, error)
+	}{
+		{"Verify", func() (*certcheck.Result, error) { return w.h.Verify(t.Context(), chain) }},
+		{"VerifyAs", func() (*certcheck.Result, error) { return w.h.VerifyAs(t.Context(), "alpha", chain) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.verify()
+			e := hErr(t, err)
+			if e.Code != certcheck.CodeUntrustedIssuer || e.Diagnostics.Certificate == nil {
+				t.Fatalf("code %s, certificate %v; want %s with the leaf described", e.Code, e.Diagnostics.Certificate, certcheck.CodeUntrustedIssuer)
+			}
+			var buf bytes.Buffer
+			slog.New(slog.NewTextHandler(&buf, nil)).LogAttrs(t.Context(), slog.LevelInfo, "rejected", e.Diagnostics.LogAttrs()...)
+			slog.New(slog.NewJSONHandler(&buf, nil)).LogAttrs(t.Context(), slog.LevelInfo, "rejected", e.Diagnostics.LogAttrs()...)
+			for _, pii := range []string{"JUAN", "GARC", "PEZ", "12345678Z"} {
+				if strings.Contains(buf.String(), pii) {
+					t.Errorf("log lines contain %q:\n%s", pii, buf.String())
+				}
+			}
+			if !strings.Contains(buf.String(), e.Diagnostics.DiagnosticID) {
+				t.Errorf("log lines lack the diagnostic ID:\n%s", buf.String())
+			}
+		})
+	}
+}
+
+// TestDescribeCertificateNil: a server that builds its own Diagnostics may
+// describe a missing leaf or a certificate without a usable key.
+func TestDescribeCertificateNil(t *testing.T) {
+	if d := certcheck.DescribeCertificate(nil); d != nil {
+		t.Errorf("DescribeCertificate(nil) = %+v, want nil", d)
+	}
+	for _, tc := range []struct {
+		name string
+		cert *x509.Certificate
+		want string
+	}{
+		{"nil RSA key", &x509.Certificate{PublicKeyAlgorithm: x509.RSA, PublicKey: (*rsa.PublicKey)(nil)}, "RSA"},
+		{"RSA key without modulus", &x509.Certificate{PublicKeyAlgorithm: x509.RSA, PublicKey: &rsa.PublicKey{}}, "RSA"},
+		{"nil ECDSA key", &x509.Certificate{PublicKeyAlgorithm: x509.ECDSA, PublicKey: (*ecdsa.PublicKey)(nil)}, "ECDSA"},
+		{"ECDSA key without curve", &x509.Certificate{PublicKeyAlgorithm: x509.ECDSA, PublicKey: &ecdsa.PublicKey{}}, "ECDSA"},
+		{"no key", &x509.Certificate{}, x509.UnknownPublicKeyAlgorithm.String()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := certcheck.DescribeCertificate(tc.cert).KeyAlgorithm; got != tc.want {
+				t.Errorf("KeyAlgorithm = %q, want %q", got, tc.want)
 			}
 		})
 	}

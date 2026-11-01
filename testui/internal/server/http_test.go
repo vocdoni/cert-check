@@ -335,3 +335,43 @@ func TestIPLimiterBounded(t *testing.T) {
 		t.Errorf("entries after pruning = %d, want 1", n)
 	}
 }
+
+// TestIPLimiterFullTableSweepsOncePerInterval: on a full table a newcomer
+// triggers at most one prune scan per limiterSweepInterval; in between,
+// newcomers are refused without scanning (U11-ASTRA-1).
+func TestIPLimiterFullTableSweepsOncePerInterval(t *testing.T) {
+	const perMinute = 20
+	t0 := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	l := newIPLimiter(perMinute)
+	for i := range maxLimiterEntries {
+		if ok, _ := l.allow(netip.AddrFrom4([4]byte{10, byte(i >> 16), byte(i >> 8), byte(i)}), t0); !ok {
+			t.Fatalf("client %d refused while filling the table", i)
+		}
+	}
+	size := func() int {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return len(l.entries)
+	}
+	newcomer := func(i int) netip.Addr { return netip.AddrFrom4([4]byte{192, 0, 2, byte(i)}) }
+
+	// The entries are not idle beyond the prune window yet: this sweep frees nothing.
+	sweep := t0.Add(10 * time.Minute)
+	if ok, _ := l.allow(newcomer(1), sweep); ok {
+		t.Fatal("newcomer allowed on a full table of active clients")
+	}
+	// Every entry is now prunable, but the next sweep is not due: refused, nothing scanned.
+	if ok, _ := l.allow(newcomer(2), sweep.Add(limiterSweepInterval-time.Second)); ok {
+		t.Error("newcomer allowed before the next sweep was due, want refused without a scan")
+	}
+	if n := size(); n != maxLimiterEntries {
+		t.Errorf("entries before the next sweep = %d, want %d (no scan)", n, maxLimiterEntries)
+	}
+	// The next sweep is due: the idle entries go and the newcomer gets in.
+	if ok, _ := l.allow(newcomer(3), sweep.Add(limiterSweepInterval)); !ok {
+		t.Error("newcomer refused once the sweep was due and the table was idle")
+	}
+	if n := size(); n != 1 {
+		t.Errorf("entries after the due sweep = %d, want 1", n)
+	}
+}

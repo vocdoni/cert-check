@@ -107,6 +107,7 @@ func TestCriticalExtensionCopy(t *testing.T) {
 		{"empty qcStatements", []byte{0x30, 0x00}},
 		{"truncated qcStatements", []byte{0x30, 0x05, 0x30, 0x03, 0x06}},
 		{"trailing bytes", append(ppQCStatements(t), 0x00)},
+		{"extra field in a statement", qcExtraField},
 	} {
 		t.Run("malformed under G2: "+tc.name, func(t *testing.T) {
 			s := g2Shape
@@ -115,6 +116,9 @@ func TestCriticalExtensionCopy(t *testing.T) {
 			e := tErr(t, err)
 			if res != nil || e.Code != CodeInvalidChain || e.Diagnostics.FailedStep != StepPurpose {
 				t.Errorf("got (%s at %s), want (%s at %s); detail %q", e.Code, e.Diagnostics.FailedStep, CodeInvalidChain, StepPurpose, e.Detail)
+			}
+			if n := len(e.Diagnostics.RevocationAttempts); n != 0 {
+				t.Errorf("%d revocation attempts, want none before the extension is rejected", n)
 			}
 		})
 	}
@@ -276,12 +280,38 @@ func TestParseQCStatementsSpecimens(t *testing.T) {
 	}
 }
 
+// qcExtraField is one statement (id-etsi-qcs-QcCompliance) carrying two
+// statementInfo fields; the grammar allows at most one.
+var qcExtraField = []byte{0x30, 0x0e, 0x30, 0x0c, 0x06, 0x06, 0x04, 0x00, 0x8e, 0x46, 0x01, 0x01, 0x05, 0x00, 0x05, 0x00}
+
+func TestParseQCStatementsStrict(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		der  []byte
+		ok   bool
+	}{
+		{"one statement without info", []byte{0x30, 0x0a, 0x30, 0x08, 0x06, 0x06, 0x04, 0x00, 0x8e, 0x46, 0x01, 0x01}, true},
+		{"one statement with info", []byte{0x30, 0x0c, 0x30, 0x0a, 0x06, 0x06, 0x04, 0x00, 0x8e, 0x46, 0x01, 0x01, 0x05, 0x00}, true},
+		{"extra field in a statement", qcExtraField, false},
+		{"statement without an id", []byte{0x30, 0x04, 0x30, 0x02, 0x05, 0x00}, false},
+		{"statement that is not a SEQUENCE", []byte{0x30, 0x08, 0x06, 0x06, 0x04, 0x00, 0x8e, 0x46, 0x01, 0x01}, false},
+		{"non-minimal length", []byte{0x30, 0x81, 0x0a, 0x30, 0x08, 0x06, 0x06, 0x04, 0x00, 0x8e, 0x46, 0x01, 0x01}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := parseQCStatements(tc.der); (err == nil) != tc.ok {
+				t.Errorf("parseQCStatements(%x) = %v, want ok %v", tc.der, err, tc.ok)
+			}
+		})
+	}
+}
+
 func FuzzParseQCStatements(f *testing.F) {
 	for _, v := range specimenQCStatements(f) {
 		f.Add(v)
 	}
 	f.Add(ppQCStatements(f))
 	f.Add([]byte{0x30, 0x00})
+	f.Add(qcExtraField)
 	f.Fuzz(func(t *testing.T, der []byte) {
 		err := parseQCStatements(der)
 		if err == nil && (len(der) < 2 || der[0] != 0x30) {

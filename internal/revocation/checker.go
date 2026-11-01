@@ -165,10 +165,10 @@ func (c *Checker) checkOCSP(ctx context.Context, cert, issuer *x509.Certificate,
 		return StatusUnsupportedMethod
 	}
 	key := issuerKey(issuer) + " " + SerialKey(cert.SerialNumber)
-	if it, ok := c.ocsp.get(key, now); ok {
-		c.fillOCSP(res, it.ev, it.source)
+	if it, ok := c.ocsp.get(key, now, p); ok {
+		c.fillOCSP(res, it)
 		res.Attempts = append(res.Attempts, Attempt{Method: MethodOCSP, URL: it.source, Outcome: it.status, FromCache: true,
-			ThisUpdate: it.ev.Single.ThisUpdate, NextUpdate: it.ev.Single.NextUpdate, ResponderSubject: it.ev.ResponderSubject})
+			ThisUpdate: it.thisUpdate, NextUpdate: it.nextUpdate, ResponderSubject: it.responderSubject})
 		return it.status
 	}
 	id, err := NewCertID(crypto.SHA1, cert, issuer)
@@ -178,10 +178,10 @@ func (c *Checker) checkOCSP(ctx context.Context, cert, issuer *x509.Certificate,
 	}
 	last := StatusUnavailable
 	for _, u := range urls {
-		st, ev := c.ocspOnce(ctx, u, id, issuer, p, now, res)
+		st, it := c.ocspOnce(ctx, u, id, issuer, p, now, res)
 		switch st {
 		case StatusGood, StatusRevoked, StatusUnknown:
-			c.ocsp.put(ocspItem{key: key, ev: ev, status: st, source: hostOf(u)}) // put ignores unknown
+			c.ocsp.put(key, it) // put ignores unknown
 			return st
 		}
 		last = worstFailure(last, st)
@@ -189,19 +189,19 @@ func (c *Checker) checkOCSP(ctx context.Context, cert, issuer *x509.Certificate,
 	return last
 }
 
-func (c *Checker) ocspOnce(ctx context.Context, u string, id CertID, issuer *x509.Certificate, p Policy, now time.Time, res *Result) (Status, OCSPEvidence) {
+func (c *Checker) ocspOnce(ctx context.Context, u string, id CertID, issuer *x509.Certificate, p Policy, now time.Time, res *Result) (Status, ocspItem) {
 	var nonce []byte
 	if p.OCSPNonce {
 		nonce = make([]byte, NonceLength)
 		if _, err := rand.Read(nonce); err != nil {
 			res.Detail = "nonce generation failed"
-			return StatusUnavailable, OCSPEvidence{}
+			return StatusUnavailable, ocspItem{}
 		}
 	}
 	reqDER, nonceExt, err := MarshalRequest(id, nonce)
 	if err != nil {
 		res.Detail = err.Error()
-		return StatusUnavailable, OCSPEvidence{}
+		return StatusUnavailable, ocspItem{}
 	}
 	at := Attempt{Method: MethodOCSP, URL: u, NonceSent: nonce != nil}
 	fr, err := c.fetcher.Fetch(ctx, FetchRequest{
@@ -216,26 +216,27 @@ func (c *Checker) ocspOnce(ctx context.Context, u string, id CertID, issuer *x50
 		return st
 	}
 	if err != nil {
-		return record(StatusUnavailable, err.Error()), OCSPEvidence{}
+		return record(StatusUnavailable, err.Error()), ocspItem{}
 	}
 	resp, err := ParseResponse(fr.Body)
 	if err != nil {
-		return record(StatusInvalidEvidence, err.Error()), OCSPEvidence{}
+		return record(StatusInvalidEvidence, err.Error()), ocspItem{}
 	}
 	ev, st, detail := VerifyOCSP(OCSPInput{Response: resp, Want: id, Issuer: issuer, Nonce: nonceExt, Now: now, MaxAge: p.MaxAge()})
 	at.ProducedAt, at.ThisUpdate, at.NextUpdate = ev.ProducedAt, ev.Single.ThisUpdate, ev.Single.NextUpdate
 	at.ResponderSubject, at.NonceEchoed = ev.ResponderSubject, ev.NonceEchoed
 	st = record(st, detail)
+	it := newOCSPItem(u, st, ev)
 	if st == StatusGood || st == StatusRevoked || st == StatusUnknown {
-		c.fillOCSP(res, ev, hostOf(u))
+		c.fillOCSP(res, it)
 	}
-	return st, ev
+	return st, it
 }
 
-func (c *Checker) fillOCSP(res *Result, ev OCSPEvidence, source string) {
-	res.ThisUpdate, res.NextUpdate, res.Source = ev.Single.ThisUpdate, ev.Single.NextUpdate, source
-	if ev.Single.Status == CertRevoked {
-		res.RevokedAt, res.Reason = ev.Single.RevokedAt, ev.Single.Reason
+func (c *Checker) fillOCSP(res *Result, it ocspItem) {
+	res.ThisUpdate, res.NextUpdate, res.Source = it.thisUpdate, it.nextUpdate, it.source
+	if it.status == StatusRevoked {
+		res.RevokedAt, res.Reason = it.revokedAt, it.reason
 	}
 }
 

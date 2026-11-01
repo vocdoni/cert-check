@@ -182,14 +182,18 @@ func (h *Handler) VerifyAs(ctx context.Context, providerID string, chain []*x509
 }
 
 // verify returns p.Verify(ctx, chain) as (Result, nil) or (nil, *Error). A
-// provider breaking its contract (an error that holds no *Error, or neither a
-// Result nor an error) gives an internal error.
+// provider breaking its contract (an error that holds no *Error or a nil
+// *Error, or neither a Result nor an error) gives an internal error.
 func (h *Handler) verify(ctx context.Context, p Provider, chain []*x509.Certificate) (*Result, error) {
 	res, err := p.Verify(ctx, chain)
 	switch {
 	case err != nil:
-		if e, ok := errors.AsType[*Error](err); ok {
+		e, ok := errors.AsType[*Error](err)
+		if ok && e != nil {
 			return nil, e
+		}
+		if ok {
+			return nil, h.fail(chain, p.Info().ID, "", CodeInternal, "provider returned a nil *certcheck.Error")
 		}
 		return nil, h.fail(chain, p.Info().ID, "", CodeInternal, "provider returned an error that is not *certcheck.Error")
 	case res == nil:
@@ -214,16 +218,18 @@ func (h *Handler) chainsToPinnedCA(leaf *x509.Certificate) bool {
 }
 
 // fail returns an *Error decided by the handler, with Diagnostics filled as
-// a provider fills them for any failure.
+// a provider fills them for any failure, within the bounds: at most
+// DefaultMaxChainLen+1 chain entries, and no description of a leaf over
+// MaxCertificateDER.
 func (h *Handler) fail(chain []*x509.Certificate, providerID string, step Step, code ErrorCode, detail string) *Error {
 	d := Diagnostics{DiagnosticID: NewDiagnosticID(), Time: h.now().UTC(), ServerVersion: h.version, Provider: providerID,
 		FailedStep: step, Code: code, TechnicalDetail: detail}
-	for _, c := range chain {
+	for _, c := range chain[:min(len(chain), DefaultMaxChainLen+1)] {
 		if c != nil {
 			d.Chain = append(d.Chain, ChainEntry{Subject: c.Subject.String(), Issuer: c.Issuer.String()})
 		}
 	}
-	if len(chain) > 0 && chain[0] != nil {
+	if len(chain) > 0 && chain[0] != nil && len(chain[0].Raw) <= MaxCertificateDER {
 		d.Certificate = DescribeCertificate(chain[0])
 	}
 	return &Error{Code: code, Retryable: code.Retryable(), Detail: detail, Diagnostics: d}

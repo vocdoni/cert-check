@@ -508,6 +508,38 @@ func TestCheckCodes(t *testing.T) {
 	}
 }
 
+// TestVerifyCanceledContextWithGoodCache: cached good evidence answers
+// without a fetch, yet a cancelled or expired validation is never a success
+// (the Provider contract: a deadline hit is a retryable internal error).
+func TestVerifyCanceledContextWithGoodCache(t *testing.T) {
+	t.Parallel()
+	w := newCodeWorld(t)
+	leaf := w.leaf(t, w.rootA, nil)
+	if _, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf}); err != nil {
+		t.Fatalf("first VerifyAs = %v, want success (caches the good OCSP response)", err)
+	}
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	expired, cancel2 := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancel2()
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{"canceled", canceled},
+		{"deadline exceeded", expired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := w.chk.VerifyAs(tc.ctx, "alpha", []*x509.Certificate{leaf})
+			e := tErr(t, err)
+			if res != nil || e.Code != CodeInternal || !e.Retryable || e.Diagnostics.FailedStep != StepRevocation {
+				t.Errorf("got (%v, %s at %s, retryable %v); want (nil, %s at %s, true)", res, e.Code, e.Diagnostics.FailedStep, e.Retryable,
+					CodeInternal, StepRevocation)
+			}
+		})
+	}
+}
+
 func TestRetryableCodes(t *testing.T) {
 	retryable := []ErrorCode{CodeRevocationUnavailable, CodeInternal}
 	seen := map[ErrorCode]bool{}

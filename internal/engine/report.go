@@ -23,6 +23,23 @@ func keyAlgorithm(c *x509.Certificate) string {
 	return c.PublicKeyAlgorithm.String()
 }
 
+// describeChain returns the diagnostics of a received chain within the
+// bounds: at most maxLen+1 entries (nil certificates skipped), and the leaf
+// described only when its DER is within MaxCertificateDER.
+func describeChain(chain []*x509.Certificate, maxLen int) ([]ChainEntry, *CertificateDetails) {
+	var entries []ChainEntry
+	for _, c := range chain[:min(len(chain), maxLen+1)] {
+		if c != nil {
+			entries = append(entries, ChainEntry{Subject: c.Subject.String(), Issuer: c.Issuer.String()})
+		}
+	}
+	var leaf *CertificateDetails
+	if len(chain) > 0 && chain[0] != nil && len(chain[0].Raw) <= MaxCertificateDER {
+		leaf = describeCertificate(chain[0])
+	}
+	return entries, leaf
+}
+
 func reportAttempts(in []revocation.Attempt) []RevocationAttempt {
 	opt := func(t time.Time) *time.Time {
 		if t.IsZero() {

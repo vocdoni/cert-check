@@ -231,13 +231,25 @@ func (n Name) Field(oid asn1.ObjectIdentifier, kinds KindSet) (value string, fou
 	return value, found, nil
 }
 
+// maxCombiningRun bounds a run of consecutive combining marks (R5.1). A
+// Spanish or Catalan letter needs at most two.
+const maxCombiningRun = 4
+
 // checkText rejects control characters, U+FFFD, bidi controls and, per
 // ruling R53, every other invisible or ambiguous code point: format
 // characters (Cf), line and paragraph separators, private-use code points,
-// noncharacters and any space other than U+0020. The errors name the rule,
-// never the character.
+// noncharacters and any space other than U+0020. Per R5.1 it also rejects
+// the other default-ignorable code points (U+034F, the Hangul fillers),
+// variation selectors and runs of more than maxCombiningRun combining marks.
+// The errors name the rule, never the character.
 func checkText(s string) error {
+	run := 0
 	for _, r := range s {
+		if unicode.Is(unicode.M, r) {
+			run++
+		} else {
+			run = 0
+		}
 		switch {
 		case r < 0x20, r >= 0x7f && r <= 0x9f:
 			return errors.New("control character")
@@ -247,6 +259,10 @@ func checkText(s string) error {
 			return errors.New("bidi control")
 		case unicode.Is(unicode.Cf, r):
 			return errors.New("format character")
+		case unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r):
+			return errors.New("default-ignorable character")
+		case unicode.Is(unicode.Variation_Selector, r):
+			return errors.New("variation selector")
 		case unicode.In(r, unicode.Zl, unicode.Zp):
 			return errors.New("line or paragraph separator")
 		case unicode.Is(unicode.Co, r):
@@ -255,6 +271,8 @@ func checkText(s string) error {
 			return errors.New("noncharacter")
 		case r != ' ' && unicode.Is(unicode.Zs, r):
 			return errors.New("space other than U+0020")
+		case run > maxCombiningRun:
+			return errors.New("too many combining marks")
 		}
 	}
 	return nil

@@ -1,9 +1,13 @@
 package revocation
 
 import (
+	"bytes"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"math/big"
 	"net/http"
+	"runtime"
+	"strconv"
 	"testing"
 	"time"
 
@@ -22,12 +26,17 @@ type chkTReuseCase struct {
 
 func chkTRunReuse(t *testing.T, tc chkTReuseCase) {
 	t.Helper()
+	chkTRunReusePolicy(t, tc, Policy{OCSPHosts: []string{chkTOCSPHost}, OCSPNonce: true})
+}
+
+// chkTRunReusePolicy is chkTRunReuse under policy p.
+func chkTRunReusePolicy(t *testing.T, tc chkTReuseCase, p Policy) {
+	t.Helper()
 	f := chkTNewFixture(t)
 	f.answer(tc.spec)
 	hits := f.serve(t, chkTOCSPHost, f.ocsp.Handler(t))
 	leaf := f.leaf(t, []string{chkTOCSPURL}, nil)
 	c := f.checker(t, Options{})
-	p := Policy{OCSPHosts: []string{chkTOCSPHost}, OCSPNonce: true}
 
 	first := chkTCheck(t, c, leaf, f.ca.Cert, p)
 	if first.Status != tc.want || hits.Load() != 1 {
@@ -100,6 +109,152 @@ func TestOCSPCacheGood(t *testing.T) {
 	}
 }
 
+func TestOCSPCacheHonoursPolicyMaxAge(t *testing.T) {
+	p := Policy{OCSPHosts: []string{chkTOCSPHost}, OCSPNonce: true, MaxAgeWithoutNextUpdate: time.Minute}
+	cases := []chkTReuseCase{
+		{"without nextUpdate and MaxAge 1m reused at +30s", chkTAnswer(testpki.Good, 0, 0), 30 * time.Second, StatusGood, true},
+		{"without nextUpdate and MaxAge 1m not reused at +2m", chkTAnswer(testpki.Good, 0, 0), 2 * time.Minute, StatusGood, false},
+		{"with nextUpdate MaxAge does not apply at +2m", chkTAnswer(testpki.Good, 0, time.Hour), 2 * time.Minute, StatusGood, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) { chkTRunReusePolicy(t, tc, p) })
+	}
+}
+
+func TestOCSPCacheBoundedBySignerValidity(t *testing.T) {
+	cases := []struct {
+		name    string
+		at      time.Duration
+		want    Status
+		wantHit bool
+	}{
+		{"reused just before the responder expires", 2*time.Minute - time.Second, StatusGood, true},
+		{"not reused once the responder expired", 2*time.Minute + time.Second, StatusInvalidEvidence, false},
+		{"not reused before the responder is valid", -2 * time.Minute, StatusInvalidEvidence, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := chkTNewFixture(t)
+			f.ocsp = testpki.NewOCSPServer(f.ca, f.ca.OCSPResponder(t, testpki.CertSpec{
+				Now: f.base, NotBefore: f.base.Add(-time.Minute), NotAfter: f.base.Add(2 * time.Minute),
+			}))
+			f.answer(chkTAnswer(testpki.Good, 0, time.Hour))
+			hits := f.serve(t, chkTOCSPHost, f.ocsp.Handler(t))
+			leaf := f.leaf(t, []string{chkTOCSPURL}, nil)
+			c := f.checker(t, Options{})
+			p := Policy{OCSPHosts: []string{chkTOCSPHost}, OCSPNonce: true}
+			if res := chkTCheck(t, c, leaf, f.ca.Cert, p); res.Status != StatusGood {
+				t.Fatalf("first Check = %s %s, want good", res.Status, chkTTrace(res.Attempts))
+			}
+			f.clock.Set(f.base.Add(tc.at))
+			res := chkTCheck(t, c, leaf, f.ca.Cert, p)
+			wantHits := int64(2)
+			if tc.wantHit {
+				wantHits = 1
+			}
+			if res.Status != tc.want || len(res.Attempts) != 1 || res.Attempts[0].FromCache != tc.wantHit || hits.Load() != wantHits {
+				t.Errorf("Check at %+v = %s %s after %d requests, want %s, FromCache %v, %d requests",
+					tc.at, res.Status, chkTTrace(res.Attempts), hits.Load(), tc.want, tc.wantHit, wantHits)
+			}
+		})
+	}
+}
+
+func TestOCSPCacheCrossPolicy(t *testing.T) {
+	type step struct {
+		name       string
+		p          Policy
+		wantCache  bool
+		wantSource string
+		wantEchoed bool
+	}
+	run := func(t *testing.T, f *chkTFixture, leaf *x509.Certificate, steps []step) {
+		t.Helper()
+		c := f.checker(t, Options{})
+		for _, s := range steps {
+			res := chkTCheck(t, c, leaf, f.ca.Cert, s.p)
+			if res.Status != StatusGood || len(res.Attempts) != 1 || res.Attempts[0].FromCache != s.wantCache ||
+				res.Attempts[0].NonceEchoed != s.wantEchoed || res.Source != s.wantSource {
+				t.Errorf("%s: Check = %s from %q %s, NonceEchoed %v; want good from %q, FromCache %v, NonceEchoed %v",
+					s.name, res.Status, res.Source, chkTTrace(res.Attempts), res.Attempts[0].NonceEchoed,
+					s.wantSource, s.wantCache, s.wantEchoed)
+			}
+		}
+	}
+
+	t.Run("nonce required", func(t *testing.T) {
+		f := chkTNewFixture(t)
+		hits := f.serve(t, chkTOCSPHost, f.ocsp.Handler(t))
+		leaf := f.leaf(t, []string{chkTOCSPURL}, nil)
+		noNonce := Policy{OCSPHosts: []string{chkTOCSPHost}}
+		nonce := Policy{OCSPHosts: []string{chkTOCSPHost}, OCSPNonce: true}
+		run(t, f, leaf, []step{
+			{"nonce-less policy fetches", noNonce, false, chkTOCSPHost, false},
+			{"nonce policy does not reuse an answer without a nonce", nonce, false, chkTOCSPHost, true},
+			{"nonce policy reuses the echoed answer", nonce, true, chkTOCSPHost, false},
+			{"nonce-less policy reuses the echoed answer", noNonce, true, chkTOCSPHost, false},
+		})
+		if got := hits.Load(); got != 2 {
+			t.Errorf("OCSP requests = %d, want 2", got)
+		}
+	})
+
+	t.Run("source host not allowlisted", func(t *testing.T) {
+		f := chkTNewFixture(t)
+		hits1 := f.serve(t, "ocsp1.test", f.ocsp.Handler(t))
+		hits2 := f.serve(t, "ocsp2.test", f.ocsp.Handler(t))
+		leaf := f.leaf(t, []string{"http://ocsp1.test/", "http://ocsp2.test/"}, nil)
+		both := Policy{OCSPHosts: []string{"ocsp1.test", "ocsp2.test"}}
+		only2 := Policy{OCSPHosts: []string{"ocsp2.test"}}
+		run(t, f, leaf, []step{
+			{"both hosts allowed: fetched from ocsp1", both, false, "ocsp1.test", false},
+			{"ocsp1 not allowed: answer from ocsp1 not reused", only2, false, "ocsp2.test", false},
+			{"ocsp2 answer reused", only2, true, "ocsp2.test", false},
+		})
+		if hits1.Load() != 1 || hits2.Load() != 1 {
+			t.Errorf("OCSP requests = %d and %d, want 1 and 1", hits1.Load(), hits2.Load())
+		}
+	})
+}
+
+// TestOCSPCacheEntryRetainsNoResponse pads the unsigned certs field of a
+// valid response with a 60 KiB certificate, as an on-path attacker can: a
+// cached entry must not keep the response (or any slice of it) alive.
+func TestOCSPCacheEntryRetainsNoResponse(t *testing.T) {
+	p := ocspTNewPKI(t)
+	pad := testpki.NewRoot(t, "ocspT padding", testpki.CertSpec{
+		Now: p.now, ExtraExtensions: []pkix.Extension{{Id: ocspTOIDExtA, Value: make([]byte, 60<<10)}},
+	})
+	der := p.build(t, p.req, func(s *testpki.OCSPSpec) { s.Certs = []*x509.Certificate{p.resp.Cert, pad.Cert} })
+	if len(der) < 60<<10 || len(der) > MaxOCSPResponse {
+		t.Fatalf("padded response = %d bytes, want 60 KiB..%d", len(der), MaxOCSPResponse)
+	}
+	const n = 128
+	c := newOCSPCache(n)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := range n {
+		r, err := ParseResponse(bytes.Clone(der))
+		if err != nil {
+			t.Fatalf("ParseResponse: %v", err)
+		}
+		ev, st, detail := VerifyOCSP(OCSPInput{Response: r, Want: p.want, Issuer: p.ca.Cert, Now: p.now, MaxAge: ocspTMaxAge})
+		if st != StatusGood {
+			t.Fatalf("VerifyOCSP = %s (%s), want good", st, detail)
+		}
+		c.put(strconv.Itoa(i), newOCSPItem(chkTOCSPURL, st, ev))
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if c.lru.Len() != n {
+		t.Fatalf("entries = %d, want %d", c.lru.Len(), n)
+	}
+	if perEntry := (int64(after.HeapAlloc) - int64(before.HeapAlloc)) / n; perEntry > 4<<10 {
+		t.Errorf("retained heap per entry = %d bytes, want <= 4 KiB (the %d-byte response must not stay reachable)", perEntry, len(der))
+	}
+}
+
 func TestOCSPCacheRevoked(t *testing.T) {
 	revoked := func(nextUpdate time.Duration) func(time.Time) testpki.OCSPSpec {
 		return chkTAnswer(testpki.Revoked, 0, nextUpdate)
@@ -165,8 +320,8 @@ func TestOCSPCacheNeverUnknownOrInvalid(t *testing.T) {
 		now := time.Now()
 		c := newOCSPCache(DefaultOCSPCacheEntries)
 		for _, st := range []Status{StatusUnknown, StatusUnavailable, StatusStale, StatusInvalidEvidence, StatusUnsupportedMethod} {
-			c.put(ocspItem{key: string(st), status: st, ev: OCSPEvidence{Single: SingleResponse{ThisUpdate: now, NextUpdate: now.Add(time.Hour)}}})
-			if _, ok := c.get(string(st), now); ok {
+			c.put(string(st), chkTItem(st, now))
+			if _, ok := c.get(string(st), now, chkTItemPolicy); ok {
 				t.Errorf("get after put(%s) = hit, want miss", st)
 			}
 		}
@@ -175,6 +330,19 @@ func TestOCSPCacheNeverUnknownOrInvalid(t *testing.T) {
 		}
 	})
 }
+
+// chkTItem is a cache entry with status st: thisUpdate now, nextUpdate
+// now+1h, a signer valid around now, served from chkTOCSPURL.
+func chkTItem(st Status, now time.Time) ocspItem {
+	return ocspItem{
+		status: st, thisUpdate: now, nextUpdate: now.Add(time.Hour), reason: -1,
+		signerNotBefore: now.Add(-time.Hour), signerNotAfter: now.Add(time.Hour),
+		url: chkTOCSPURL, source: chkTOCSPHost,
+	}
+}
+
+// chkTItemPolicy accepts chkTItem entries.
+var chkTItemPolicy = Policy{OCSPHosts: []string{chkTOCSPHost}}
 
 func TestOCSPCacheKeyIncludesIssuer(t *testing.T) {
 	f := chkTNewFixture(t)
@@ -210,24 +378,24 @@ func TestOCSPCacheKeyIncludesIssuer(t *testing.T) {
 func TestOCSPCacheBound(t *testing.T) {
 	t.Run("lru eviction at the entry limit", func(t *testing.T) {
 		now := time.Now()
-		ev := OCSPEvidence{Single: SingleResponse{ThisUpdate: now, NextUpdate: now.Add(time.Hour)}}
+		good := chkTItem(StatusGood, now)
 		c := newOCSPCache(2)
-		c.put(ocspItem{key: "a", ev: ev, status: StatusGood})
-		c.put(ocspItem{key: "b", ev: ev, status: StatusGood})
-		if _, ok := c.get("a", now); !ok { // a becomes the most recently used
+		c.put("a", good)
+		c.put("b", good)
+		if _, ok := c.get("a", now, chkTItemPolicy); !ok { // a becomes the most recently used
 			t.Fatal("get(a) = miss, want hit")
 		}
-		c.put(ocspItem{key: "c", ev: ev, status: StatusGood})
+		c.put("c", good)
 		for key, want := range map[string]bool{"a": true, "b": false, "c": true} {
-			if _, ok := c.get(key, now); ok != want {
+			if _, ok := c.get(key, now, chkTItemPolicy); ok != want {
 				t.Errorf("get(%s) hit = %v, want %v", key, ok, want)
 			}
 		}
 		if n := c.lru.Len(); n != 2 || len(c.items) != 2 {
 			t.Errorf("entries = %d list, %d map, want 2 and 2", n, len(c.items))
 		}
-		c.put(ocspItem{key: "c", ev: ev, status: StatusRevoked}) // replacing keeps one entry per key
-		if it, ok := c.get("c", now); !ok || it.status != StatusRevoked || c.lru.Len() != 2 {
+		c.put("c", chkTItem(StatusRevoked, now)) // replacing keeps one entry per key
+		if it, ok := c.get("c", now, chkTItemPolicy); !ok || it.status != StatusRevoked || c.lru.Len() != 2 {
 			t.Errorf("get(c) after replace = %v %v with %d entries, want revoked with 2 entries", it.status, ok, c.lru.Len())
 		}
 	})
