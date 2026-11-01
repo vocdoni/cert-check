@@ -1,6 +1,6 @@
 # Library-first restructure: design
 
-Status: audited (2026-10-31)   Class: architectural
+Status: approved (2026-11-01)   Class: architectural
 Owner decisions so far:
 - 2026-10-31 (request): the repository becomes primarily a Go module that other Go programs import.
   - It should have an API similar to (not the same as) the blind-csp idCAT handler.
