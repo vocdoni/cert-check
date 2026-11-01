@@ -4,3 +4,4 @@ certauth/revocation/testdata/** -text
 certauth/profiles/testdata/** -text
 web/static/fonts/** -text
 web/static/favicon.ico -text
+testdata/** -text
