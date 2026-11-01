@@ -458,7 +458,7 @@ func TestCheckFailures(t *testing.T) {
 		want         Status
 		wantMethod   Method
 		wantCRLHits  int64
-		wantWarn     bool
+		wantWarn     Method // the method whose rejected evidence is logged; "" for none
 		wantRevoked  bool
 		wantAttempts int
 	}{
@@ -471,7 +471,7 @@ func TestCheckFailures(t *testing.T) {
 		{
 			name: "ocsp invalid and crl down",
 			ocsp: ocspAnswer(func(_ time.Time, s *testpki.OCSPSpec) { s.CorruptSignature = true }), crl: crlDown,
-			want: StatusInvalidEvidence, wantCRLHits: 1, wantWarn: true, wantAttempts: 2,
+			want: StatusInvalidEvidence, wantCRLHits: 1, wantWarn: MethodOCSP, wantAttempts: 2,
 		},
 		{
 			name: "ocsp down and crl stale",
@@ -490,7 +490,7 @@ func TestCheckFailures(t *testing.T) {
 			crl: func(t *testing.T, f *chkTFixture, _ *x509.Certificate) http.Handler {
 				return f.crl(t, testpki.CRLSpec{CorruptSig: true})
 			},
-			want: StatusInvalidEvidence, wantCRLHits: 1, wantWarn: true, wantAttempts: 2,
+			want: StatusInvalidEvidence, wantCRLHits: 1, wantWarn: MethodCRL, wantAttempts: 2,
 		},
 		{
 			name:   "leaf without AIA or CDP",
@@ -561,7 +561,7 @@ func TestCheckFailures(t *testing.T) {
 			}
 
 			warns := f.logs.warnings()
-			if !tc.wantWarn {
+			if tc.wantWarn == "" {
 				if len(warns) != 0 {
 					t.Errorf("warn records = %d, want 0", len(warns))
 				}
@@ -570,10 +570,77 @@ func TestCheckFailures(t *testing.T) {
 			if len(warns) != 1 {
 				t.Fatalf("warn records = %d, want 1", len(warns))
 			}
-			got := chkTAttrs(warns[0])
-			want := map[string]string{"issuer": f.ca.Cert.Subject.String(), "detail": res.Detail}
-			if len(got) != len(want) || got["issuer"] != want["issuer"] || got["detail"] != want["detail"] {
+			host := chkTOCSPHost
+			if tc.wantWarn == MethodCRL {
+				host = chkTCRLHost
+			}
+			want := map[string]string{"issuer": f.ca.Cert.Subject.String(), "method": string(tc.wantWarn), "outcome": string(StatusInvalidEvidence), "host": host}
+			if got := chkTAttrs(warns[0]); fmt.Sprint(got) != fmt.Sprint(want) {
 				t.Errorf("warn attrs = %v, want exactly %v", got, want)
+			}
+		})
+	}
+}
+
+// TestCheckRejectedEvidenceLog: the warning for rejected evidence names the
+// method, outcome and host of each rejected attempt, and nothing from a URL
+// path or query, a redirect target or an error text.
+func TestCheckRejectedEvidenceLog(t *testing.T) {
+	const (
+		ocspURL = "http://" + chkTOCSPHost + "/SENTINEL-OCSP-PATH?q=SENTINEL-OCSP-QUERY"
+		crlURL  = "http://" + chkTCRLHost + "/SENTINEL-CRL-PATH.crl?x=SENTINEL-CRL-QUERY"
+	)
+	ocspBad := func(t *testing.T, f *chkTFixture) http.Handler {
+		f.answer(chkTWith(func(_ time.Time, s *testpki.OCSPSpec) { s.CorruptSignature = true }))
+		return f.ocsp.Handler(t)
+	}
+	ocspDown := func(*testing.T, *chkTFixture) http.Handler { return chkTStatus(http.StatusServiceUnavailable) }
+	foreign := func(*testing.T, *chkTFixture) http.Handler {
+		return testpki.Redirect("http://foreign.test/SENTINEL-REDIRECT-PATH?y=SENTINEL-REDIRECT-QUERY")
+	}
+	badCRL := func(t *testing.T, f *chkTFixture) http.Handler {
+		mux := http.NewServeMux()
+		mux.Handle("/SENTINEL-CRL-PATH.crl", testpki.Redirect("/SENTINEL-REDIRECT-PATH?y=SENTINEL-REDIRECT-QUERY"))
+		mux.Handle("/SENTINEL-REDIRECT-PATH", f.crl(t, testpki.CRLSpec{CorruptSig: true}))
+		return mux
+	}
+	cases := []struct {
+		name      string
+		ocsp, crl func(*testing.T, *chkTFixture) http.Handler
+		want      []Method
+	}{
+		{"ocsp rejected, crl redirect blocked", ocspBad, foreign, []Method{MethodOCSP}},
+		{"ocsp down, crl rejected after a redirect", ocspDown, badCRL, []Method{MethodCRL}},
+		{"both rejected", ocspBad, badCRL, []Method{MethodOCSP, MethodCRL}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := chkTNewFixture(t)
+			f.serve(t, chkTOCSPHost, tc.ocsp(t, f))
+			f.serve(t, chkTCRLHost, tc.crl(t, f))
+			f.serve(t, "foreign.test", f.crl(t, testpki.CRLSpec{}))
+			leaf := f.leaf(t, []string{ocspURL}, []string{crlURL})
+			res := chkTCheck(t, f.checker(t, Options{}), leaf, f.ca.Cert, chkTPolicy())
+			if res.Status != StatusInvalidEvidence {
+				t.Fatalf("Check = %s %s, want invalid_evidence", res.Status, chkTTrace(res.Attempts))
+			}
+			warns := f.logs.warnings()
+			if len(warns) != len(tc.want) {
+				t.Fatalf("warn records = %d, want %d", len(warns), len(tc.want))
+			}
+			for i, w := range warns {
+				host := chkTOCSPHost
+				if tc.want[i] == MethodCRL {
+					host = chkTCRLHost
+				}
+				want := map[string]string{"issuer": f.ca.Cert.Subject.String(), "method": string(tc.want[i]), "outcome": string(StatusInvalidEvidence), "host": host}
+				got := chkTAttrs(w)
+				if fmt.Sprint(got) != fmt.Sprint(want) {
+					t.Errorf("warn %d attrs = %v, want exactly %v", i, got, want)
+				}
+				if line := w.Message + fmt.Sprint(got); strings.Contains(line, "SENTINEL") {
+					t.Errorf("warn %d = %q, want no URL path, query or redirect target", i, line)
+				}
 			}
 		})
 	}
@@ -1199,6 +1266,8 @@ func TestCheckMisuse(t *testing.T) {
 	f := chkTNewFixture(t)
 	ocspHits := f.serve(t, chkTOCSPHost, f.ocsp.Handler(t))
 	leaf := f.leaf(t, []string{chkTOCSPURL}, []string{chkTCRLURL})
+	noSerial, noRaw := *leaf, *f.ca.Cert
+	noSerial.SerialNumber, noRaw.Raw = nil, nil
 	c := f.checker(t, Options{})
 	cases := []struct {
 		name   string
@@ -1211,6 +1280,8 @@ func TestCheckMisuse(t *testing.T) {
 		{"empty policy", leaf, f.ca.Cert, Policy{}},
 		{"uppercase host", leaf, f.ca.Cert, Policy{OCSPHosts: []string{"OCSP.test"}}},
 		{"crl allowed without hosts", leaf, f.ca.Cert, Policy{OCSPHosts: []string{chkTOCSPHost}, AllowCRL: true}},
+		{"cert without serial", &noSerial, f.ca.Cert, chkTPolicy()},
+		{"issuer without raw DER", leaf, &noRaw, chkTPolicy()},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

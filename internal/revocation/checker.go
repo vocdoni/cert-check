@@ -89,6 +89,9 @@ func (c *Checker) Check(ctx context.Context, cert, issuer *x509.Certificate, p P
 	if cert == nil || issuer == nil {
 		return Result{}, errors.New("revocation: nil certificate or issuer")
 	}
+	if cert.SerialNumber == nil || len(issuer.Raw) == 0 || len(issuer.RawSubject) == 0 || len(issuer.RawSubjectPublicKeyInfo) == 0 {
+		return Result{}, errors.New("revocation: certificate or issuer lacks parsed DER fields")
+	}
 	if err := p.Validate(); err != nil {
 		return Result{}, err
 	}
@@ -115,9 +118,25 @@ func (c *Checker) Check(ctx context.Context, cert, issuer *x509.Certificate, p P
 	}
 	res.Status = worstFailure(ocspStatus, crlStatus)
 	if res.Status == StatusInvalidEvidence {
-		c.log.Warn("revocation evidence rejected", "issuer", issuer.Subject.String(), "detail", res.Detail)
+		c.logRejected(issuer, res.Attempts)
 	}
 	return res, nil
+}
+
+// logRejected warns once per attempt whose evidence was rejected, with its
+// method, outcome and host only: a URL path or query, a redirect target or
+// an error text may carry data that does not belong in logs.
+func (c *Checker) logRejected(issuer *x509.Certificate, attempts []Attempt) {
+	logged := false
+	for _, a := range attempts {
+		if a.Outcome == StatusInvalidEvidence {
+			c.log.Warn("revocation evidence rejected", "issuer", issuer.Subject.String(), "method", a.Method, "outcome", a.Outcome, "host", hostOf(a.URL))
+			logged = true
+		}
+	}
+	if !logged { // rejected before any attempt was recorded
+		c.log.Warn("revocation evidence rejected", "issuer", issuer.Subject.String())
+	}
 }
 
 // worstFailure folds two failed methods into one status: invalid evidence
