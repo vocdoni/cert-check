@@ -614,6 +614,11 @@ func TestEvaluateCRL(t *testing.T) {
 		{name: "non-critical idp mismatch", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}, NonCritical: true}}, want: StatusInvalidEvidence},
 		{name: "non-critical idp only ca for a leaf", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{crlURI}, OnlyCA: true, NonCritical: true}}, want: StatusUnsupportedMethod},
 		{name: "non-critical idp relative name", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{RelativeName: testpki.RDN{{OID: testpki.OIDCommonName, Value: "CRL1"}}, NonCritical: true}}, want: StatusUnsupportedMethod},
+		// A CRL of another DP is invalid evidence whatever its scope flags.
+		{name: "idp mismatch with only user for a ca", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}, OnlyUser: true}}, ca: true, want: StatusInvalidEvidence},
+		{name: "idp mismatch with only ca for a leaf", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}, OnlyCA: true}}, want: StatusInvalidEvidence},
+		{name: "idp mismatch with indirect", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}, Indirect: true}}, want: StatusInvalidEvidence},
+		{name: "idp mismatch with only some reasons for a ca", spec: testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}, OnlySomeReasons: true}}, ca: true, want: StatusInvalidEvidence},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -637,6 +642,137 @@ func TestEvaluateCRL(t *testing.T) {
 			}
 			if detail == "" {
 				t.Error("EvaluateCRL detail is empty")
+			}
+		})
+	}
+}
+
+// crlTEvalFixture is a root, a leaf it issued and the leaf's single DP.
+func crlTEvalFixture(t *testing.T) (*testpki.CA, *x509.Certificate, DistributionPoint) {
+	t.Helper()
+	root := testpki.NewRoot(t, "crlT fixture root", testpki.CertSpec{Now: crlTNow})
+	leaf := root.Leaf(t, testpki.CertSpec{Now: crlTNow, Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, "crlT fixture leaf")},
+		CDP: []testpki.DistributionPoint{{URIs: []string{"http://crl.example.es/root.crl"}}}})
+	dps, err := ParseCRLDistributionPoints(leaf.Cert)
+	if err != nil || len(dps) != 1 {
+		t.Fatalf("ParseCRLDistributionPoints = %s, %v, want one DP", crlTDPString(dps), err)
+	}
+	return root, leaf.Cert, dps[0]
+}
+
+// crlTEvaluate parses der against root (want good) and evaluates it for leaf.
+func crlTEvaluate(t *testing.T, der []byte, root *testpki.CA, leaf *x509.Certificate, dp DistributionPoint) (Status, CRLRecord, string) {
+	t.Helper()
+	p, st, err := ParseCRL(der, root.Cert)
+	if st != StatusGood || err != nil {
+		t.Fatalf("ParseCRL = %s, %v, want good", st, err)
+	}
+	return EvaluateCRL(p, leaf, dp, ScopeLeaf, crlTNow)
+}
+
+func TestEvaluateCRLZeroThisUpdate(t *testing.T) {
+	root, leaf, dp := crlTEvalFixture(t)
+	zero := crlTDER(cbasn1.GeneralizedTime, []byte("00010101000000Z"))
+	next := crlTDER(cbasn1.UTCTime, []byte(crlTNow.Add(time.Hour).UTC().Format("060102150405Z")))
+	der := crlTSign(t, root.Key, crlTSeq(crlTDER(cbasn1.INTEGER, []byte{1}), crlTECDSAAlgID, root.Cert.RawSubject, zero, next), false)
+	if got, _, detail := crlTEvaluate(t, der, root, leaf, dp); got != StatusInvalidEvidence {
+		t.Errorf("EvaluateCRL with thisUpdate 00010101000000Z = %s (%s), want invalid_evidence", got, detail)
+	}
+}
+
+func TestEvaluateCRLInvertedUpdateInterval(t *testing.T) {
+	root, leaf, dp := crlTEvalFixture(t)
+	cases := []struct {
+		name                   string
+		thisUpdate, nextUpdate time.Time
+		want                   Status
+	}{
+		{"next update before this update", crlTNow.Add(4 * time.Minute), crlTNow.Add(2 * time.Minute), StatusInvalidEvidence},
+		{"next update equal to this update", crlTNow.Add(time.Minute), crlTNow.Add(time.Minute), StatusGood},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, ThisUpdate: c.thisUpdate, NextUpdate: c.nextUpdate})
+			if got, _, detail := crlTEvaluate(t, der, root, leaf, dp); got != c.want {
+				t.Errorf("EvaluateCRL = %s (%s), want %s", got, detail, c.want)
+			}
+		})
+	}
+}
+
+func TestParseCRLDuplicateIDP(t *testing.T) {
+	root, _, _ := crlTEvalFixture(t)
+	idp := func(s testpki.IDPSpec) pkix.Extension {
+		return pkix.Extension{Id: oidExtIssuingDistPoint, Critical: true, Value: testpki.EncodeIDP(s)}
+	}
+	cases := []struct {
+		name  string
+		extra []pkix.Extension
+	}{
+		{"second idp naming another dp", []pkix.Extension{idp(testpki.IDPSpec{URIs: []string{"http://crl.example.es/other.crl"}})}},
+		{"second idp widening the scope", []pkix.Extension{idp(testpki.IDPSpec{})}},
+		{"second crl number", []pkix.Extension{{Id: oidExtCRLNumber, Value: []byte{0x02, 0x01, 0x07}}}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, IDP: &testpki.IDPSpec{URIs: []string{"http://crl.example.es/root.crl"}, OnlyUser: true}, ExtraExtensions: c.extra})
+			if p, st, err := ParseCRL(der, root.Cert); st != StatusInvalidEvidence || err == nil || p != nil {
+				t.Errorf("ParseCRL = %v, %s, %v, want invalid_evidence", p, st, err)
+			}
+		})
+	}
+}
+
+func TestParseCRLDuplicateSerial(t *testing.T) {
+	root, leaf, dp := crlTEvalFixture(t)
+	at := crlTNow.Add(-time.Hour)
+	der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, Entries: []testpki.CRLEntry{
+		{Serial: leaf.SerialNumber, RevokedAt: at, Reason: 1},
+		{Serial: big.NewInt(99), RevokedAt: at, Reason: 1},
+		{Serial: leaf.SerialNumber, RevokedAt: at, Reason: 4},
+	}})
+	if got, rec, detail := crlTEvaluate(t, der, root, leaf, dp); got != StatusRevoked || !rec.RevokedAt.Equal(at) {
+		t.Errorf("EvaluateCRL = %s %+v (%s), want revoked at %v", got, rec, detail, at)
+	}
+}
+
+// TestParseCRLRemoveFromCRL pins today's behaviour: removeFromCRL (8) only
+// has a meaning in a delta CRL, which is unsupported; in a complete CRL the
+// serial is listed, so it is revoked.
+func TestParseCRLRemoveFromCRL(t *testing.T) {
+	root, leaf, dp := crlTEvalFixture(t)
+	at := crlTNow.Add(-time.Hour)
+	der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, Entries: []testpki.CRLEntry{{Serial: leaf.SerialNumber, RevokedAt: at, Reason: 8}}})
+	if got, rec, detail := crlTEvaluate(t, der, root, leaf, dp); got != StatusRevoked || rec.Reason != 8 {
+		t.Errorf("EvaluateCRL = %s %+v (%s), want revoked with reason 8", got, rec, detail)
+	}
+}
+
+func TestParseCRLCriticalEntryExtensions(t *testing.T) {
+	root, leaf, _ := crlTEvalFixture(t)
+	gt := func(s string) []byte { return crlTDER(cbasn1.GeneralizedTime, []byte(s)) }
+	invalidity := func(critical bool, value []byte) pkix.Extension {
+		return pkix.Extension{Id: oidEntryInvalidityDate, Critical: critical, Value: value}
+	}
+	cases := []struct {
+		name string
+		ext  pkix.Extension
+		want Status
+	}{
+		{"unknown critical", pkix.Extension{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 8}, Critical: true, Value: []byte{0x05, 0x00}}, StatusUnsupportedMethod},
+		{"critical invalidity date", invalidity(true, gt("20261029120000Z")), StatusGood},
+		{"critical invalidity date as UTCTime", invalidity(true, crlTDER(cbasn1.UTCTime, []byte("261029120000Z"))), StatusInvalidEvidence},
+		{"critical invalidity date with trailing data", invalidity(true, append(gt("20261029120000Z"), 0x00)), StatusInvalidEvidence},
+		{"critical invalidity date not a time", invalidity(true, []byte{0x05, 0x00}), StatusInvalidEvidence},
+		{"critical invalidity date empty", invalidity(true, nil), StatusInvalidEvidence},
+		{"non-critical malformed invalidity date ignored", invalidity(false, []byte{0x05, 0x00}), StatusGood},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, Entries: []testpki.CRLEntry{
+				{Serial: leaf.SerialNumber, RevokedAt: crlTNow.Add(-time.Hour), Reason: 1, Extensions: []pkix.Extension{c.ext}}}})
+			if p, st, err := ParseCRL(der, root.Cert); st != c.want || (st == StatusGood) != (err == nil && p != nil) {
+				t.Errorf("ParseCRL = %v, %s, %v, want %s", p, st, err, c.want)
 			}
 		})
 	}
