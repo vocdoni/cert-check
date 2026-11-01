@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -30,6 +31,7 @@ const (
 	// A dial outlives a cancelled Fetch (the transport detaches it from the
 	// request and the permit is released), so the semaphore alone does not
 	// bound sockets: the transport caps them per host, and idle ones in total.
+	// Fetch also caps its requests per host at maxConnsPerHost.
 	maxConnsPerHost = 4
 	maxIdleConns    = 32
 )
@@ -60,6 +62,8 @@ type Fetcher struct {
 	client *http.Client
 	sem    chan struct{}
 	ua     string
+	mu     sync.Mutex
+	hosts  map[string]chan struct{} // host:port -> its permits (maxConnsPerHost)
 }
 
 type allowKey struct{}
@@ -98,6 +102,7 @@ func NewFetcher(o FetcherOptions) *Fetcher {
 		client: &http.Client{Transport: tr, CheckRedirect: checkRedirect},
 		sem:    make(chan struct{}, n),
 		ua:     ua,
+		hosts:  make(map[string]chan struct{}),
 	}
 }
 
@@ -132,6 +137,15 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 	u.Host = strings.ToLower(u.Host) // one connection pool per allowlisted host
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
+	// The host's permits first: requests beyond its connection cap wait here
+	// without a global permit, so one hung host cannot starve the others.
+	hp := f.hostPermits(u)
+	select {
+	case hp <- struct{}{}:
+		defer func() { <-hp }()
+	case <-ctx.Done():
+		return res, ctx.Err()
+	}
 	select {
 	case f.sem <- struct{}{}:
 		defer func() { <-f.sem }()
@@ -177,6 +191,27 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 	}
 	res.Body = b
 	return res, nil
+}
+
+// hostPermits returns the permits of u's host:port, made on first use. u is
+// allowlisted and lowercase, so the map is bounded by the allowlists.
+func (f *Fetcher) hostPermits(u *url.URL) chan struct{} {
+	port := u.Port()
+	if port == "" {
+		port = "80"
+		if u.Scheme == "https" {
+			port = "443"
+		}
+	}
+	key := net.JoinHostPort(u.Hostname(), port)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	hp, ok := f.hosts[key]
+	if !ok {
+		hp = make(chan struct{}, maxConnsPerHost)
+		f.hosts[key] = hp
+	}
+	return hp
 }
 
 // dialError marks an error from the dialer, which fetchError reduces to a

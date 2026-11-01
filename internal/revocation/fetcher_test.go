@@ -554,6 +554,51 @@ func TestFetchConcurrency(t *testing.T) {
 	}
 }
 
+// TestFetchHungHostDoesNotStarveOthers: requests to a hung host beyond its
+// connection cap wait for that host's permits, not holding global ones, so
+// another host is still fetched within its timeout.
+func TestFetchHungHostDoesNotStarveOthers(t *testing.T) {
+	var hung atomic.Int64
+	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	n := testpki.NewNet()
+	n.Serve(t, "hung.example.es", http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		hung.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	n.Serve(t, "fast.example.es", testpki.Bytes("application/pkix-crl", []byte("ok")))
+	t.Cleanup(unblock) // runs before the server cleanup (LIFO), also after a failure
+	var conns fetchTConns
+	f := NewFetcher(FetcherOptions{DialContext: conns.dial(n)})
+	hosts := []string{"hung.example.es", "fast.example.es"}
+	var wg sync.WaitGroup
+	for range MaxConcurrent {
+		wg.Go(func() {
+			_, _ = f.Fetch(t.Context(), FetchRequest{URL: "http://hung.example.es/x.crl", MaxBytes: 16,
+				Timeout: 30 * time.Second, AllowedHosts: hosts})
+		})
+	}
+	fetchTEventually(t, func() bool { return hung.Load() >= maxConnsPerHost })
+	time.Sleep(100 * time.Millisecond) // let the excess requests queue
+
+	res, err := f.Fetch(t.Context(), FetchRequest{URL: "http://fast.example.es/x.crl", MaxBytes: 16,
+		Timeout: 2 * time.Second, AllowedHosts: hosts})
+	if err != nil || string(res.Body) != "ok" {
+		t.Errorf("Fetch(fast) = %q, %v while %d fetches hang on another host, want %q", res.Body, err, MaxConcurrent, "ok")
+	}
+	if !slices.Contains(conns.dialedAddrs(), "fast.example.es:80") {
+		t.Errorf("dialed %q, want fast.example.es:80 among them", conns.dialedAddrs())
+	}
+	unblock()
+	wg.Wait()
+	if got := hung.Load(); got != MaxConcurrent {
+		t.Errorf("hung host served %d requests, want %d", got, MaxConcurrent)
+	}
+}
+
 // TestFetchCancelledDialsBounded: the transport detaches a dial from its
 // request, so a Fetch cancelled while dialing releases its permit while the
 // dial goes on. Round after round of such fetches must not pile up dials.
