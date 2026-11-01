@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -53,10 +54,10 @@ const (
 // Config is the validated configuration (spec "Configuration").
 type Config struct {
 	Port                  int      // PORT, default 8080
-	PublicURL             *url.URL // CERTCHECK_PUBLIC_URL, required; https (http only for localhost/127.0.0.1)
+	PublicURL             *url.URL // CERTCHECK_PUBLIC_URL, required; https (http only for localhost/127.0.0.1); in Origin form
 	AuthDomain            string   // CERTCHECK_AUTH_DOMAIN, required, lowercase DNS name
 	AuthPublicPort        int      // CERTCHECK_AUTH_PUBLIC_PORT, default $RAILWAY_TCP_PROXY_PORT; required
-	AuthListen            string   // CERTCHECK_AUTH_LISTEN, default ":8443"
+	AuthListen            string   // CERTCHECK_AUTH_LISTEN, default ":8443"; host:port, port in [1,65535]
 	DataDir               string   // CERTCHECK_DATA_DIR, default "/data"
 	CertMode              CertMode
 	ACMEEmail             string // CERTCHECK_ACME_EMAIL, required with ACME
@@ -104,6 +105,9 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if v := getenv("CERTCHECK_AUTH_LISTEN"); v != "" {
 		c.AuthListen = v
+	}
+	if _, port, err := net.SplitHostPort(c.AuthListen); err != nil || !validPort(port) {
+		errs = append(errs, errors.New("CERTCHECK_AUTH_LISTEN must be host:port with a numeric port in [1,65535]"))
 	}
 	if v := getenv("CERTCHECK_DATA_DIR"); v != "" {
 		c.DataDir = v
@@ -157,19 +161,44 @@ func Load(getenv func(string) string) (Config, error) {
 
 // parsePublicURL accepts an https origin, or an http one for localhost and
 // 127.0.0.1 only. A trailing "/" is dropped; any other path, a query, a
-// fragment or userinfo is rejected.
+// fragment, userinfo or a port outside [1,65535] is rejected. The result is
+// in the form browsers send in Origin: lowercase host, canonical port, no
+// default port.
 func parsePublicURL(raw string) (*url.URL, bool) {
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return nil, false
 	}
 	if u.Path != "" && u.Path != "/" {
 		return nil, false
 	}
-	local := u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1"
+	host := strings.ToLower(u.Hostname())
+	local := host == "localhost" || host == "127.0.0.1"
 	if u.Scheme != "https" && (u.Scheme != "http" || !local) {
 		return nil, false
 	}
-	u.Path = ""
+	port := u.Port()
+	if port != "" || strings.HasSuffix(u.Host, ":") {
+		if !validPort(port) {
+			return nil, false
+		}
+		port = strings.TrimLeft(port, "0")
+		if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+			port = ""
+		}
+	}
+	if strings.Contains(host, ":") { // IPv6 literal
+		host = "[" + host + "]"
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	u.Host, u.Path = host, ""
 	return u, true
+}
+
+// validPort reports whether s is a decimal TCP port in [1,65535].
+func validPort(s string) bool {
+	n, err := strconv.ParseUint(s, 10, 16)
+	return err == nil && n != 0
 }

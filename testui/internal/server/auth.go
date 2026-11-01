@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -32,8 +33,9 @@ type authHandler struct {
 	handler   *certcheck.Handler
 	publicURL string // fixed origin, never taken from the request
 	slots     chan struct{}
-	slotWait  time.Duration // ValidationSlotWait; tests shorten it
-	budget    time.Duration // ValidationBudget; tests shorten it
+	slotWait  time.Duration   // ValidationSlotWait; tests shorten it
+	budget    time.Duration   // ValidationBudget; tests shorten it
+	service   context.Context // parent of every validation; cancelled when the shutdown drain expires
 	log       *slog.Logger
 	version   string
 	now       func() time.Time // diagnostics time of server-made errors
@@ -50,10 +52,13 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provider, ok := a.hosts.Provider(r.TLS.ServerName)
-	states := r.URL.Query()["state"]
+	// ParseQuery, not URL.Query: a malformed pair (bad escape, ';') is an
+	// error rather than silently dropped, so it cannot hide a second state.
+	query, qerr := url.ParseQuery(r.URL.RawQuery)
+	states := query["state"]
 	var ref TxRef
 	err := ErrInvalidState
-	if ok && len(states) == 1 {
+	if ok && qerr == nil && len(states) == 1 {
 		ref, err = a.store.ConsumeState(Secret(states[0]), provider)
 	}
 	if err != nil {
@@ -75,8 +80,10 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, a.publicURL+"/#code="+string(code), http.StatusSeeOther)
 }
 
-// validate runs the checker in a bounded slot with a 40 s budget detached
-// from client disconnects; a missed slot or the budget yields internal (retryable).
+// validate runs the checker in a bounded slot with a 40 s budget on the
+// service context: detached from client disconnects, cancelled when the
+// shutdown drain expires.
+// A missed slot or the budget yields internal (retryable).
 func (a *authHandler) validate(r *http.Request, provider string) Outcome {
 	wait := time.NewTimer(a.slotWait)
 	defer wait.Stop()
@@ -86,7 +93,7 @@ func (a *authHandler) validate(r *http.Request, provider string) Outcome {
 	case <-wait.C:
 		return Outcome{Err: a.serverError(r, certcheck.CodeInternal, "validation capacity exhausted")}
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), a.budget)
+	ctx, cancel := context.WithTimeout(a.service, a.budget)
 	defer cancel()
 	res, err := a.handler.AuthAs(r.WithContext(ctx), provider)
 	if err != nil {
@@ -126,7 +133,8 @@ func (a *authHandler) logOutcome(o Outcome) {
 	a.log.LogAttrs(context.Background(), slog.LevelInfo, "authentication succeeded", attrs...)
 }
 
-// limitListener closes connections beyond its capacity before the TLS handshake.
+// limitListener closes connections beyond its capacity before anything is
+// read (on the auth listener, before the TLS handshake).
 type limitListener struct {
 	net.Listener
 	sem chan struct{}
