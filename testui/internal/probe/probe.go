@@ -279,8 +279,8 @@ func probeCRL(ctx context.Context, f *revocation.Fetcher, t Target, now time.Tim
 		}
 		return l.finish(st, err.Error())
 	}
-	rl := parsed.List
-	l.signer, l.thisUpdate, l.nextUpdate = rl.Issuer.String(), rl.ThisUpdate, rl.NextUpdate
+	rl := parsed
+	l.signer, l.thisUpdate, l.nextUpdate = t.Issuer.Subject.String(), rl.ThisUpdate, rl.NextUpdate // ParseCRL checked the issuer name
 	switch {
 	case rl.ThisUpdate.After(now.Add(revocation.ClockSkew)):
 		return l.finish(revocation.StatusStale, "crl thisUpdate in the future")

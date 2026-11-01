@@ -360,11 +360,18 @@ func TestParseCRL(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || p == nil || p.List == nil {
+			if err != nil || p == nil || p.Listed == nil {
 				t.Fatalf("ParseCRL = %v, %v, want a parsed CRL", p, err)
 			}
-			if p.Size != int64(len(c.der)) {
-				t.Errorf("Size = %d, want %d", p.Size, len(c.der))
+			rl, err := x509.ParseRevocationList(c.der)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !p.ThisUpdate.Equal(rl.ThisUpdate) || !p.NextUpdate.Equal(rl.NextUpdate) || p.Number == nil || p.Number.Cmp(rl.Number) != 0 {
+				t.Errorf("ParseCRL = thisUpdate %v nextUpdate %v number %v, want %v %v %v", p.ThisUpdate, p.NextUpdate, p.Number, rl.ThisUpdate, rl.NextUpdate, rl.Number)
+			}
+			if p.Cost < crlCostBase {
+				t.Errorf("Cost = %d, want at least %d", p.Cost, crlCostBase)
 			}
 		})
 	}
@@ -407,6 +414,13 @@ func TestParseCRL(t *testing.T) {
 		}
 		if len(p.Listed) != len(want) {
 			t.Errorf("Listed has %d entries, want %d", len(p.Listed), len(want))
+		}
+		wantCost := int64(crlCostBase)
+		for k := range want {
+			wantCost += crlCostEntry + int64(len(k))
+		}
+		if p.Cost != wantCost {
+			t.Errorf("Cost = %d, want %d", p.Cost, wantCost)
 		}
 		for k, w := range want {
 			g, ok := p.Listed[k]

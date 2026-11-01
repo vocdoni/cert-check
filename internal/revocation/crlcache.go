@@ -24,7 +24,7 @@ func issuerKey(issuer *x509.Certificate) string {
 }
 
 // crlCache caches parsed CRLs keyed by (issuer SHA-256, URL) until
-// min(nextUpdate, fetched+1h). Cost is estimated as 2 × raw size; the least
+// min(nextUpdate, fetched+1h). Each costs ParsedCRL.Cost; the least
 // recently used entries are evicted past the bound. Fetch+parse run once per
 // key under singleflight, detached from any single caller's cancellation.
 type crlCache struct {
@@ -65,10 +65,10 @@ func (c *crlCache) get(key string, now time.Time) (*ParsedCRL, bool) {
 
 func (c *crlCache) put(key string, p *ParsedCRL, now time.Time) {
 	expires := now.Add(crlCacheMaxAge)
-	if p.List.NextUpdate.Before(expires) {
-		expires = p.List.NextUpdate
+	if p.NextUpdate.Before(expires) {
+		expires = p.NextUpdate
 	}
-	cost := 2 * p.Size
+	cost := p.Cost
 	if cost > c.limit || !now.Before(expires) {
 		return
 	}

@@ -296,11 +296,11 @@ func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Cert
 	}
 	st, rec, detail := EvaluateCRL(load.crl, cert, dp, scope, now)
 	at.Outcome, at.Detail = st, detail
-	at.ThisUpdate, at.NextUpdate = load.crl.List.ThisUpdate, load.crl.List.NextUpdate
+	at.ThisUpdate, at.NextUpdate = load.crl.ThisUpdate, load.crl.NextUpdate
 	res.Attempts = append(res.Attempts, at)
 	res.Detail = fmt.Sprintf("CRL %s: %s", u, detail)
 	if st == StatusGood || st == StatusRevoked {
-		res.ThisUpdate, res.NextUpdate, res.Source = load.crl.List.ThisUpdate, load.crl.List.NextUpdate, hostOf(u)
+		res.ThisUpdate, res.NextUpdate, res.Source = load.crl.ThisUpdate, load.crl.NextUpdate, hostOf(u)
 		if st == StatusRevoked {
 			res.RevokedAt, res.Reason = rec.RevokedAt, rec.Reason
 		}

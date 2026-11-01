@@ -210,14 +210,26 @@ func ParseIDP(der []byte) (IDP, error) {
 	return idp, nil
 }
 
-// ParsedCRL is a parsed, signature-checked CRL kept in the cache. Raw bytes are discarded.
+// ParsedCRL is a parsed, signature-checked CRL kept in the cache: only what
+// EvaluateCRL reads, without the DER or the x509.RevocationList.
 type ParsedCRL struct {
-	List   *x509.RevocationList
-	IDP    *IDP                 // nil when the CRL has no IDP
-	Listed map[string]CRLRecord // serial (lowercase hex of big.Int bytes) -> record
-	Size   int64                // raw size, for the cache bound
-	URL    string
+	ThisUpdate time.Time
+	NextUpdate time.Time            // zero when the CRL has none
+	Number     *big.Int             // cRLNumber, nil when absent
+	IDP        *IDP                 // nil when the CRL has no IDP
+	Listed     map[string]CRLRecord // serial (lowercase hex of big.Int bytes) -> record
+	Cost       int64                // estimated retained heap, for the cache bound
+	URL        string
 }
+
+// Cache charge of a ParsedCRL: a conservative bound on its retained heap,
+// calibrated by TestCRLCacheDenseEntryAccounting. An entry costs its key
+// bytes plus crlCostEntry for its map slot, key header and size-class
+// rounding (measured at most 128 bytes on Go 1.27 amd64, 1k to 1M entries).
+const (
+	crlCostBase  = 4 << 10
+	crlCostEntry = 160
+)
 
 // CRLRecord is one listed serial.
 type CRLRecord struct {
@@ -240,15 +252,17 @@ func ParseCRL(der []byte, issuer *x509.Certificate) (*ParsedCRL, Status, error) 
 	if err != nil {
 		return nil, StatusInvalidEvidence, fmt.Errorf("crl: parse: %w", err)
 	}
-	p := &ParsedCRL{List: rl, Listed: make(map[string]CRLRecord, len(rl.RevokedCertificateEntries)), Size: int64(len(der))}
+	p := &ParsedCRL{ThisUpdate: rl.ThisUpdate, NextUpdate: rl.NextUpdate, Number: rl.Number,
+		Listed: make(map[string]CRLRecord, len(rl.RevokedCertificateEntries)), Cost: crlCostBase}
 	for _, e := range rl.Extensions {
 		switch {
 		case e.Id.Equal(oidExtIssuingDistPoint):
-			idp, err := ParseIDP(e.Value)
+			idp, err := ParseIDP(bytes.Clone(e.Value)) // e.Value aliases der
 			if err != nil {
 				return nil, StatusInvalidEvidence, err
 			}
 			p.IDP = &idp
+			p.Cost += int64(len(e.Value))
 		case e.Id.Equal(oidExtDeltaCRLIndicator):
 			return nil, StatusUnsupportedMethod, errors.New("crl: delta CRL")
 		case e.Critical && !e.Id.Equal(oidExtCRLNumber) && !e.Id.Equal(oidExtAuthorityKeyID):
@@ -268,7 +282,9 @@ func ParseCRL(der []byte, issuer *x509.Certificate) (*ParsedCRL, Status, error) 
 				return nil, StatusUnsupportedMethod, fmt.Errorf("crl: unhandled critical entry extension %s", e.Id)
 			}
 		}
-		p.Listed[SerialKey(entry.SerialNumber)] = rec
+		k := SerialKey(entry.SerialNumber)
+		p.Listed[k] = rec
+		p.Cost += crlCostEntry + int64(len(k))
 	}
 	return p, StatusGood, nil
 }
@@ -312,14 +328,13 @@ const (
 // EvaluateCRL applies freshness, scope and listing to a parsed CRL for cert,
 // whose CDP DistributionPoint (the one the URL came from) is dp.
 func EvaluateCRL(p *ParsedCRL, cert *x509.Certificate, dp DistributionPoint, scope Scope, now time.Time) (Status, CRLRecord, string) {
-	rl := p.List
-	if rl.ThisUpdate.After(now.Add(ClockSkew)) {
+	if p.ThisUpdate.After(now.Add(ClockSkew)) {
 		return StatusStale, CRLRecord{}, "crl thisUpdate in the future"
 	}
-	if rl.NextUpdate.IsZero() {
+	if p.NextUpdate.IsZero() {
 		return StatusStale, CRLRecord{}, "crl without nextUpdate"
 	}
-	if rl.NextUpdate.Before(now) {
+	if p.NextUpdate.Before(now) {
 		return StatusStale, CRLRecord{}, "crl nextUpdate in the past"
 	}
 	if idp := p.IDP; idp != nil {

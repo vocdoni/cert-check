@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,13 +17,14 @@ import (
 // crlTKey composes a cache key the way the checker does.
 func crlTKey(issuer *x509.Certificate, url string) string { return issuerKey(issuer) + " " + url }
 
-// crlTParsed returns a ParsedCRL of the given raw size and nextUpdate.
-func crlTParsed(size int64, nextUpdate time.Time) *ParsedCRL {
+// crlTParsed returns a ParsedCRL of the given cost and nextUpdate.
+func crlTParsed(cost int64, nextUpdate time.Time) *ParsedCRL {
 	return &ParsedCRL{
-		List:   &x509.RevocationList{ThisUpdate: crlTNow.Add(-time.Hour), NextUpdate: nextUpdate},
-		Listed: map[string]CRLRecord{},
-		Size:   size,
-		URL:    "http://crl.example.es/a.crl",
+		ThisUpdate: crlTNow.Add(-time.Hour),
+		NextUpdate: nextUpdate,
+		Listed:     map[string]CRLRecord{},
+		Cost:       cost,
+		URL:        "http://crl.example.es/a.crl",
 	}
 }
 
@@ -136,11 +139,11 @@ func TestCRLCache(t *testing.T) {
 
 	t.Run("lru eviction", func(t *testing.T) {
 		c := newCRLCache(1000)
-		a, b, d := crlTParsed(200, far), crlTParsed(200, far), crlTParsed(200, far)
+		a, b, d := crlTParsed(400, far), crlTParsed(400, far), crlTParsed(400, far)
 		c.put("a", a, now)
 		c.put("b", b, now)
 		if c.cost != 800 {
-			t.Fatalf("cost = %d, want 800 (2 x size)", c.cost)
+			t.Fatalf("cost = %d, want 800", c.cost)
 		}
 		if _, ok := c.get("a", now); !ok {
 			t.Fatal("get a = miss, want hit")
@@ -161,11 +164,11 @@ func TestCRLCache(t *testing.T) {
 
 	t.Run("bound is inclusive", func(t *testing.T) {
 		c := newCRLCache(1000)
-		c.put("a", crlTParsed(500, far), now)
+		c.put("a", crlTParsed(1000, far), now)
 		if _, ok := c.get("a", now); !ok || c.cost != 1000 {
 			t.Fatalf("entry of cost 1000 under limit 1000: cached %v, cost %d, want cached, 1000", ok, c.cost)
 		}
-		c.put("b", crlTParsed(1, far), now)
+		c.put("b", crlTParsed(2, far), now)
 		if _, ok := c.get("a", now); ok {
 			t.Error("get a after b = hit, want evicted")
 		}
@@ -176,8 +179,8 @@ func TestCRLCache(t *testing.T) {
 
 	t.Run("entry above the bound not cached", func(t *testing.T) {
 		c := newCRLCache(1000)
-		c.put("small", crlTParsed(100, far), now)
-		f := &crlTFetcher{p: crlTParsed(501, far)}
+		c.put("small", crlTParsed(200, far), now)
+		f := &crlTFetcher{p: crlTParsed(1001, far)}
 		r := c.load(t.Context(), "huge", now, timeout, f.fetch)
 		if r.crl != f.p || r.err != nil {
 			t.Fatalf("load huge = %+v, want the parsed CRL returned", r)
@@ -192,8 +195,8 @@ func TestCRLCache(t *testing.T) {
 
 	t.Run("replace keeps the cost", func(t *testing.T) {
 		c := newCRLCache(1000)
-		c.put("a", crlTParsed(100, far), now)
-		c.put("a", crlTParsed(150, far), now)
+		c.put("a", crlTParsed(200, far), now)
+		c.put("a", crlTParsed(300, far), now)
 		if c.cost != 300 || len(c.items) != 1 || c.lru.Len() != 1 {
 			t.Errorf("cost %d, items %d, lru %d, want 300, 1, 1", c.cost, len(c.items), c.lru.Len())
 		}
@@ -304,6 +307,42 @@ func TestCRLCache(t *testing.T) {
 			t.Errorf("load for issuer a = %p (fromCache %v), want issuer a's cached CRL", r.crl, r.attempt.FromCache)
 		}
 	})
+}
+
+// TestCRLCacheDenseEntryAccounting: the cache charges a parsed CRL at least
+// the heap it retains once its DER is garbage.
+func TestCRLCacheDenseEntryAccounting(t *testing.T) {
+	ca := testpki.NewRoot(t, "crlT accounting ca", testpki.CertSpec{Now: crlTNow})
+	cases := []struct{ entries, serialLen int }{{10_000, 16}, {200_000, 20}}
+	for _, cc := range cases {
+		t.Run(fmt.Sprintf("%d entries of %d bytes", cc.entries, cc.serialLen), func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			p := crlTParseDense(t, ca, cc.entries, cc.serialLen) // the DER is unreachable on return
+			runtime.GC()
+			runtime.ReadMemStats(&after)
+			retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+			c := newCRLCache(DefaultCRLCacheBytes)
+			c.put("k", p, crlTNow)
+			if c.cost < retained {
+				t.Errorf("charged %d bytes, retained %d: want charged >= retained", c.cost, retained)
+			}
+			t.Logf("%d entries: charged %d, retained %d", len(p.Listed), c.cost, retained)
+			runtime.KeepAlive(p)
+		})
+	}
+}
+
+// crlTParseDense parses a dense CRL from crlTDense; nothing but the result
+// outlives the call.
+func crlTParseDense(t *testing.T, ca *testpki.CA, entries, serialLen int) *ParsedCRL {
+	t.Helper()
+	p, st, err := ParseCRL(crlTDense(t, ca, entries, serialLen, true, false), ca.Cert)
+	if st != StatusGood || err != nil || len(p.Listed) != entries {
+		t.Fatalf("ParseCRL = %s, %v, want good with %d entries", st, err, entries)
+	}
+	return p
 }
 
 // crlTEventually polls cond until it holds or 10 s pass.
