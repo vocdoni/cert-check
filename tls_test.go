@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -158,6 +159,77 @@ func TestAuthenticateRunsEveryRequest(t *testing.T) {
 	}
 	if a, b := first.res.Diagnostics.DiagnosticID, second.res.Diagnostics.DiagnosticID; a == "" || a == b {
 		t.Errorf("DiagnosticIDs = %q, %q, want two distinct IDs", a, b)
+	}
+}
+
+// sharedProvider returns the same outcome to every call: a consumer Provider
+// may hand out a package-level *Error or *Result.
+type sharedProvider struct {
+	ca  *x509.Certificate
+	res *certcheck.Result
+	err error
+}
+
+func (sharedProvider) Info() certcheck.ProviderInfo {
+	return certcheck.ProviderInfo{ID: "shared", Name: "Shared"}
+}
+func (p sharedProvider) CAs() []*x509.Certificate { return []*x509.Certificate{p.ca} }
+func (p sharedProvider) Verify(context.Context, []*x509.Certificate) (*certcheck.Result, error) {
+	return p.res, p.err
+}
+
+// TestAuthSharedOutcome: Auth and AuthAs add the handshake details to a copy
+// of the provider's outcome, never to the shared value (run with -race).
+func TestAuthSharedOutcome(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	leaf := w.leaf(t, w.rootU, hPolicyA, nil)
+	sharedErr := &certcheck.Error{Code: certcheck.CodeRevoked, Detail: "revoked",
+		Diagnostics: certcheck.Diagnostics{Provider: "shared", FailedStep: certcheck.StepRevocation, Code: certcheck.CodeRevoked}}
+	sharedRes := &certcheck.Result{Provider: certcheck.ProviderRef{ID: "shared", Name: "Shared"}}
+	for _, tc := range []struct {
+		name     string
+		provider sharedProvider
+		tlsOf    func() *certcheck.TLSInfo // the shared value's TLS details
+	}{
+		{"*Error", sharedProvider{ca: w.rootU.Cert, err: sharedErr}, func() *certcheck.TLSInfo { return sharedErr.Diagnostics.TLS }},
+		{"wrapped *Error", sharedProvider{ca: w.rootU.Cert, err: fmt.Errorf("wrapped: %w", sharedErr)}, func() *certcheck.TLSInfo { return sharedErr.Diagnostics.TLS }},
+		{"*Result", sharedProvider{ca: w.rootU.Cert, res: sharedRes}, func() *certcheck.TLSInfo { return sharedRes.Diagnostics.TLS }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, err := certcheck.NewHandler([]certcheck.Provider{tc.provider})
+			if err != nil {
+				t.Fatalf("NewHandler: %v", err)
+			}
+			var wg sync.WaitGroup
+			for i := range 8 {
+				wg.Go(func() {
+					sni := fmt.Sprintf("host%d.auth.test", i)
+					r := httptest.NewRequest(http.MethodGet, "https://"+sni+"/login", nil)
+					r.TLS = &tls.ConnectionState{Version: tls.VersionTLS12, ServerName: sni, PeerCertificates: []*x509.Certificate{leaf}}
+					var res *certcheck.Result
+					var err error
+					if i%2 == 0 {
+						res, err = h.Auth(r)
+					} else {
+						res, err = h.AuthAs(r, "shared")
+					}
+					var got *certcheck.TLSInfo
+					if e, ok := errors.AsType[*certcheck.Error](err); ok {
+						got = e.Diagnostics.TLS
+					} else if res != nil {
+						got = res.Diagnostics.TLS
+					}
+					if got == nil || got.SNI != sni {
+						t.Errorf("call %d: Diagnostics.TLS = %+v, want SNI %s", i, got, sni)
+					}
+				})
+			}
+			wg.Wait()
+			if got := tc.tlsOf(); got != nil {
+				t.Errorf("shared outcome's Diagnostics.TLS = %+v, want nil (untouched)", got)
+			}
+		})
 	}
 }
 

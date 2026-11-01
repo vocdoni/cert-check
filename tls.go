@@ -87,18 +87,22 @@ func errNoTLS() *Error {
 	return &Error{Code: CodeInternal, Retryable: true, Detail: "request without TLS state"}
 }
 
-// withTLSInfo adds the handshake details to the outcome of Verify or
-// VerifyAs, which is either a Result or an *Error, never neither.
+// withTLSInfo adds the handshake details to a shallow copy of the outcome of
+// Verify or VerifyAs, which is either a Result or an *Error, never neither.
+// The outcome may be a provider's shared value: it is never modified.
 func withTLSInfo(cs *tls.ConnectionState, res *Result, err error) (*Result, error) {
 	info := DescribeTLS(cs)
 	if err != nil {
-		if e, ok := errors.AsType[*Error](err); ok {
-			e.Diagnostics.TLS = info
+		if e, ok := errors.AsType[*Error](err); ok && e != nil {
+			cp := *e
+			cp.Diagnostics.TLS = info
+			return nil, &cp
 		}
 		return nil, err
 	}
-	res.Diagnostics.TLS = info
-	return res, nil
+	cp := *res
+	cp.Diagnostics.TLS = info
+	return &cp, nil
 }
 
 // CheckHost returns ErrMisdirected when r.Host (port stripped, compared
