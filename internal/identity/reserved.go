@@ -4,8 +4,6 @@ import (
 	"regexp"
 	"slices"
 	"strings"
-
-	"golang.org/x/text/unicode/norm"
 )
 
 // MarkerKind names which reserved-identity rule matched. It never carries a value.
@@ -21,13 +19,15 @@ const (
 
 // Reserved is the versioned registry of test and specimen identities
 // (spec "Identity extraction", reserved identities and name markers).
+// Name markers compare with ComparisonKey, the folding of the SAN
+// consistency check, with U+2019 read as an apostrophe (R5.2).
 type Reserved struct {
 	Version            string
 	Documents          []string       // document numbers, exact
-	SurnameContains    []string       // compared after NFC + upper-casing
-	GivenNameEquals    []string       // compared after NFC + upper-casing
-	GivenNamePattern   *regexp.Regexp // applied to the NFC + upper-cased given names
-	OrganizationEquals []string       // compared after NFC + upper-casing
+	SurnameContains    []string       // contained in the folded surnames, first or second surname
+	GivenNameEquals    []string       // equal to the folded given names
+	GivenNamePattern   *regexp.Regexp // applied to the folded given names
+	OrganizationEquals []string       // equal to the folded organization name
 }
 
 // DefaultReserved returns the production registry.
@@ -50,18 +50,25 @@ func DefaultReserved() Reserved {
 	}
 }
 
-func fold(s string) string { return strings.ToUpper(NormalizeName(norm.NFC.String(s))) }
+func fold(s string) string { return ComparisonKey(strings.ReplaceAll(s, "\u2019", "'")) }
 
 // Match reports whether the extraction hits a reserved identity or a name
 // marker. The returned kind never includes the matched value.
+//
+// Every accepted surname spelling is screened: the subject surnames and the
+// first and second surnames (the SAN spelling where the profile has one).
+// The SAN given name is not kept, but Extract requires its ComparisonKey to
+// equal the subject's, so screening GivenNames covers it.
 func (r Reserved) Match(x Extracted) (MarkerKind, bool) {
 	if slices.Contains(r.Documents, x.Identity.Document.Number) {
 		return MarkerDocument, true
 	}
-	sn := fold(x.Identity.Surnames)
-	for _, m := range r.SurnameContains {
-		if strings.Contains(sn, fold(m)) {
-			return MarkerSurname, true
+	for _, s := range []string{x.Identity.Surnames, x.Identity.FirstSurname, x.Identity.SecondSurname} {
+		sn := fold(s)
+		for _, m := range r.SurnameContains {
+			if strings.Contains(sn, fold(m)) {
+				return MarkerSurname, true
+			}
 		}
 	}
 	gn := fold(x.Identity.GivenNames)
