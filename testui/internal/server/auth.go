@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -50,10 +51,13 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	provider, ok := a.hosts.Provider(r.TLS.ServerName)
-	states := r.URL.Query()["state"]
+	// ParseQuery, not URL.Query: a malformed pair (bad escape, ';') is an
+	// error rather than silently dropped, so it cannot hide a second state.
+	query, qerr := url.ParseQuery(r.URL.RawQuery)
+	states := query["state"]
 	var ref TxRef
 	err := ErrInvalidState
-	if ok && len(states) == 1 {
+	if ok && qerr == nil && len(states) == 1 {
 		ref, err = a.store.ConsumeState(Secret(states[0]), provider)
 	}
 	if err != nil {

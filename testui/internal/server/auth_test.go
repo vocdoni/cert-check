@@ -127,6 +127,15 @@ func TestAuthInvalidState(t *testing.T) {
 			s := stateOf(t, authURL)
 			return authURL + "&state=" + string(s), s
 		}},
+		// A malformed pair must not hide a second state (U11-ASTRA-3).
+		{"duplicated with a bad escape", func(t *testing.T) (string, Secret) {
+			authURL, _ := w.createTx(t, "alpha")
+			return authURL + "&state=%ZZ", stateOf(t, authURL)
+		}},
+		{"duplicated with a semicolon", func(t *testing.T) (string, Secret) {
+			authURL, _ := w.createTx(t, "alpha")
+			return authURL + "&state=a;b", stateOf(t, authURL)
+		}},
 		{"wrong provider", func(t *testing.T) (string, Secret) {
 			authURL, _ := w.createTx(t, "beta")
 			s := stateOf(t, authURL)
