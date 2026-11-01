@@ -260,6 +260,7 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 	needIDP := scope == ScopeCA && len(usable) > 1 && distinctCRLs(usable) > 1
 	last, tried, good, failed := StatusUnsupportedMethod, false, false, false
 	for _, dp := range usable {
+		fetched := false
 		for _, gn := range dp.FullName {
 			raw, ok := gn.URI()
 			if !ok {
@@ -269,7 +270,7 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 			if err != nil || !hostAllowed(u, p.CRLHosts) {
 				continue
 			}
-			tried = true
+			tried, fetched = true, true
 			switch st := c.crlOnce(ctx, raw, cert, issuer, dp, p, scope, needIDP, now, res); st {
 			case StatusRevoked:
 				return st
@@ -282,6 +283,10 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 				failed = true
 				last = worstFailure(last, st)
 			}
+		}
+		if scope == ScopeCA && !fetched { // every DP must answer good, so none may be skipped
+			res.Attempts = append(res.Attempts, Attempt{Method: MethodCRL, Outcome: StatusUnsupportedMethod, Detail: "no allowlisted CDP URL for a CA distribution point"})
+			failed = true
 		}
 	}
 	if !tried {
