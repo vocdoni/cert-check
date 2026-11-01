@@ -150,8 +150,13 @@ func crlTFuzzCheck(t *testing.T, der []byte, issuer, leaf, sub *x509.Certificate
 	if rl.CheckSignatureFrom(issuer) != nil {
 		t.Fatal("ParseCRL accepted a CRL whose signature x509 rejects")
 	}
-	if len(p.Listed) > len(rl.RevokedCertificateEntries) || p.Cost < crlCostBase+int64(len(p.Listed))*crlCostEntry {
+	// A negative serial is listed under its unsigned reading too.
+	if len(p.Listed) > 2*len(rl.RevokedCertificateEntries) || p.Cost < crlCostBase+int64(len(p.Listed))*crlCostEntry {
 		t.Fatalf("Listed %d of %d entries, cost %d", len(p.Listed), len(rl.RevokedCertificateEntries), p.Cost)
+	}
+	// The pre-parse count behind the cache-limit check is x509's.
+	if n, err := checkCRLSignature(der, issuer); err != nil || n != len(rl.RevokedCertificateEntries) {
+		t.Fatalf("checkCRLSignature = %d, %v, want %d entries", n, err, len(rl.RevokedCertificateEntries))
 	}
 	for _, e := range rl.RevokedCertificateEntries {
 		if _, ok := p.Listed[SerialKey(e.SerialNumber)]; !ok {

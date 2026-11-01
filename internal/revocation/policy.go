@@ -49,7 +49,8 @@ const (
 // DefaultMaxAgeWithoutNextUpdate bounds an OCSP response that omits nextUpdate.
 const DefaultMaxAgeWithoutNextUpdate = 15 * time.Minute
 
-// ClockSkew is the tolerance applied to evidence thisUpdate only.
+// ClockSkew is the tolerance applied to evidence thisUpdate and to the OCSP
+// producedAt only.
 const ClockSkew = 5 * time.Minute
 
 // Policy is the per-profile revocation configuration. Hosts are exact,
@@ -105,15 +106,20 @@ func (p Policy) AllHosts() []string {
 // validateHostEntry accepts "name" or "name:port", the form hostAllowed
 // builds: name is lowercase LDH labels with no trailing dot and a top label
 // that is not all digits (so never an IPv4 literal); port is 1-65535 in
-// plain decimal.
+// plain decimal, but not 80 or 443 (hostAllowed strips a scheme's default
+// port, so such an entry would not match the URLs it was written for).
 func validateHostEntry(h string) error {
 	host, port, hasPort := strings.Cut(h, ":")
 	if !dnsName(host) {
 		return fmt.Errorf("revocation: invalid host entry %q: not a lowercase DNS name", h)
 	}
 	if hasPort {
-		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 || strconv.Itoa(n) != port {
 			return fmt.Errorf("revocation: invalid host entry %q: bad port", h)
+		}
+		if n == 80 || n == 443 {
+			return fmt.Errorf("revocation: invalid host entry %q: default port, use the bare name", h)
 		}
 	}
 	return nil

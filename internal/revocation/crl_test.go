@@ -15,6 +15,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io/fs"
+	"maps"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -531,6 +532,49 @@ func TestParseCRLDenseBadSignature(t *testing.T) {
 	t.Logf("%d-byte CRL with a bad signature: %d bytes allocated", len(der), got)
 }
 
+// TestParseCRLOverCostLimit: a CA-signed CRL whose estimated cost exceeds
+// the cache limit is refused after its signature check without the full
+// parse: the cache could not keep it, so every check would parse it again.
+func TestParseCRLOverCostLimit(t *testing.T) {
+	ca := testpki.NewRoot(t, "crlT over limit ca", testpki.CertSpec{Now: crlTNow})
+	const entries = 100_000
+	der := crlTDense(t, ca, entries, 16, true, false)
+	estimate := int64(crlCostBase + entries*crlCostEntry)
+	cases := []struct {
+		name    string
+		limit   int64
+		corrupt bool
+		want    Status
+		wantErr string
+	}{
+		{"over the limit", estimate - 1, false, StatusUnsupportedMethod, "crl too large"},
+		{"over the limit, bad signature", estimate - 1, true, StatusInvalidEvidence, ""},
+		{"at the limit", estimate, false, StatusGood, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			der := der
+			if c.corrupt {
+				der = crlTDense(t, ca, entries, 16, true, true)
+			}
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			p, st, err := parseCRL(der, ca.Cert, c.limit)
+			runtime.ReadMemStats(&after)
+			if st != c.want || (st == StatusGood) != (err == nil && p != nil) {
+				t.Fatalf("parseCRL(limit %d) = %s, %v (parsed %v), want %s", c.limit, st, err, p != nil, c.want)
+			}
+			if c.wantErr != "" && err.Error() != c.wantErr {
+				t.Errorf("parseCRL(limit %d) error = %q, want %q", c.limit, err, c.wantErr)
+			}
+			if got := after.TotalAlloc - before.TotalAlloc; st != StatusGood && got > 256<<10 {
+				t.Errorf("parseCRL of a %d-entry CRL refused as %s allocated %d bytes, want at most 256 KiB", entries, st, got)
+			}
+		})
+	}
+}
+
 func TestSerialKey(t *testing.T) {
 	cases := []struct {
 		in   *big.Int
@@ -733,6 +777,46 @@ func TestParseCRLDuplicateSerial(t *testing.T) {
 	}})
 	if got, rec, detail := crlTEvaluate(t, der, root, leaf, dp); got != StatusRevoked || !rec.RevokedAt.Equal(at) {
 		t.Errorf("EvaluateCRL = %s %+v (%s), want revoked at %v", got, rec, detail, at)
+	}
+}
+
+// TestParseCRLNegativeSerialEntry: a CA that encodes a serial without the
+// leading zero in its CRL (02 01 80 for 128) lists a negative number; the
+// certificate it revokes, serial 128, must still be revoked.
+func TestParseCRLNegativeSerialEntry(t *testing.T) {
+	root := testpki.NewRoot(t, "crlT negative serial root", testpki.CertSpec{Now: crlTNow})
+	cdp := []testpki.DistributionPoint{{URIs: []string{"http://crl.example.es/root.crl"}}}
+	cases := []struct {
+		name   string
+		listed *big.Int // the CRL entry's serial as Go decodes it
+		cert   *big.Int
+		want   Status
+	}{
+		{"02 01 80 lists 128", big.NewInt(-128), big.NewInt(128), StatusRevoked},
+		{"02 01 ff lists 255", big.NewInt(-1), big.NewInt(255), StatusRevoked},
+		{"02 03 80 00 01 lists 0x800001", big.NewInt(-0x7fffff), big.NewInt(0x800001), StatusRevoked},
+		{"02 01 80 does not list 129", big.NewInt(-128), big.NewInt(129), StatusGood},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			leaf := root.Leaf(t, testpki.CertSpec{Now: crlTNow, Serial: c.cert, CDP: cdp,
+				Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, "crlT negative serial leaf")}})
+			dps, err := ParseCRLDistributionPoints(leaf.Cert)
+			if err != nil || len(dps) != 1 {
+				t.Fatalf("ParseCRLDistributionPoints = %s, %v, want one DP", crlTDPString(dps), err)
+			}
+			der := root.CRL(t, testpki.CRLSpec{Now: crlTNow, Entries: []testpki.CRLEntry{{Serial: c.listed, RevokedAt: crlTNow.Add(-time.Hour), Reason: 1}}})
+			p, st, err := ParseCRL(der, root.Cert)
+			if st != StatusGood || err != nil {
+				t.Fatalf("ParseCRL = %s, %v, want good", st, err)
+			}
+			if _, ok := p.Listed[SerialKey(c.listed)]; !ok {
+				t.Errorf("Listed = %v, want the decoded key %q too", slices.Collect(maps.Keys(p.Listed)), SerialKey(c.listed))
+			}
+			if got, _, detail := EvaluateCRL(p, leaf.Cert, dps[0], ScopeLeaf, crlTNow); got != c.want {
+				t.Errorf("EvaluateCRL(serial %x) = %s (%s), want %s", c.cert, got, detail, c.want)
+			}
+		})
 	}
 }
 

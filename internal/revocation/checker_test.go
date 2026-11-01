@@ -887,6 +887,26 @@ func TestCheckCRLCacheAdmission(t *testing.T) {
 	}
 }
 
+// TestCheckCRLOverCacheLimit: a CRL the cache could not keep is refused with
+// a fixed detail instead of being parsed again on every check.
+func TestCheckCRLOverCacheLimit(t *testing.T) {
+	f := chkTNewFixture(t)
+	var entries []testpki.CRLEntry
+	for i := range 50 {
+		entries = append(entries, testpki.CRLEntry{Serial: big.NewInt(int64(1000 + i)), RevokedAt: f.base.Add(-time.Hour), Reason: 1})
+	}
+	f.serve(t, chkTCRLHost, f.crl(t, testpki.CRLSpec{Entries: entries}))
+	leaf := f.leaf(t, nil, []string{chkTCRLURL})
+	c := f.checker(t, Options{CRLCacheBytes: crlCostBase + 10*crlCostEntry})
+	res := chkTCheck(t, c, leaf, f.ca.Cert, chkTPolicy())
+	if res.Status != StatusUnavailable || res.Method != "" {
+		t.Fatalf("Check = %s via %q %s, want unavailable", res.Status, res.Method, chkTTrace(res.Attempts))
+	}
+	if a := res.Attempts[len(res.Attempts)-1]; a.Method != MethodCRL || a.Outcome != StatusUnsupportedMethod || a.Detail != "crl too large" {
+		t.Errorf("CRL attempt = %s %s %q, want crl unsupported_method %q", a.Method, a.Outcome, a.Detail, "crl too large")
+	}
+}
+
 // TestCRLRollbackRejected: once a CRL number is seen for an (issuer, URL), a
 // lower one is invalid evidence, also after the cached CRL expired.
 func TestCRLRollbackRejected(t *testing.T) {
@@ -1104,6 +1124,51 @@ func TestCheckCAScopeUnsupportedARLCannotYieldGood(t *testing.T) {
 			t.Fatalf("Check = %s via %q %s, want good via crl", res.Status, res.Method, chkTTrace(res.Attempts))
 		}
 	})
+}
+
+// TestCheckCAScopeMirrorDPs: DPs naming one CRL path on several hosts
+// (UANATACA, BEWOR, inDenova, DIGITEL) are mirrors of one CRL, so a complete
+// CRL without an IDP covers the CA; DPs naming different paths (the AC DNIE
+// 005/006 shape) or queries still need a CRL bound to each.
+func TestCheckCAScopeMirrorDPs(t *testing.T) {
+	cases := []struct {
+		name       string
+		uris       []string // one DP each, served by the host of each URI
+		revoked    bool     // the CRL lists the CA
+		wantStatus Status
+		wantMethod Method
+	}{
+		{"mirrors of one path", []string{"http://arl1.test/arl.crl", "http://arl2.test/arl.crl"}, false, StatusGood, MethodCRL},
+		{"mirrors listing the CA", []string{"http://arl1.test/arl.crl", "http://arl2.test/arl.crl"}, true, StatusRevoked, MethodCRL},
+		{"two paths stay strict", []string{"http://arl1.test/CRL.crl", "http://arl2.test/arl.crl"}, false, StatusUnavailable, ""},
+		{"two paths on one host stay strict", []string{"http://arl1.test/CRL.crl", "http://arl1.test/arl.crl"}, false, StatusUnavailable, ""},
+		{"two queries stay strict", []string{"http://arl1.test/get?crl=1", "http://arl2.test/get?crl=2"}, false, StatusUnavailable, ""},
+		{"an ldap-only dp is another crl", []string{"ldap://arl1.test/cn=ARL?certificateRevocationList", "http://arl2.test/arl.crl"}, false, StatusUnavailable, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := chkTNewFixture(t)
+			var cdp []testpki.DistributionPoint
+			for _, u := range tc.uris {
+				cdp = append(cdp, testpki.DistributionPoint{URIs: []string{u}})
+			}
+			cert := f.ca.Intermediate(t, "chkT UANATACA CA1", testpki.CertSpec{Now: f.base, CDP: cdp}).Cert
+			var spec testpki.CRLSpec
+			if tc.revoked {
+				spec.Entries = []testpki.CRLEntry{{Serial: cert.SerialNumber, RevokedAt: f.base.Add(-time.Hour), Reason: 1}}
+			}
+			f.serve(t, "arl1.test", f.crl(t, spec))
+			f.serve(t, "arl2.test", f.crl(t, spec))
+			p := Policy{CRLHosts: []string{"arl1.test", "arl2.test"}, AllowCRL: true}
+			res := chkTCheck(t, f.checker(t, Options{}), cert, f.ca.Cert, p)
+			if res.Status != tc.wantStatus || res.Method != tc.wantMethod {
+				t.Fatalf("Check = %s via %q %s, want %s via %q", res.Status, res.Method, chkTTrace(res.Attempts), tc.wantStatus, tc.wantMethod)
+			}
+			if tc.wantStatus == StatusGood && len(res.Attempts) != 3 {
+				t.Errorf("attempts = %s, want OCSP unsupported then both mirrors good", chkTTrace(res.Attempts))
+			}
+		})
+	}
 }
 
 // TestCheckRealDNIeCRLs runs the real AC RAIZ DNIE 2 CRL and ARL through the

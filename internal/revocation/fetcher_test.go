@@ -4,17 +4,21 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -461,6 +465,86 @@ func TestFetchSizeCap(t *testing.T) {
 	}
 }
 
+// TestFetchBodyAllocationBounded: a body at the cap is read into one buffer
+// sized from its Content-Length, or grown by doubling up to the cap without
+// one. io.ReadAll allocated about 2.3x the body in both cases.
+func TestFetchBodyAllocationBounded(t *testing.T) {
+	const size = MaxCRLResponse
+	body := bytes.Repeat([]byte{0x30}, size)
+	n := testpki.NewNet()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/length", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		_, _ = w.Write(body)
+	})
+	mux.HandleFunc("/chunked", func(w http.ResponseWriter, _ *http.Request) {
+		fl := w.(http.Flusher)
+		for i := 0; i < size; i += 1 << 20 {
+			_, _ = w.Write(body[i : i+1<<20])
+			fl.Flush()
+		}
+	})
+	n.Serve(t, "big.example.es", mux)
+	f := NewFetcher(FetcherOptions{DialContext: n.DialContext})
+	cases := []struct {
+		path     string
+		maxRatio float64 // bytes allocated per body byte
+	}{
+		{"/length", 1.1},
+		{"/chunked", 2.1},
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			res, err := f.Fetch(t.Context(), FetchRequest{URL: "http://big.example.es" + c.path, MaxBytes: size,
+				Timeout: 30 * time.Second, AllowedHosts: []string{"big.example.es"}})
+			runtime.ReadMemStats(&after)
+			if err != nil || !bytes.Equal(res.Body, body) {
+				t.Fatalf("Fetch(%s) = %d bytes, %v, want the %d-byte body", c.path, len(res.Body), err, size)
+			}
+			got := float64(after.TotalAlloc-before.TotalAlloc) / size
+			if got > c.maxRatio {
+				t.Errorf("Fetch(%s) allocated %.2fx the body, want at most %.1fx", c.path, got, c.maxRatio)
+			}
+			t.Logf("Fetch(%s): %.2fx the body allocated", c.path, got)
+		})
+	}
+}
+
+// TestFetchTruncatedBody: a body that ends before its announced length or
+// its last chunk is an error, not a short body.
+func TestFetchTruncatedBody(t *testing.T) {
+	raw := func(resp string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			c, buf, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			_, _ = buf.WriteString(resp)
+			_ = buf.Flush()
+		}
+	}
+	n := testpki.NewNet()
+	mux := http.NewServeMux()
+	mux.Handle("/length", raw("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789"))
+	mux.Handle("/length-empty", raw("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"))
+	mux.Handle("/chunked", raw("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n64\r\n0123456789"))
+	n.Serve(t, "short.example.es", mux)
+	f := NewFetcher(FetcherOptions{DialContext: n.DialContext})
+	for _, path := range []string{"/length", "/length-empty", "/chunked"} {
+		t.Run(path, func(t *testing.T) {
+			res, err := f.Fetch(t.Context(), FetchRequest{URL: "http://short.example.es" + path, MaxBytes: 1 << 10,
+				Timeout: 5 * time.Second, AllowedHosts: []string{"short.example.es"}})
+			if !errors.Is(err, io.ErrUnexpectedEOF) || res.Body != nil {
+				t.Errorf("Fetch(%s) = %d bytes, %v, want no body and %v", path, len(res.Body), err, io.ErrUnexpectedEOF)
+			}
+		})
+	}
+}
+
 func TestFetchTimeout(t *testing.T) {
 	n := testpki.NewNet()
 	n.Serve(t, "slow.example.es", testpki.Slow(2*time.Second, testpki.Bytes("application/pkix-crl", []byte("late"))))
@@ -548,6 +632,51 @@ func TestFetchConcurrency(t *testing.T) {
 				t.Errorf("peak concurrent requests = %d, want <= %d", got, c.wantPeak)
 			}
 		})
+	}
+}
+
+// TestFetchHungHostDoesNotStarveOthers: requests to a hung host beyond its
+// connection cap wait for that host's permits, not holding global ones, so
+// another host is still fetched within its timeout.
+func TestFetchHungHostDoesNotStarveOthers(t *testing.T) {
+	var hung atomic.Int64
+	release := make(chan struct{})
+	unblock := sync.OnceFunc(func() { close(release) })
+	n := testpki.NewNet()
+	n.Serve(t, "hung.example.es", http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		hung.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	n.Serve(t, "fast.example.es", testpki.Bytes("application/pkix-crl", []byte("ok")))
+	t.Cleanup(unblock) // runs before the server cleanup (LIFO), also after a failure
+	var conns fetchTConns
+	f := NewFetcher(FetcherOptions{DialContext: conns.dial(n)})
+	hosts := []string{"hung.example.es", "fast.example.es"}
+	var wg sync.WaitGroup
+	for range MaxConcurrent {
+		wg.Go(func() {
+			_, _ = f.Fetch(t.Context(), FetchRequest{URL: "http://hung.example.es/x.crl", MaxBytes: 16,
+				Timeout: 30 * time.Second, AllowedHosts: hosts})
+		})
+	}
+	fetchTEventually(t, func() bool { return hung.Load() >= maxConnsPerHost })
+	time.Sleep(100 * time.Millisecond) // let the excess requests queue
+
+	res, err := f.Fetch(t.Context(), FetchRequest{URL: "http://fast.example.es/x.crl", MaxBytes: 16,
+		Timeout: 2 * time.Second, AllowedHosts: hosts})
+	if err != nil || string(res.Body) != "ok" {
+		t.Errorf("Fetch(fast) = %q, %v while %d fetches hang on another host, want %q", res.Body, err, MaxConcurrent, "ok")
+	}
+	if !slices.Contains(conns.dialedAddrs(), "fast.example.es:80") {
+		t.Errorf("dialed %q, want fast.example.es:80 among them", conns.dialedAddrs())
+	}
+	unblock()
+	wg.Wait()
+	if got := hung.Load(); got != MaxConcurrent {
+		t.Errorf("hung host served %d requests, want %d", got, MaxConcurrent)
 	}
 }
 
@@ -639,8 +768,7 @@ func TestFetchIdleConnsBounded(t *testing.T) {
 }
 
 // TestFetchErrorOmitsResponseStrings: a Fetch error never quotes a Location
-// or any other response bytes; the only URL in it is the requested one. A
-// dial error keeps its text (it may name an allowlisted redirect host).
+// or any other response bytes; the only URL in it is the requested one.
 func TestFetchErrorOmitsResponseStrings(t *testing.T) {
 	const sentinel = "SENTINELPII"
 	raw := func(resp string) http.HandlerFunc {
@@ -693,6 +821,48 @@ func TestFetchErrorOmitsResponseStrings(t *testing.T) {
 			}
 			if !strings.Contains(msg, strconv.Quote(u)) {
 				t.Errorf("Fetch(%s) error = %q, want it to name the requested URL", u, msg)
+			}
+		})
+	}
+}
+
+// TestFetchDialErrorClassified: a dial error is reduced to a fixed category.
+// Its own text can name the resolver, a resolved address or an OS error.
+func TestFetchDialErrorClassified(t *testing.T) {
+	const leak = "10.1.2.3"
+	addr := &net.TCPAddr{IP: net.ParseIP(leak), Port: 80}
+	cases := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{"resolver failure", &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "server misbehaving",
+			Name: "ocsp.example.es", Server: leak + ":53"}}, errDialDNS},
+		{"no such host", &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host",
+			Name: "ocsp.example.es", Server: leak + ":53", IsNotFound: true}}, errDialDNS},
+		{"timeout", &net.OpError{Op: "dial", Net: "tcp", Addr: addr, Err: os.ErrDeadlineExceeded}, errDialTimeout},
+		{"refused", &net.OpError{Op: "dial", Net: "tcp", Addr: addr,
+			Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}, errDialRefused},
+		{"blocked address", &net.OpError{Op: "dial", Net: "tcp", Addr: addr,
+			Err: fmt.Errorf("%w: tcp4 %s", ErrBlockedAddress, leak)}, ErrBlockedAddress},
+		{"other", &net.OpError{Op: "dial", Net: "tcp", Addr: addr,
+			Err: os.NewSyscallError("connect", syscall.ENETUNREACH)}, errDial},
+		{"opaque", errors.New("fetchT: dialer says " + leak), errDial},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := NewFetcher(FetcherOptions{DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return nil, c.err
+			}})
+			const u = "http://ocsp.example.es/ocsp"
+			_, err := f.Fetch(t.Context(), FetchRequest{URL: u, Body: []byte{0x30, 0x00}, MaxBytes: 1 << 10,
+				Timeout: 5 * time.Second, AllowedHosts: []string{"ocsp.example.es"}})
+			if !errors.Is(err, c.want) {
+				t.Fatalf("Fetch error = %v, want %v", err, c.want)
+			}
+			want := (&url.Error{Op: "Post", URL: u, Err: c.want}).Error()
+			if msg := err.Error(); msg != want || strings.Contains(msg, leak) {
+				t.Errorf("Fetch error = %q, want %q", msg, want)
 			}
 		})
 	}
@@ -800,6 +970,93 @@ func TestFetchHTTPStatus(t *testing.T) {
 				t.Errorf("Fetch result = status %d, %d body bytes, want status %d and no body", res.StatusCode, len(res.Body), code)
 			}
 		})
+	}
+}
+
+// TestFetchNon200BodyNotRead: a non-200 answer returns before its body is
+// read and the connection is dropped, not drained, so an endless error body
+// costs neither the timeout nor the bandwidth.
+func TestFetchNon200BodyNotRead(t *testing.T) {
+	var written, open atomic.Int64
+	chunk := bytes.Repeat([]byte{'x'}, 32<<10)
+	n := testpki.NewNet()
+	n.Serve(t, "err.example.es", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		open.Add(1)
+		defer open.Add(-1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fl := w.(http.Flusher)
+		for r.Context().Err() == nil {
+			n, err := w.Write(chunk)
+			written.Add(int64(n))
+			if err != nil {
+				return
+			}
+			fl.Flush()
+		}
+	}))
+	f := NewFetcher(FetcherOptions{DialContext: n.DialContext})
+	start := time.Now()
+	res, err := f.Fetch(t.Context(), FetchRequest{URL: "http://err.example.es/x.crl", MaxBytes: 1 << 10,
+		Timeout: 30 * time.Second, AllowedHosts: []string{"err.example.es"}})
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrHTTPStatus) || res.StatusCode != http.StatusServiceUnavailable || res.Body != nil {
+		t.Fatalf("Fetch = status %d, %d bytes, %v, want 503 and %v", res.StatusCode, len(res.Body), err, ErrHTTPStatus)
+	}
+	if elapsed > time.Second {
+		t.Errorf("Fetch took %v, want it to return on the status line", elapsed)
+	}
+	// A drain behind Close would keep the handler writing until the 30 s
+	// timeout, gigabytes on loopback; what is written before the drop is
+	// what the socket buffers hold, a few MiB at most.
+	fetchTEventually(t, func() bool { return open.Load() == 0 })
+	if got := written.Load(); got >= 64<<20 {
+		t.Errorf("server wrote %d body bytes before the connection dropped, want < 64 MiB", got)
+	}
+}
+
+// TestFetchCancelMidBodyNoLeak: fetches that time out while a body drips in
+// leave no transport goroutine and no server-side connection behind.
+func TestFetchCancelMidBodyNoLeak(t *testing.T) {
+	var open atomic.Int64
+	n := testpki.NewNet()
+	n.Serve(t, "drip.example.es", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		open.Add(1)
+		defer open.Add(-1)
+		fl := w.(http.Flusher)
+		for {
+			if _, err := w.Write([]byte{0x30}); err != nil {
+				return
+			}
+			fl.Flush()
+			select {
+			case <-time.After(20 * time.Millisecond):
+			case <-r.Context().Done():
+				return
+			}
+		}
+	}))
+	f := NewFetcher(FetcherOptions{DialContext: n.DialContext})
+	base := runtime.NumGoroutine()
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Go(func() {
+			_, err := f.Fetch(t.Context(), FetchRequest{URL: "http://drip.example.es/x.crl", MaxBytes: 1 << 20,
+				Timeout: 300 * time.Millisecond, AllowedHosts: []string{"drip.example.es"}})
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("Fetch error = %v, want %v", err, context.DeadlineExceeded)
+			}
+		})
+	}
+	wg.Wait()
+	deadline := time.Now().Add(3 * time.Second)
+	for open.Load() != 0 || runtime.NumGoroutine() > base {
+		if time.Now().After(deadline) {
+			t.Fatalf("after 3s: %d handlers open, %d goroutines, want 0 and <= %d", open.Load(), runtime.NumGoroutine(), base)
+		}
+		// A dial that completes after its fetch timed out joins the idle
+		// pool (bounded, and not a leak); drop it so only leaks remain.
+		f.client.CloseIdleConnections()
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
