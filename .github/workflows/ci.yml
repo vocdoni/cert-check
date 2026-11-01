@@ -63,7 +63,7 @@ jobs:
           for t in FuzzParseResponse FuzzParseIDP FuzzParseCDP; do
             go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/revocation
           done
-          go test -run '^$' -fuzz '^FuzzParseQCStatements$' -fuzztime 30s ./certauth
+          go test -run '^$' -fuzz '^FuzzParseQCStatements$' -fuzztime 30s ./internal/engine
       - name: dependency isolation (AC3)
         run: |
           if go list -deps ./... | grep -E 'certmagic|libdns|go\.uber\.org/zap|golang\.org/x/time'; then exit 1; fi

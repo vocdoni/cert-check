@@ -106,12 +106,6 @@ type Provider struct {
 	Profiles    []Profile
 }
 
-// ProviderInfo is the provider part of a result.
-type ProviderInfo struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
 // ProfileInfo is the profile part of a result.
 type ProfileInfo struct {
 	ID         string `json:"id"`

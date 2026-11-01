@@ -60,8 +60,6 @@ type Registry struct {
 	providers []*loadedProvider
 	byID      map[string]*loadedProvider
 	reserved  identity.Reserved
-	allRoots  *x509.CertPool
-	allInter  *x509.CertPool
 }
 
 var (
@@ -92,8 +90,7 @@ func New(cfg Config) (*Registry, error) {
 	if cfg.Now.IsZero() {
 		return nil, errors.New("profiles: Config.Now is required")
 	}
-	r := &Registry{byID: map[string]*loadedProvider{}, reserved: cfg.Reserved,
-		allRoots: x509.NewCertPool(), allInter: x509.NewCertPool()}
+	r := &Registry{byID: map[string]*loadedProvider{}, reserved: cfg.Reserved}
 	profileIDs := map[string]bool{}
 	for _, p := range cfg.Providers {
 		if !providerIDRe.MatchString(p.ID) || p.Name == "" {
@@ -123,14 +120,12 @@ func New(cfg Config) (*Registry, error) {
 			lp.info.Profiles = append(lp.info.Profiles, prof)
 			for _, c := range e.Anchors {
 				lp.clientCA.AddCert(c)
-				r.allRoots.AddCert(c)
 			}
 			for _, c := range e.Intermediates {
 				lp.clientCA.AddCert(c)
-				r.allInter.AddCert(c)
 			}
 		}
-		if err := checkAmbiguity(lp.enabled); err != nil {
+		if err := CheckAmbiguity(lp.enabled); err != nil {
 			return nil, err
 		}
 		r.byID[p.ID] = lp
@@ -268,9 +263,10 @@ func bytesTrimSpace(b []byte) []byte {
 	return b
 }
 
-// checkAmbiguity rejects two profiles of one provider that share an anchor
-// key and a policy OID (step 4 could then match both).
-func checkAmbiguity(es []*Enabled) error {
+// CheckAmbiguity rejects two profiles that share an anchor key and a policy
+// OID (step 4 could then match both). The loader applies it per provider; the
+// certcheck Handler applies it across providers.
+func CheckAmbiguity(es []*Enabled) error {
 	for i, a := range es {
 		for _, b := range es[i+1:] {
 			if !sharesKey(a.Anchors, b.Anchors) {
@@ -333,12 +329,6 @@ func (r *Registry) ClientCAs(providerID string) (*x509.CertPool, error) {
 		return nil, fmt.Errorf("profiles: unknown provider %q", providerID)
 	}
 	return p.clientCA.Clone(), nil
-}
-
-// AllAnchors returns the union of every enabled profile's anchors and pinned
-// intermediates (used only to tell provider_mismatch from untrusted_issuer).
-func (r *Registry) AllAnchors() (roots, intermediates *x509.CertPool) {
-	return r.allRoots.Clone(), r.allInter.Clone()
 }
 
 // Reserved returns the reserved-identity registry.

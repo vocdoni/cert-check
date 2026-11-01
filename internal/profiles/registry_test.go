@@ -409,25 +409,12 @@ func TestAllAnchors(t *testing.T) {
 			t.Errorf("ClientCAs(%q) differs from the provider's enabled anchors and intermediates", p.ID)
 		}
 	}
-	gotRoots, gotInter := r.AllAnchors()
-	if !gotRoots.Equal(regTPool(roots...)) {
-		t.Error("AllAnchors roots is not the union of every enabled profile's anchors")
-	}
-	if !gotInter.Equal(regTPool(inter...)) {
-		t.Error("AllAnchors intermediates is not the union of every enabled profile's pinned intermediates")
-	}
 	if len(roots) != 26 || len(inter) != 3 {
 		t.Errorf("enabled anchors = %d roots and %d intermediates, want 26 and 3", len(roots), len(inter))
 	}
 
 	// The returned pools are copies.
 	extra := testpki.NewRoot(t, "extra", testpki.CertSpec{})
-	gotRoots.AddCert(extra.Cert)
-	gotInter.AddCert(extra.Cert)
-	again, againInter := r.AllAnchors()
-	if !again.Equal(regTPool(roots...)) || !againInter.Equal(regTPool(inter...)) {
-		t.Error("mutating the AllAnchors result changed the registry")
-	}
 	ca, _ := r.ClientCAs("fnmt")
 	ca.AddCert(extra.Cert)
 	if again, _ := r.ClientCAs("fnmt"); again.Equal(ca) {

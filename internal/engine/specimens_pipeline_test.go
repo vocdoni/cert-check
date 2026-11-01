@@ -1,4 +1,4 @@
-package certauth_test
+package engine_test
 
 import (
 	"context"
@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/internal/identity"
+	certcheck "github.com/vocdoni/cert-check"
+	"github.com/vocdoni/cert-check/internal/engine"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
 )
@@ -33,21 +33,42 @@ func specPipeNoNetwork(context.Context, string, string) (net.Conn, error) {
 // specPipeWant parses one half of the manifest's expected result, e.g.
 // "`test_certificate` (test_marker: fingerprint)", into the code and, for
 // test_certificate, the Error.Detail the pipeline must give.
-func specPipeWant(t *testing.T, half string) (certauth.ErrorCode, string) {
+func specPipeWant(t *testing.T, half string) (certcheck.ErrorCode, string) {
 	t.Helper()
 	half = strings.ReplaceAll(strings.TrimSpace(half), "`", "")
 	code, rest, _ := strings.Cut(half, " ")
-	if certauth.ErrorCode(code) != certauth.CodeTestCertificate {
-		return certauth.ErrorCode(code), ""
+	if certcheck.ErrorCode(code) != certcheck.CodeTestCertificate {
+		return certcheck.ErrorCode(code), ""
 	}
 	marker, ok := strings.CutPrefix(strings.Trim(rest, "()"), "test_marker: ")
 	if !ok {
 		t.Fatalf("expected result %q: test_certificate without a test_marker kind", half)
 	}
 	if marker == "fingerprint" {
-		return certauth.CodeTestCertificate, "known specimen fingerprint"
+		return certcheck.CodeTestCertificate, "known specimen fingerprint"
 	}
-	return certauth.CodeTestCertificate, "reserved identity: " + marker
+	return certcheck.CodeTestCertificate, "reserved identity: " + marker
+}
+
+// specHandler builds every declaration with engine.New at the clock (the
+// production reserved identities) and a Handler over the enabled ones.
+func specHandler(t *testing.T, providers []profiles.Provider, now func() time.Time, rc *revocation.Checker) *certcheck.Handler {
+	t.Helper()
+	var ps []certcheck.Provider
+	for _, d := range providers {
+		p, err := engine.New(engine.Config{Provider: d, Revocation: rc, Now: now, Logger: slog.New(slog.DiscardHandler)})
+		if err != nil {
+			t.Fatalf("engine.New(%s): %v", d.ID, err)
+		}
+		if len(p.CAs()) > 0 {
+			ps = append(ps, p)
+		}
+	}
+	h, err := certcheck.NewHandler(ps, certcheck.WithClock(now))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	return h
 }
 
 func TestSpecimensRejectedTwice(t *testing.T) {
@@ -104,29 +125,21 @@ func TestSpecimensRejectedTwice(t *testing.T) {
 							}
 						}
 					}
-					reg, err := profiles.New(profiles.Config{Providers: providers, Reserved: identity.DefaultReserved(), Now: clock, Logger: logger})
-					if err != nil {
-						t.Fatalf("profiles.New: %v", err)
-					}
 					rc, err := revocation.NewChecker(revocation.Options{DialContext: specPipeNoNetwork, Now: now, Logger: logger})
 					if err != nil {
 						t.Fatalf("revocation.NewChecker: %v", err)
 					}
-					chk, err := certauth.NewChecker(certauth.Options{Registry: reg, Revocation: rc, Now: now})
-					if err != nil {
-						t.Fatalf("NewChecker: %v", err)
-					}
-					res, err := chk.Check(t.Context(), provider, []*x509.Certificate{leaf})
-					e, isErr := errors.AsType[*certauth.Error](err)
+					res, err := specHandler(t, providers, now, rc).VerifyAs(t.Context(), provider, []*x509.Certificate{leaf})
+					e, isErr := errors.AsType[*certcheck.Error](err)
 					if !isErr || res != nil {
-						t.Fatalf("Check = (%v, %v), want a *certauth.Error", res, err)
+						t.Fatalf("Check = (%v, %v), want a *certcheck.Error", res, err)
 					}
 					wantCode, wantDetail := specPipeWant(t, run.half)
 					if e.Code != wantCode {
 						t.Errorf("code = %s at %s (%q), want %s", e.Code, e.Diagnostics.FailedStep, e.Detail, wantCode)
 					}
-					if wantDetail != "" && (e.Detail != wantDetail || e.Diagnostics.FailedStep != certauth.StepTestMarker) {
-						t.Errorf("detail = %q at %s, want %q at %s", e.Detail, e.Diagnostics.FailedStep, wantDetail, certauth.StepTestMarker)
+					if wantDetail != "" && (e.Detail != wantDetail || e.Diagnostics.FailedStep != certcheck.StepTestMarker) {
+						t.Errorf("detail = %q at %s, want %q at %s", e.Detail, e.Diagnostics.FailedStep, wantDetail, certcheck.StepTestMarker)
 					}
 					if n := len(e.Diagnostics.RevocationAttempts); n != 0 {
 						t.Errorf("%d revocation attempts, want none", n)

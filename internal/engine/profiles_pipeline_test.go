@@ -1,4 +1,4 @@
-package certauth
+package engine
 
 import (
 	"crypto/ecdsa"
@@ -419,7 +419,7 @@ const (
 // check serves the shape's revocation endpoints on a fresh fake network and
 // runs the pipeline on [leaf]. arl replaces the DNIe ARL handler when non-nil;
 // the DNIe root CRL is always served.
-func (p *ppPKI) check(t *testing.T, reg *profiles.Registry, s ppShape, leaf *x509.Certificate, mode ppMode, arl http.Handler) (*Result, error) {
+func (p *ppPKI) check(t *testing.T, s ppShape, leaf *x509.Certificate, mode ppMode, arl http.Handler) (*Result, error) {
 	t.Helper()
 	issuer := p.issuer(s)
 	var sites tSites
@@ -462,8 +462,8 @@ func (p *ppPKI) check(t *testing.T, reg *profiles.Registry, s ppShape, leaf *x50
 		sites.handle(t, ppARLURL, testpki.Redirect(ppARLPath))
 		sites.handle(t, ppSiteURL(t, ppARLURL, ppARLPath), arl)
 	}
-	chk := tChecker(t, reg, p.now, tRevocation(t, sites.net(t), p.now))
-	return chk.Check(t.Context(), p.profiles[s.profile].ProviderID, []*x509.Certificate{leaf})
+	chk := tHandler(t, p.providers, p.now, p.now, tRevocation(t, sites.net(t), p.now))
+	return chk.VerifyAs(t.Context(), p.profiles[s.profile].ProviderID, []*x509.Certificate{leaf})
 }
 
 // ppSiteURL returns path on the host of base.
@@ -487,7 +487,6 @@ func TestProfilesPipeline(t *testing.T) {
 	t.Parallel()
 	now := tNow()
 	p := newPPPKI(t, now)
-	reg := tRegistry(t, p.providers, now)
 	shapes := ppShapes(t)
 
 	covered := map[string]bool{}
@@ -513,7 +512,7 @@ func TestProfilesPipeline(t *testing.T) {
 			leaf := p.issue(t, s)
 			prof := p.profiles[s.profile]
 
-			res, err := p.check(t, reg, s, leaf, ppOCSPUp, nil)
+			res, err := p.check(t, s, leaf, ppOCSPUp, nil)
 			if err != nil {
 				t.Fatalf("Check error = %v, want success", err)
 			}
@@ -523,7 +522,7 @@ func TestProfilesPipeline(t *testing.T) {
 				return // no OCSP to fall back from
 			}
 			// CRL fallback: OCSP 503, then the CRL decides (fail closed without one).
-			res, err = p.check(t, reg, s, leaf, ppOCSPDown, nil)
+			res, err = p.check(t, s, leaf, ppOCSPDown, nil)
 			if !s.hasHTTPCDP() {
 				e := tErr(t, err)
 				if e.Code != CodeRevocationUnavailable || e.Diagnostics.FailedStep != StepRevocation {

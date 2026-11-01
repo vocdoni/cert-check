@@ -1,6 +1,6 @@
 //go:build live
 
-package certauth_test
+package engine_test
 
 import (
 	"crypto/sha256"
@@ -15,8 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vocdoni/cert-check/certauth"
-	"github.com/vocdoni/cert-check/internal/identity"
+	certcheck "github.com/vocdoni/cert-check"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
 )
@@ -90,29 +89,21 @@ func TestWithheldSpecimensRejectedTwice(t *testing.T) {
 							}
 						}
 					}
-					reg, err := profiles.New(profiles.Config{Providers: providers, Reserved: identity.DefaultReserved(), Now: clock, Logger: logger})
-					if err != nil {
-						t.Fatalf("profiles.New: %v", err)
-					}
 					rc, err := revocation.NewChecker(revocation.Options{DialContext: specPipeNoNetwork, Now: now, Logger: logger})
 					if err != nil {
 						t.Fatalf("revocation.NewChecker: %v", err)
 					}
-					chk, err := certauth.NewChecker(certauth.Options{Registry: reg, Revocation: rc, Now: now})
-					if err != nil {
-						t.Fatalf("NewChecker: %v", err)
-					}
-					res, err := chk.Check(t.Context(), provider, []*x509.Certificate{leaf})
-					e, isErr := errors.AsType[*certauth.Error](err)
+					res, err := specHandler(t, providers, now, rc).VerifyAs(t.Context(), provider, []*x509.Certificate{leaf})
+					e, isErr := errors.AsType[*certcheck.Error](err)
 					if !isErr || res != nil {
-						t.Fatalf("Check = (%v, %v), want a *certauth.Error", res, err)
+						t.Fatalf("Check = (%v, %v), want a *certcheck.Error", res, err)
 					}
 					wantCode, wantDetail := specPipeWant(t, run.half)
 					if e.Code != wantCode {
 						t.Errorf("code = %s at %s (%q), want %s", e.Code, e.Diagnostics.FailedStep, e.Detail, wantCode)
 					}
-					if wantDetail != "" && (e.Detail != wantDetail || e.Diagnostics.FailedStep != certauth.StepTestMarker) {
-						t.Errorf("detail = %q at %s, want %q at %s", e.Detail, e.Diagnostics.FailedStep, wantDetail, certauth.StepTestMarker)
+					if wantDetail != "" && (e.Detail != wantDetail || e.Diagnostics.FailedStep != certcheck.StepTestMarker) {
+						t.Errorf("detail = %q at %s, want %q at %s", e.Detail, e.Diagnostics.FailedStep, wantDetail, certcheck.StepTestMarker)
 					}
 					if n := len(e.Diagnostics.RevocationAttempts); n != 0 {
 						t.Errorf("%d revocation attempts, want none", n)

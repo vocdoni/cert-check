@@ -1,4 +1,4 @@
-package certauth
+package engine
 
 import (
 	"bytes"
@@ -46,7 +46,7 @@ func TestCriticalExtensionCopy(t *testing.T) {
 	g3 := ppEnabled(t, reg, "idcat", "aoc-idcat-g3")
 
 	t.Run("accepted under G2", func(t *testing.T) {
-		res, err := p.check(t, reg, g2Shape, leaf, ppOCSPUp, nil)
+		res, err := p.check(t, g2Shape, leaf, ppOCSPUp, nil)
 		if err != nil {
 			t.Fatalf("Check error = %v, want success", err)
 		}
@@ -93,7 +93,7 @@ func TestCriticalExtensionCopy(t *testing.T) {
 	t.Run("rejected under G3", func(t *testing.T) {
 		s := ppShapeNamed(t, "aoc-idcat-g3")
 		s.extra = []pkix.Extension{{Id: ppOIDQC, Critical: true, Value: ppQCStatements(t)}}
-		res, err := p.check(t, reg, s, p.issue(t, s), ppOCSPUp, nil)
+		res, err := p.check(t, s, p.issue(t, s), ppOCSPUp, nil)
 		e := tErr(t, err)
 		if res != nil || e.Code != CodeInvalidChain || e.Diagnostics.FailedStep != StepPath {
 			t.Errorf("got (%s at %s), want (%s at %s); detail %q", e.Code, e.Diagnostics.FailedStep, CodeInvalidChain, StepPath, e.Detail)
@@ -111,7 +111,7 @@ func TestCriticalExtensionCopy(t *testing.T) {
 		t.Run("malformed under G2: "+tc.name, func(t *testing.T) {
 			s := g2Shape
 			s.extra = []pkix.Extension{{Id: ppOIDQC, Critical: true, Value: tc.value}}
-			res, err := p.check(t, reg, s, p.issue(t, s), ppOCSPUp, nil)
+			res, err := p.check(t, s, p.issue(t, s), ppOCSPUp, nil)
 			e := tErr(t, err)
 			if res != nil || e.Code != CodeInvalidChain || e.Diagnostics.FailedStep != StepPurpose {
 				t.Errorf("got (%s at %s), want (%s at %s); detail %q", e.Code, e.Diagnostics.FailedStep, CodeInvalidChain, StepPurpose, e.Detail)
@@ -135,7 +135,7 @@ func TestPathPriority(t *testing.T) {
 			leaf := w.leaf(t, tc.ca(w), func(s *testpki.CertSpec) {
 				s.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageEmailProtection}
 			})
-			_, err := w.chk.Check(t.Context(), "alpha", []*x509.Certificate{leaf})
+			_, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf})
 			e := tErr(t, err)
 			if e.Code != CodeUnsupportedPurpose || e.Diagnostics.FailedStep != StepPath {
 				t.Errorf("got (%s at %s), want (%s at %s)", e.Code, e.Diagnostics.FailedStep, CodeUnsupportedPurpose, StepPath)
@@ -166,9 +166,8 @@ func TestPathPriority(t *testing.T) {
 			s.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageEmailProtection}
 		})
 		for _, order := range [][]profiles.Profile{{a, b}, {b, a}} {
-			reg := tRegistry(t, []profiles.Provider{{ID: "delta", Name: "Delta", Profiles: order}}, now.Add(-48*time.Hour))
-			chk := tChecker(t, reg, now, tRevocation(t, testpki.NewNet(), now))
-			_, err := chk.Check(t.Context(), "delta", []*x509.Certificate{leaf})
+			chk := tHandler(t, []profiles.Provider{{ID: "delta", Name: "Delta", Profiles: order}}, now.Add(-48*time.Hour), now, tRevocation(t, testpki.NewNet(), now))
+			_, err := chk.VerifyAs(t.Context(), "delta", []*x509.Certificate{leaf})
 			e := tErr(t, err)
 			if e.Code != CodeUnsupportedPurpose || e.Diagnostics.FailedStep != StepPath {
 				t.Errorf("order %s first: got (%s at %s, %q), want (%s at %s)", order[0].ID, e.Code, e.Diagnostics.FailedStep, e.Detail, CodeUnsupportedPurpose, StepPath)
@@ -180,7 +179,7 @@ func TestPathPriority(t *testing.T) {
 		leaf := w.leaf(t, w.rootC, func(s *testpki.CertSpec) {
 			s.NotBefore, s.NotAfter = s.Now.Add(-48*time.Hour), s.Now.Add(-24*time.Hour)
 		})
-		_, err := w.chk.Check(t.Context(), "alpha", []*x509.Certificate{leaf})
+		_, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf})
 		e := tErr(t, err)
 		if e.Code != CodeExpired || e.Diagnostics.FailedStep != StepPath {
 			t.Errorf("got (%s at %s), want (%s at %s)", e.Code, e.Diagnostics.FailedStep, CodeExpired, StepPath)
@@ -196,12 +195,11 @@ func TestPathPriority(t *testing.T) {
 			EKU: profiles.EKURequireClientAuth, Identity: tPlainAdapter(),
 			Revocation: revocation.Policy{OCSPHosts: []string{cwOCSPHost}}}
 		// The registry loaded while the anchor was valid; the clock moved on.
-		reg := tRegistry(t, []profiles.Provider{{ID: "gamma", Name: "Gamma", Profiles: []profiles.Profile{prof}}}, now.Add(-48*time.Hour))
-		chk := tChecker(t, reg, now, tRevocation(t, testpki.NewNet(), now))
+		chk := tHandler(t, []profiles.Provider{{ID: "gamma", Name: "Gamma", Profiles: []profiles.Profile{prof}}}, now.Add(-48*time.Hour), now, tRevocation(t, testpki.NewNet(), now))
 		leaf := w.leaf(t, root, func(s *testpki.CertSpec) {
 			s.NotBefore, s.NotAfter = now.Add(-5*24*time.Hour), now.Add(30*24*time.Hour)
 		})
-		_, err := chk.Check(t.Context(), "gamma", []*x509.Certificate{leaf})
+		_, err := chk.VerifyAs(t.Context(), "gamma", []*x509.Certificate{leaf})
 		e := tErr(t, err)
 		if e.Code != CodeInvalidChain || e.Diagnostics.FailedStep != StepPath || !strings.Contains(e.Detail, "anchor or intermediate outside validity") {
 			t.Errorf("got (%s at %s, %q), want (%s at %s, anchor outside validity)", e.Code, e.Diagnostics.FailedStep, e.Detail, CodeInvalidChain, StepPath)
@@ -213,7 +211,7 @@ func TestPathPriority(t *testing.T) {
 			s.Policies = []asn1.ObjectIdentifier{tOID(t, cwPolicyC)}
 			s.ExtraExtensions = []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 7, 1}, Critical: true, Value: []byte{0x05, 0x00}}}
 		})
-		_, err := w.chk.Check(t.Context(), "alpha", []*x509.Certificate{leaf})
+		_, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf})
 		e := tErr(t, err)
 		if e.Code != CodeProviderMismatch || e.Diagnostics.FailedStep != StepPath {
 			t.Errorf("got (%s at %s), want (%s at %s)", e.Code, e.Diagnostics.FailedStep, CodeProviderMismatch, StepPath)
@@ -222,7 +220,7 @@ func TestPathPriority(t *testing.T) {
 
 	t.Run("identity detail names the rule, not the value", func(t *testing.T) {
 		leaf := w.leaf(t, w.rootA, func(s *testpki.CertSpec) { s.Subject = tPerson("IDCES-12345678A", cwGiven, cwSurnames) })
-		_, err := w.chk.Check(t.Context(), "alpha", []*x509.Certificate{leaf})
+		_, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf})
 		e := tErr(t, err)
 		for _, v := range []string{"12345678A", cwGiven, cwSurnames} {
 			if strings.Contains(e.Detail, v) {
@@ -239,7 +237,7 @@ func TestPathPriority(t *testing.T) {
 // specimens (real issuer bytes).
 func specimenQCStatements(t testing.TB) map[string][]byte {
 	t.Helper()
-	files, err := filepath.Glob(filepath.Join("..", "testdata", "specimens", "*.pem"))
+	files, err := filepath.Glob(filepath.Join("..", "..", "testdata", "specimens", "*.pem"))
 	if err != nil || len(files) == 0 {
 		t.Fatalf("specimens: %v (%d files)", err, len(files))
 	}

@@ -1,4 +1,4 @@
-package certauth
+package engine
 
 import (
 	"context"
@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	certcheck "github.com/vocdoni/cert-check"
 	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
@@ -27,8 +28,8 @@ import (
 // pipeline outcome of every committed specimen under every production
 // provider, and the full Result JSON of every synthetic profile fixture.
 const (
-	goldenDir         = "../testdata/golden"
-	goldenSpecimenDir = "../testdata/specimens"
+	goldenDir         = "../../testdata/golden"
+	goldenSpecimenDir = "../../testdata/specimens"
 )
 
 var (
@@ -61,7 +62,6 @@ func goldenMask(raw []byte, now time.Time) string {
 func TestGoldenSynthetic(t *testing.T) {
 	now := tNow()
 	p := newPPPKI(t, now)
-	reg := tRegistry(t, p.providers, now)
 	var (
 		mu  sync.Mutex
 		out = map[string]string{}
@@ -75,7 +75,7 @@ func TestGoldenSynthetic(t *testing.T) {
 					name string
 					mode ppMode
 				}{{"ocsp", ppOCSPUp}, {"ocsp-down", ppOCSPDown}} {
-					res, err := p.check(t, reg, s, leaf, mode.mode, nil)
+					res, err := p.check(t, s, leaf, mode.mode, nil)
 					var raw []byte
 					var merr error
 					if err != nil {
@@ -155,16 +155,22 @@ func TestGoldenSpecimens(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			reg, err := profiles.New(profiles.Config{Providers: decls, Reserved: reserved, Now: clock, Logger: tDiscard})
-			if err != nil {
-				t.Fatal(err)
+			var enabled []certcheck.Provider
+			for _, d := range decls {
+				p, err := New(Config{Provider: d, Revocation: rc, Now: now, Logger: tDiscard, Reserved: &reserved})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(p.CAs()) > 0 { // the registry hid providers without an enabled profile
+					enabled = append(enabled, p)
+				}
 			}
-			chk, err := NewChecker(Options{Registry: reg, Revocation: rc, Now: now})
+			h, err := certcheck.NewHandler(enabled, certcheck.WithClock(now))
 			if err != nil {
 				t.Fatal(err)
 			}
 			for _, d := range profiles.All() {
-				res, err := chk.Check(t.Context(), d.ID, []*x509.Certificate{leaf})
+				res, err := h.VerifyAs(t.Context(), d.ID, []*x509.Certificate{leaf})
 				e, ok := errors.AsType[*Error](err)
 				if !ok || res != nil {
 					t.Fatalf("%s on %s (%s): (%v, %v), want *Error", filepath.Base(f), d.ID, run, res, err)

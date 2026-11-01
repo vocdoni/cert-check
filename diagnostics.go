@@ -1,4 +1,4 @@
-package certauth
+package certcheck
 
 import (
 	"crypto/ecdsa"
@@ -14,8 +14,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-
-	"github.com/vocdoni/cert-check/internal/revocation"
 )
 
 // Diagnostics is the session-bound support report. It contains certificate
@@ -36,7 +34,7 @@ type Diagnostics struct {
 	RevocationAttempts []RevocationAttempt `json:"revocationAttempts"`
 }
 
-// TLSInfo describes the handshake (filled by tlsauth).
+// TLSInfo describes the handshake (filled by Handler.Auth and Handler.AuthAs).
 type TLSInfo struct {
 	Version                    string `json:"version"`
 	CipherSuite                string `json:"cipherSuite"`
@@ -76,24 +74,25 @@ type CandidateResult struct {
 	Result    string `json:"result"`
 }
 
-// RevocationAttempt is revocation.Attempt in report form.
+// RevocationAttempt is one OCSP or CRL fetch made for the verified chain.
 type RevocationAttempt struct {
-	Method           revocation.Method `json:"method"`
-	URL              string            `json:"url"`
-	HTTPStatus       int               `json:"httpStatus"`
-	DurationMS       int64             `json:"durationMs"`
-	Outcome          revocation.Status `json:"outcome"`
-	Detail           string            `json:"detail"`
-	FromCache        bool              `json:"fromCache"`
-	ProducedAt       *time.Time        `json:"producedAt"`
-	ThisUpdate       *time.Time        `json:"thisUpdate"`
-	NextUpdate       *time.Time        `json:"nextUpdate"`
-	ResponderSubject string            `json:"responderSubject"`
-	NonceSent        bool              `json:"nonceSent"`
-	NonceEchoed      bool              `json:"nonceEchoed"`
+	Method           RevocationMethod `json:"method"`
+	URL              string           `json:"url"`
+	HTTPStatus       int              `json:"httpStatus"`
+	DurationMS       int64            `json:"durationMs"`
+	Outcome          RevocationStatus `json:"outcome"`
+	Detail           string           `json:"detail"`
+	FromCache        bool             `json:"fromCache"`
+	ProducedAt       *time.Time       `json:"producedAt"`
+	ThisUpdate       *time.Time       `json:"thisUpdate"`
+	NextUpdate       *time.Time       `json:"nextUpdate"`
+	ResponderSubject string           `json:"responderSubject"`
+	NonceSent        bool             `json:"nonceSent"`
+	NonceEchoed      bool             `json:"nonceEchoed"`
 }
 
-// NewDiagnosticID returns 16 random bytes in hex.
+// NewDiagnosticID returns a new random diagnostic ID (32 lowercase hex
+// digits), for errors a server decides itself.
 func NewDiagnosticID() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b) // since Go 1.24 crypto/rand.Read never returns an error (it crashes instead)
@@ -114,7 +113,8 @@ func DescribeTLS(cs *tls.ConnectionState) *TLSInfo {
 	}
 }
 
-func describeCertificate(c *x509.Certificate) *CertificateDetails {
+// DescribeCertificate describes a received leaf for Diagnostics.Certificate.
+func DescribeCertificate(c *x509.Certificate) *CertificateDetails {
 	sum := sha256.Sum256(c.Raw)
 	d := &CertificateDetails{
 		Subject: c.Subject.String(), Issuer: c.Issuer.String(), SerialHex: fmt.Sprintf("%x", c.SerialNumber),
@@ -171,27 +171,8 @@ func extKeyUsageName(e x509.ExtKeyUsage) string {
 	return fmt.Sprintf("eku(%d)", e)
 }
 
-func reportAttempts(in []revocation.Attempt) []RevocationAttempt {
-	opt := func(t time.Time) *time.Time {
-		if t.IsZero() {
-			return nil
-		}
-		return new(t.UTC())
-	}
-	out := make([]RevocationAttempt, 0, len(in))
-	for _, a := range in {
-		out = append(out, RevocationAttempt{
-			Method: a.Method, URL: a.URL, HTTPStatus: a.HTTPStatus, DurationMS: a.Duration.Milliseconds(),
-			Outcome: a.Outcome, Detail: a.Detail, FromCache: a.FromCache, ProducedAt: opt(a.ProducedAt),
-			ThisUpdate: opt(a.ThisUpdate), NextUpdate: opt(a.NextUpdate), ResponderSubject: a.ResponderSubject,
-			NonceSent: a.NonceSent, NonceEchoed: a.NonceEchoed,
-		})
-	}
-	return out
-}
-
 // LogAttrs returns the non-PII fields allowed in logs: id, code, step,
-// provider, candidates (x509 error class only, see logSafe), issuer DN,
+// provider, candidates (x509 error class only), issuer DN,
 // policy OIDs, revocation host/status/duration, TLS version/cipher. Never
 // subject, names, document, serial, leaf hash, URL paths or technicalDetail.
 func (d Diagnostics) LogAttrs() []slog.Attr {

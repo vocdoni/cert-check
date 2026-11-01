@@ -1,4 +1,4 @@
-package certauth
+package engine
 
 import (
 	"cmp"
@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	certcheck "github.com/vocdoni/cert-check"
 	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
@@ -94,14 +95,29 @@ func tRegistry(t testing.TB, providers []profiles.Provider, regNow time.Time) *p
 	return reg
 }
 
-// tChecker builds a Checker with the clock fixed at now.
-func tChecker(t testing.TB, reg *profiles.Registry, now time.Time, rc *revocation.Checker) *Checker {
+// tHandler builds one Provider per declaration, loaded at loadNow with the
+// production reserved identities and clocked at now afterwards, and a Handler
+// over the enabled ones (the registry hid the others). Handler.VerifyAs is
+// what Checker.Check was.
+func tHandler(t testing.TB, providers []profiles.Provider, loadNow, now time.Time, rc *revocation.Checker) *certcheck.Handler {
 	t.Helper()
-	c, err := NewChecker(Options{Registry: reg, Revocation: rc, Now: func() time.Time { return now }, Version: "test"})
-	if err != nil {
-		t.Fatalf("NewChecker: %v", err)
+	var ps []certcheck.Provider
+	for _, d := range providers {
+		clock := loadNow // New reads the clock once, as the load time
+		p, err := New(Config{Provider: d, Revocation: rc, Now: func() time.Time { return clock }, Logger: tDiscard, Version: "test"})
+		if err != nil {
+			t.Fatalf("New(%s): %v", d.ID, err)
+		}
+		clock = now
+		if len(p.CAs()) > 0 {
+			ps = append(ps, p)
+		}
 	}
-	return c
+	h, err := certcheck.NewHandler(ps, certcheck.WithClock(func() time.Time { return now }), certcheck.WithVersion("test"))
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	return h
 }
 
 // tPerson is the common natural-person subject: C, serialNumber, GN, SN, CN.
@@ -211,7 +227,7 @@ type codeWorld struct {
 	rootA, rootB, rootC *testpki.CA
 	ocsp                *testpki.OCSPServer
 	marker              *x509.Certificate // alpha-a leaf pinned as a fingerprint marker
-	chk                 *Checker
+	chk                 *certcheck.Handler
 
 	mu      sync.Mutex
 	answers map[string]func(testpki.Request) testpki.OCSPSpec // OCSP answer by leaf serial; default good, nextUpdate +1h
@@ -262,7 +278,7 @@ func newCodeWorld(t *testing.T) *codeWorld {
 		{ID: "alpha", Name: "Alpha", Profiles: []profiles.Profile{a, b}},
 		{ID: "beta", Name: "Beta", Profiles: []profiles.Profile{profile("beta-a", "beta", w.rootC, cwPolicyC)}},
 	}
-	w.chk = tChecker(t, tRegistry(t, providers, now), now, tRevocation(t, sites.net(t), now))
+	w.chk = tHandler(t, providers, now, now, tRevocation(t, sites.net(t), now))
 	return w
 }
 
@@ -318,7 +334,7 @@ func (w *codeWorld) run(t *testing.T, c codeCase) ([]*x509.Certificate, *Result,
 		ctx, cancel = context.WithTimeout(ctx, c.timeout)
 		defer cancel()
 	}
-	res, err := w.chk.Check(ctx, cmp.Or(c.provider, "alpha"), chain)
+	res, err := w.chk.VerifyAs(ctx, cmp.Or(c.provider, "alpha"), chain)
 	return chain, res, err
 }
 
@@ -485,7 +501,7 @@ func TestCheckCodes(t *testing.T) {
 			if c.detail != "" && !strings.Contains(e.Detail, c.detail) {
 				t.Errorf("detail = %q, want it to contain %q", e.Detail, c.detail)
 			}
-			if got, want := e.Error(), "certauth: "+string(e.Code)+": "+e.Detail; got != want {
+			if got, want := e.Error(), "certcheck: "+string(e.Code)+": "+e.Detail; got != want {
 				t.Errorf("Error() = %q, want %q", got, want)
 			}
 		})
@@ -517,43 +533,42 @@ func TestNewCheckerOptions(t *testing.T) {
 		Anchors: []profiles.Anchor{profiles.TestAnchor(root.Cert)}, PolicyOIDs: []string{"1.3.6.1.4.1.99999.3.1"},
 		EKU: profiles.EKURequireClientAuth, Identity: tPlainAdapter(),
 		Revocation: revocation.Policy{OCSPHosts: []string{"ocsp.opt.test"}}}
-	reg := tRegistry(t, []profiles.Provider{{ID: "opt", Name: "Opt", Profiles: []profiles.Profile{prof}}}, now)
+	decl := profiles.Provider{ID: "opt", Name: "Opt", Description: "Opt provider", Profiles: []profiles.Profile{prof}}
 	rc := tRevocation(t, testpki.NewNet(), now)
 
 	unparsed := prof
 	unparsed.HandledCriticalExtensions = []string{"1.3.6.1.4.1.99999.3.9"}
-	regUnparsed := tRegistry(t, []profiles.Provider{{ID: "opt", Name: "Opt", Profiles: []profiles.Profile{unparsed}}}, now)
+	declUnparsed := profiles.Provider{ID: "opt", Name: "Opt", Profiles: []profiles.Profile{unparsed}}
 
 	for _, tc := range []struct {
 		name string
-		opts Options
+		cfg  Config
 		want string // error substring; "" = success
 	}{
-		{"no registry", Options{Revocation: rc}, "required"},
-		{"no revocation", Options{Registry: reg}, "required"},
-		{"handled extension without a parser", Options{Registry: regUnparsed, Revocation: rc}, "opt-a handles 1.3.6.1.4.1.99999.3.9 without a parser"},
-		{"defaults", Options{Registry: reg, Revocation: rc}, ""},
+		{"invalid declaration", Config{Revocation: rc}, "invalid provider"},
+		{"no revocation", Config{Provider: decl}, "required"},
+		{"handled extension without a parser", Config{Provider: declUnparsed, Revocation: rc}, "opt-a handles 1.3.6.1.4.1.99999.3.9 without a parser"},
+		{"defaults", Config{Provider: decl, Revocation: rc}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, err := NewChecker(tc.opts)
+			c, err := New(tc.cfg)
 			if tc.want != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.want) {
-					t.Fatalf("NewChecker error = %v, want one containing %q", err, tc.want)
+					t.Fatalf("New error = %v, want one containing %q", err, tc.want)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("NewChecker error = %v", err)
+				t.Fatalf("New error = %v", err)
 			}
 			if c.maxLen != DefaultMaxChainLen || c.now == nil {
 				t.Errorf("defaults: maxLen %d, now set %v; want %d and true", c.maxLen, c.now != nil, DefaultMaxChainLen)
 			}
-			if got := len(c.Providers()); got != 1 {
-				t.Errorf("Providers() has %d entries, want 1", got)
+			if got, want := c.Info(), (certcheck.ProviderInfo{ID: "opt", Name: "Opt", Description: "Opt provider"}); got != want {
+				t.Errorf("Info() = %+v, want %+v", got, want)
 			}
-			pool, err := c.ClientCAs("opt")
-			if err != nil || !pool.Equal(func() *x509.CertPool { p := x509.NewCertPool(); p.AddCert(root.Cert); return p }()) {
-				t.Errorf("ClientCAs = (%v, %v), want the anchor pool", pool, err)
+			if cas := c.CAs(); len(cas) != 1 || !cas[0].Equal(root.Cert) {
+				t.Errorf("CAs() = %d certificates, want the anchor", len(cas))
 			}
 		})
 	}
@@ -566,7 +581,7 @@ func TestClientIntermediatesIgnored(t *testing.T) {
 	t.Run("unpinned sub CA", func(t *testing.T) {
 		sub := w.rootA.Intermediate(t, "Unpinned Sub CA", testpki.CertSpec{Now: w.now, KeyPair: tKey(t, "cw-sub", testpki.ECDSAP256)})
 		leaf := w.leaf(t, sub, nil)
-		res, err := w.chk.Check(t.Context(), "alpha", []*x509.Certificate{leaf, sub.Cert})
+		res, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf, sub.Cert})
 		e := tErr(t, err)
 		if res != nil || e.Code != CodeUntrustedIssuer || e.Diagnostics.FailedStep != StepPath {
 			t.Errorf("got (%s at %s), want (%s at %s)", e.Code, e.Diagnostics.FailedStep, CodeUntrustedIssuer, StepPath)
@@ -594,7 +609,7 @@ func TestClientIntermediatesIgnored(t *testing.T) {
 			return testpki.OCSPSpec{Signer: forged.AsResponder(), NoCerts: true, NameHashOverride: req.IssuerNameHash,
 				KeyHashOverride: req.IssuerKeyHash, NextUpdate: w.now.Add(time.Hour)}
 		})
-		res, err := w.chk.Check(t.Context(), "alpha", []*x509.Certificate{leaf, forged.Cert})
+		res, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf, forged.Cert})
 		e := tErr(t, err)
 		if res != nil || e.Code != CodeRevocationUnavailable || e.Diagnostics.FailedStep != StepRevocation {
 			t.Errorf("got (%s at %s), want (%s at %s); detail %q", e.Code, e.Diagnostics.FailedStep, CodeRevocationUnavailable, StepRevocation, e.Detail)
@@ -620,7 +635,6 @@ func TestIntermediateRevocation(t *testing.T) {
 	t.Parallel()
 	now := tNow()
 	p := newPPPKI(t, now)
-	reg := tRegistry(t, p.providers, now)
 	s := ppShapeNamed(t, "dnie-auth")
 	leaf := p.issue(t, s)
 	root := p.anchors["dnie-auth"][0]
@@ -636,7 +650,7 @@ func TestIntermediateRevocation(t *testing.T) {
 		{"ARL down", tUnavailable, CodeRevocationUnavailable},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			res, err := p.check(t, reg, s, leaf, ppOCSPUp, tc.arl)
+			res, err := p.check(t, s, leaf, ppOCSPUp, tc.arl)
 			var attempts []RevocationAttempt
 			if tc.want == "" {
 				if err != nil {

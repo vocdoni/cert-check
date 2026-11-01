@@ -1,4 +1,4 @@
-package certauth
+package engine
 
 import (
 	"bytes"
@@ -108,11 +108,11 @@ func TestLogAttrsNoPII(t *testing.T) {
 	revoked := w.leaf(t, w.rootA, nil)
 	w.answer(revoked.SerialNumber, testpki.OCSPSpec{Status: testpki.Revoked, NextUpdate: w.now.Add(time.Hour)})
 
-	res, err := w.chk.Check(t.Context(), "alpha", []*x509.Certificate{good})
+	res, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{good})
 	if err != nil {
 		t.Fatalf("Check(good) error = %v", err)
 	}
-	_, err = w.chk.Check(t.Context(), "alpha", []*x509.Certificate{revoked, w.rootA.Cert})
+	_, err = w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{revoked, w.rootA.Cert})
 	failure := tErr(t, err)
 	if failure.Code != CodeRevoked {
 		t.Fatalf("Check(revoked) code = %s, want %s", failure.Code, CodeRevoked)

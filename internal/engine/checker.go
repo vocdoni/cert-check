@@ -1,4 +1,4 @@
-package certauth
+package engine
 
 import (
 	"context"
@@ -12,19 +12,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
 
+	certcheck "github.com/vocdoni/cert-check"
 	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/profiles"
 	"github.com/vocdoni/cert-check/internal/revocation"
-)
-
-// Bounds.
-const (
-	DefaultMaxChainLen = 10
-	MaxCertificateDER  = 16 << 10
 )
 
 var (
@@ -52,55 +48,86 @@ func parseQCStatements(der []byte) error {
 	return nil
 }
 
-// Options configures a Checker.
-type Options struct {
-	Registry    *profiles.Registry  // required
+// Config configures New.
+type Config struct {
+	Provider    profiles.Provider   // the declaration of one certificate type
 	Revocation  *revocation.Checker // required
-	Now         func() time.Time    // nil = time.Now
-	MaxChainLen int                 // 0 = 10
+	Now         func() time.Time    // nil = time.Now; Now() at New is the load time
+	Logger      *slog.Logger        // load warnings; nil = slog.Default()
 	Version     string              // reported as diagnostics serverVersion
+	MaxChainLen int                 // 0 = 10
+	Reserved    *identity.Reserved  // nil = identity.DefaultReserved(); &identity.Reserved{} empties it
 }
 
-// Checker runs the validation pipeline. Safe for concurrent use.
-type Checker struct {
-	reg     *profiles.Registry
+// Provider runs the validation pipeline of one provider declaration. It
+// implements certcheck.Provider and is safe for concurrent use.
+type Provider struct {
+	reg     *profiles.Registry // holds this declaration only
+	id      string
+	info    certcheck.ProviderInfo
+	cas     []*x509.Certificate
 	rev     *revocation.Checker
 	now     func() time.Time
 	maxLen  int
 	version string
 }
 
-// NewChecker validates options.
-func NewChecker(o Options) (*Checker, error) {
-	if o.Registry == nil || o.Revocation == nil {
-		return nil, errors.New("certauth: Registry and Revocation are required")
+var _ certcheck.Provider = (*Provider)(nil)
+
+// New loads the declaration at Now() (pins checked; an anchor outside
+// validity is skipped with a warning) and returns its pipeline. A
+// declaration whose profiles are all disabled gives an inert Provider: CAs is
+// empty and Verify fails provider_mismatch at step bounds.
+func New(cfg Config) (*Provider, error) {
+	if cfg.Revocation == nil {
+		return nil, errors.New("engine: Revocation is required")
 	}
-	for _, p := range o.Registry.Providers() {
+	now := cfg.Now
+	if now == nil {
+		now = time.Now
+	}
+	reserved := identity.DefaultReserved()
+	if cfg.Reserved != nil {
+		reserved = *cfg.Reserved
+	}
+	reg, err := profiles.New(profiles.Config{Providers: []profiles.Provider{cfg.Provider}, Reserved: reserved, Now: now(), Logger: cfg.Logger})
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range reg.Providers() {
 		for _, prof := range p.Profiles {
 			for _, oid := range prof.HandledCriticalExtensions {
 				if _, ok := extensionParsers[oid]; !ok {
-					return nil, fmt.Errorf("certauth: profile %s handles %s without a parser", prof.ID, oid)
+					return nil, fmt.Errorf("engine: profile %s handles %s without a parser", prof.ID, oid)
 				}
 			}
 		}
 	}
-	c := &Checker{reg: o.Registry, rev: o.Revocation, now: o.Now, maxLen: o.MaxChainLen, version: o.Version}
-	if c.now == nil {
-		c.now = time.Now
-	}
+	c := &Provider{reg: reg, id: cfg.Provider.ID, rev: cfg.Revocation, now: now, maxLen: cfg.MaxChainLen, version: cfg.Version,
+		info: certcheck.ProviderInfo{ID: cfg.Provider.ID, Name: cfg.Provider.Name, Description: cfg.Provider.Description, Beta: cfg.Provider.Beta}}
 	if c.maxLen <= 0 {
 		c.maxLen = DefaultMaxChainLen
+	}
+	for _, e := range reg.Enabled(c.id) {
+		for _, ca := range slices.Concat(e.Anchors, e.Intermediates) {
+			if !slices.ContainsFunc(c.cas, ca.Equal) {
+				c.cas = append(c.cas, ca)
+			}
+		}
 	}
 	return c, nil
 }
 
-// Providers returns the enabled providers in display order.
-func (c *Checker) Providers() []profiles.Provider { return c.reg.Providers() }
+// Info describes the provider.
+func (c *Provider) Info() certcheck.ProviderInfo { return c.info }
 
-// ClientCAs returns the CA pool advertised for a provider.
-func (c *Checker) ClientCAs(providerID string) (*x509.CertPool, error) {
-	return c.reg.ClientCAs(providerID)
-}
+// CAs returns the anchors and pinned intermediates of the enabled profiles,
+// in declaration order (the certificate_authorities list of a handshake).
+func (c *Provider) CAs() []*x509.Certificate { return c.cas }
+
+// EnabledProfiles returns the loaded profiles behind CAs (read-only). The
+// certcheck Handler uses it for its ambiguity check and for provider_mismatch.
+func (c *Provider) EnabledProfiles() []*profiles.Enabled { return c.reg.Enabled(c.id) }
 
 // run carries the diagnostics of one Check invocation.
 type run struct {
@@ -118,9 +145,10 @@ type candidate struct {
 	err   error
 }
 
-// Check validates chain (as received: chain[0] is the leaf) for providerID.
+// Verify validates chain (as received: chain[0] is the leaf).
 // The returned error is always *Error.
-func (c *Checker) Check(ctx context.Context, providerID string, chain []*x509.Certificate) (*Result, error) {
+func (c *Provider) Verify(ctx context.Context, chain []*x509.Certificate) (*Result, error) {
+	providerID := c.id
 	now := c.now()
 	r := &run{diag: Diagnostics{DiagnosticID: NewDiagnosticID(), Time: now.UTC(), ServerVersion: c.version, Provider: providerID}}
 	for _, cert := range chain {
@@ -135,7 +163,7 @@ func (c *Checker) Check(ctx context.Context, providerID string, chain []*x509.Ce
 	// 1. Bounds.
 	prov, ok := c.reg.Provider(providerID)
 	if !ok {
-		return nil, r.fail(StepBounds, CodeProviderMismatch, "unknown provider")
+		return nil, r.fail(StepBounds, CodeProviderMismatch, "provider has no enabled profile")
 	}
 	if len(chain) == 0 || chain[0] == nil {
 		return nil, r.fail(StepBounds, CodeNoCertificate, "no client certificate")
@@ -280,7 +308,7 @@ func (c *Checker) Check(ctx context.Context, providerID string, chain []*x509.Ce
 		next = new(leafRev.NextUpdate.UTC())
 	}
 	return &Result{
-		Provider:     profiles.ProviderInfo{ID: prov.ID, Name: prov.Name},
+		Provider:     ProviderRef{ID: prov.ID, Name: prov.Name},
 		Profile:      profiles.ProfileInfo{ID: prof.ID, Name: prof.Name, HolderRole: prof.HolderRole},
 		Identity:     x.Identity,
 		Organization: x.Organization,
@@ -329,7 +357,7 @@ const (
 // mapPathErrors maps the candidates' x509 errors to one code. Priority:
 // IncompatibleUsage > Expired > UnhandledCriticalExtension (when the leaf
 // otherwise chains to that profile) > UnknownAuthority > other.
-func (c *Checker) mapPathErrors(leaf *x509.Certificate, cands []candidate, now time.Time) (ErrorCode, string) {
+func (c *Provider) mapPathErrors(leaf *x509.Certificate, cands []candidate, now time.Time) (ErrorCode, string) {
 	best, bestRank, detail := CodeInvalidChain, rankOther+1, ""
 	consider := func(rank int, code ErrorCode, d string) {
 		if rank < bestRank {
@@ -370,25 +398,12 @@ func (c *Checker) mapPathErrors(leaf *x509.Certificate, cands []candidate, now t
 			continue
 		}
 		if _, ok := errors.AsType[x509.UnknownAuthorityError](err); ok {
-			consider(rankUnknownAuthority, c.unknownAuthorityCode(leaf, now), err.Error())
+			consider(rankUnknownAuthority, CodeUntrustedIssuer, err.Error())
 			continue
 		}
 		consider(rankOther, CodeInvalidChain, fmt.Sprint(err))
 	}
 	return best, detail
-}
-
-// unknownAuthorityCode: provider_mismatch when the leaf verifies against the
-// union of every enabled provider's pinned CAs, else untrusted_issuer.
-func (c *Checker) unknownAuthorityCode(leaf *x509.Certificate, now time.Time) ErrorCode {
-	roots, inter := c.reg.AllAnchors()
-	probe := *leaf
-	probe.UnhandledCriticalExtensions = nil // classification only, never acceptance
-	_, err := probe.Verify(verifyOptions(roots, inter, now))
-	if _, unknown := errors.AsType[x509.UnknownAuthorityError](err); err != nil && unknown {
-		return CodeUntrustedIssuer
-	}
-	return CodeProviderMismatch
 }
 
 // algorithmsOK: RSA ≥ minRSA (floor 2048) or ECDSA P-256/P-384/P-521, and a

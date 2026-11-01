@@ -1,4 +1,4 @@
-package certauth
+package engine
 
 import (
 	"crypto/x509"
@@ -52,7 +52,7 @@ func TestPurposeRules(t *testing.T) {
 	}
 
 	t.Run("CA:TRUE leaf through the pipeline", func(t *testing.T) {
-		res, err := w.chk.Check(t.Context(), "alpha", []*x509.Certificate{caLeaf})
+		res, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{caLeaf})
 		e := tErr(t, err)
 		if res != nil || e.Code != CodeUnsupportedPurpose || e.Diagnostics.FailedStep != StepPurpose {
 			t.Errorf("got (%s at %s), want (%s at %s)", e.Code, e.Diagnostics.FailedStep, CodeUnsupportedPurpose, StepPurpose)

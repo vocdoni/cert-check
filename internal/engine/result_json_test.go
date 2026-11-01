@@ -1,4 +1,4 @@
-package certauth
+package engine
 
 import (
 	"crypto/x509"
@@ -133,7 +133,7 @@ func TestResultJSON(t *testing.T) {
 	// DNIe-like evidence: good without nextUpdate.
 	leaf := w.leaf(t, w.rootA, nil)
 	w.answer(leaf.SerialNumber, testpki.OCSPSpec{})
-	res, err := w.chk.Check(t.Context(), "alpha", []*x509.Certificate{leaf})
+	res, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{leaf})
 	if err != nil {
 		t.Fatalf("Check error = %v", err)
 	}
@@ -143,7 +143,7 @@ func TestResultJSON(t *testing.T) {
 	checkJSONShape(t, "result", decodeJSON(t, res), jsonResultShape(jNull, jNull, jNull))
 
 	// nextUpdate, birthDate and organization present.
-	withNext, err := w.chk.Check(t.Context(), "alpha", []*x509.Certificate{w.leaf(t, w.rootA, nil)})
+	withNext, err := w.chk.VerifyAs(t.Context(), "alpha", []*x509.Certificate{w.leaf(t, w.rootA, nil)})
 	if err != nil {
 		t.Fatalf("Check error = %v", err)
 	}
@@ -171,7 +171,7 @@ func TestResultJSON(t *testing.T) {
 func TestErrorDiagnosticsJSON(t *testing.T) {
 	t.Parallel()
 	w := newCodeWorld(t)
-	_, err := w.chk.Check(t.Context(), "alpha", nil)
+	_, err := w.chk.VerifyAs(t.Context(), "alpha", nil)
 	e := tErr(t, err)
 	got := decodeJSON(t, e.Diagnostics).(map[string]any)
 	want := map[string]any{"diagnosticId": jString, "time": jTime, "serverVersion": jString, "provider": jString,

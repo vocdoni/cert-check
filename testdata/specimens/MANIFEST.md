@@ -1,7 +1,7 @@
 # Specimen leaves: MANIFEST
 
 CA-published test and specimen end-entity certificates, used by the pipeline tests (AC2, AC5).
-`TestSpecimenManifest` (`certauth/specimens_test.go`) parses the table below and checks, for every
+`TestSpecimenManifest` (`internal/engine/specimens_test.go`) parses the table below and checks, for every
 `committed` row, that the file holds exactly one clean PEM `CERTIFICATE` block, that the SHA-256 of
 its DER equals the `sha256(DER)` column, that the issuer CN and the validity dates match, and that
 Go parses it. Every `.pem` in this directory must be listed as `committed`. A `withheld (R-P1)` file
@@ -24,7 +24,7 @@ only under the `live` build tag, from files kept outside the repository.
 Expected pipeline result: from the plan, measured on the scratch pipeline with the clock at
 NotBefore+30 min.
 Left of ` / `: production markers (run 1). Right: all test markers emptied (run 2). The first word
-of each side is the `certauth.ErrorCode`.
+of each side is the `certcheck.ErrorCode`.
 
 | file | status | sha256(DER) | issuer CN | validity | source archive (URL; SHA-256) | expected pipeline result (production markers / markers emptied) |
 |---|---|---|---|---|---|---|
