@@ -68,7 +68,7 @@ jobs:
           for t in FuzzParseName FuzzParseSANDirectoryNames FuzzParseDateOfBirth FuzzParseDocument FuzzDateUnmarshalJSON FuzzAdapterExtract; do
             go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/identity
           done
-          for t in FuzzParseResponse FuzzParseIDP FuzzParseCDP; do
+          for t in FuzzParseResponse FuzzParseIDP FuzzParseCDP FuzzParseCRL; do
             go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/revocation
           done
           go test -run '^$' -fuzz '^FuzzParseQCStatements$' -fuzztime 30s ./internal/engine
