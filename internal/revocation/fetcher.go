@@ -181,7 +181,7 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 	if resp.ContentLength > r.MaxBytes {
 		return res, ErrTooLarge
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, r.MaxBytes+1))
+	b, err := readBody(resp.Body, resp.ContentLength, r.MaxBytes)
 	res.Duration = time.Since(start)
 	if err != nil {
 		return res, fetchError(req, err)
@@ -191,6 +191,40 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 	}
 	res.Body = b
 	return res, nil
+}
+
+// readBody reads at most maxBytes+1 bytes of body into one buffer: sized
+// from length when it is known (the transport ends the body there), else
+// doubled from 64 KiB up to maxBytes+1. A body at the cap allocates about 1x
+// its size with a length and 2x without one; io.ReadAll's chunks plus their
+// final copy took 2.3x.
+func readBody(body io.Reader, length, maxBytes int64) ([]byte, error) {
+	if length >= 0 {
+		b := make([]byte, length)
+		if _, err := io.ReadFull(body, b); err != nil {
+			return nil, err
+		}
+		return b, nil
+	}
+	lim := io.LimitReader(body, maxBytes+1)
+	b := make([]byte, 0, min(maxBytes+1, 64<<10))
+	for {
+		if len(b) == cap(b) && int64(cap(b)) <= maxBytes {
+			next := 2 * int64(cap(b))
+			if next >= maxBytes { // never a last step of one byte past a full buffer
+				next = maxBytes + 1
+			}
+			b = append(make([]byte, 0, next), b...)
+		}
+		n, err := lim.Read(b[len(b):cap(b)])
+		b = b[:len(b)+n]
+		if err == io.EOF {
+			return b, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 }
 
 // hostPermits returns the permits of u's host:port, made on first use. u is

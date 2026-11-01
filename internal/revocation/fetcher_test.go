@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -459,6 +460,86 @@ func TestFetchSizeCap(t *testing.T) {
 			}
 			if len(res.Body) != c.wantLen {
 				t.Errorf("Fetch(%s) body length = %d, want %d", c.path, len(res.Body), c.wantLen)
+			}
+		})
+	}
+}
+
+// TestFetchBodyAllocationBounded: a body at the cap is read into one buffer
+// sized from its Content-Length, or grown by doubling up to the cap without
+// one. io.ReadAll allocated about 2.3x the body in both cases.
+func TestFetchBodyAllocationBounded(t *testing.T) {
+	const size = MaxCRLResponse
+	body := bytes.Repeat([]byte{0x30}, size)
+	n := testpki.NewNet()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/length", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		_, _ = w.Write(body)
+	})
+	mux.HandleFunc("/chunked", func(w http.ResponseWriter, _ *http.Request) {
+		fl := w.(http.Flusher)
+		for i := 0; i < size; i += 1 << 20 {
+			_, _ = w.Write(body[i : i+1<<20])
+			fl.Flush()
+		}
+	})
+	n.Serve(t, "big.example.es", mux)
+	f := NewFetcher(FetcherOptions{DialContext: n.DialContext})
+	cases := []struct {
+		path     string
+		maxRatio float64 // bytes allocated per body byte
+	}{
+		{"/length", 1.1},
+		{"/chunked", 2.1},
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			res, err := f.Fetch(t.Context(), FetchRequest{URL: "http://big.example.es" + c.path, MaxBytes: size,
+				Timeout: 30 * time.Second, AllowedHosts: []string{"big.example.es"}})
+			runtime.ReadMemStats(&after)
+			if err != nil || !bytes.Equal(res.Body, body) {
+				t.Fatalf("Fetch(%s) = %d bytes, %v, want the %d-byte body", c.path, len(res.Body), err, size)
+			}
+			got := float64(after.TotalAlloc-before.TotalAlloc) / size
+			if got > c.maxRatio {
+				t.Errorf("Fetch(%s) allocated %.2fx the body, want at most %.1fx", c.path, got, c.maxRatio)
+			}
+			t.Logf("Fetch(%s): %.2fx the body allocated", c.path, got)
+		})
+	}
+}
+
+// TestFetchTruncatedBody: a body that ends before its announced length or
+// its last chunk is an error, not a short body.
+func TestFetchTruncatedBody(t *testing.T) {
+	raw := func(resp string) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			c, buf, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+			_, _ = buf.WriteString(resp)
+			_ = buf.Flush()
+		}
+	}
+	n := testpki.NewNet()
+	mux := http.NewServeMux()
+	mux.Handle("/length", raw("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n0123456789"))
+	mux.Handle("/length-empty", raw("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"))
+	mux.Handle("/chunked", raw("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n64\r\n0123456789"))
+	n.Serve(t, "short.example.es", mux)
+	f := NewFetcher(FetcherOptions{DialContext: n.DialContext})
+	for _, path := range []string{"/length", "/length-empty", "/chunked"} {
+		t.Run(path, func(t *testing.T) {
+			res, err := f.Fetch(t.Context(), FetchRequest{URL: "http://short.example.es" + path, MaxBytes: 1 << 10,
+				Timeout: 5 * time.Second, AllowedHosts: []string{"short.example.es"}})
+			if !errors.Is(err, io.ErrUnexpectedEOF) || res.Body != nil {
+				t.Errorf("Fetch(%s) = %d bytes, %v, want no body and %v", path, len(res.Body), err, io.ErrUnexpectedEOF)
 			}
 		})
 	}
