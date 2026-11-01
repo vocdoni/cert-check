@@ -284,7 +284,8 @@ func requiredName(n Name, oid asn1.ObjectIdentifier, kinds KindSet) (string, err
 // the invisible ones (the Hangul fillers), so the letter is visible (R5.1).
 func hasLetter(s string) bool { return strings.IndexFunc(s, unicode.IsLetter) >= 0 }
 
-// dnieSurnames applies the DNIe CN grammar against the known SN and GN.
+// dnieSurnames applies the DNIe CN grammar against the known SN and GN. The
+// surnames must be a normalised word sequence without ',' or parentheses.
 func dnieSurnames(cn, sn, given string) (string, error) {
 	var rest string
 	var ok bool
@@ -299,6 +300,9 @@ func dnieSurnames(cn, sn, given string) (string, error) {
 	full, ok := strings.CutSuffix(rest, ", "+given)
 	if !ok {
 		return "", invalidf("DNIe CN given name does not match GN")
+	}
+	if full != NormalizeName(full) || strings.ContainsAny(full, ",()") {
+		return "", invalidf("DNIe CN surnames are not a plain word sequence")
 	}
 	if full != sn && !strings.HasPrefix(full, sn+" ") {
 		return "", invalidf("DNIe CN surnames do not start with SN")

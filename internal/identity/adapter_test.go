@@ -497,6 +497,13 @@ func adapterCases(tb testing.TB) []adapterCase {
 			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ, PEDRO (AUTENTICACIÓN)")}, wantErr: invalid},
 		{name: "dnie CN without the comma separator", adapter: shapeDNIe(),
 			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ,JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
+		// R5.3 (U7-FABLE-1): the surnames are a plain word sequence.
+		{name: "dnie CN space before comma", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ , JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
+		{name: "dnie CN surnames with an extra comma segment", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ, PEDRO, JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
+		{name: "dnie CN surnames with a parenthesised token", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ (FIRMA), JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
 		{name: "dnie CN without suffix", adapter: shapeDNIe(),
 			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ, JOSÉ")}, wantErr: invalid},
 		{name: "dnie CN with FIRMA suffix", adapter: shapeDNIe(),
@@ -619,6 +626,11 @@ func TestAdapterExtract(t *testing.T) {
 			id := got.Identity
 			if want := id.GivenNames + " " + id.Surnames; id.FullName != want {
 				t.Errorf("FullName = %q, want GivenNames + \" \" + Surnames = %q", id.FullName, want)
+			}
+			for _, v := range []string{id.GivenNames, id.Surnames, id.FirstSurname, id.SecondSurname} {
+				if v != identity.NormalizeName(v) {
+					t.Errorf("name %q is not normalised", v)
+				}
 			}
 			if !maps.Equal(id.Sources, tc.want.Identity.Sources) {
 				t.Errorf("Sources:\n got %v\nwant %v", id.Sources, tc.want.Identity.Sources)
