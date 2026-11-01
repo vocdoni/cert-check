@@ -166,6 +166,28 @@ func (wrapProvider) Verify(context.Context, []*x509.Certificate) (*certcheck.Res
 	return nil, fmt.Errorf("wrapped: %w", e)
 }
 
+// typedNilProvider breaks the Provider contract with a nil *certcheck.Error
+// in a non-nil error, directly or wrapped.
+type typedNilProvider struct {
+	ca   *x509.Certificate
+	wrap bool
+}
+
+func (p typedNilProvider) Info() certcheck.ProviderInfo {
+	if p.wrap {
+		return certcheck.ProviderInfo{ID: "wrapnil", Name: "Wrapped nil"}
+	}
+	return certcheck.ProviderInfo{ID: "nilerr", Name: "Nil error"}
+}
+func (p typedNilProvider) CAs() []*x509.Certificate { return []*x509.Certificate{p.ca} }
+func (p typedNilProvider) Verify(context.Context, []*x509.Certificate) (*certcheck.Result, error) {
+	var e *certcheck.Error
+	if p.wrap {
+		return nil, fmt.Errorf("wrapped: %w", e)
+	}
+	return nil, e
+}
+
 // TestHandlerProviderErrors: whatever a consumer Provider returns on
 // failure, every entry point answers a *certcheck.Error, and Auth/AuthAs add
 // the handshake details to it.
@@ -206,6 +228,8 @@ func TestHandlerProviderErrors(t *testing.T) {
 		{"plain error", fakeProvider{id: "fake", cas: []*x509.Certificate{w.rootU.Cert}}, certcheck.CodeInternal, "",
 			"provider returned an error that is not *certcheck.Error"},
 		{"wrapped *Error", wrapProvider{ca: w.rootU.Cert}, certcheck.CodeRevoked, certcheck.StepRevocation, "revoked"},
+		{"typed-nil *Error", typedNilProvider{ca: w.rootU.Cert}, certcheck.CodeInternal, "", "provider returned a nil *certcheck.Error"},
+		{"wrapped typed-nil *Error", typedNilProvider{ca: w.rootU.Cert, wrap: true}, certcheck.CodeInternal, "", "provider returned a nil *certcheck.Error"},
 	} {
 		id := pc.provider.Info().ID
 		h, err := certcheck.NewHandler([]certcheck.Provider{pc.provider},

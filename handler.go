@@ -182,14 +182,18 @@ func (h *Handler) VerifyAs(ctx context.Context, providerID string, chain []*x509
 }
 
 // verify returns p.Verify(ctx, chain) as (Result, nil) or (nil, *Error). A
-// provider breaking its contract (an error that holds no *Error, or neither a
-// Result nor an error) gives an internal error.
+// provider breaking its contract (an error that holds no *Error or a nil
+// *Error, or neither a Result nor an error) gives an internal error.
 func (h *Handler) verify(ctx context.Context, p Provider, chain []*x509.Certificate) (*Result, error) {
 	res, err := p.Verify(ctx, chain)
 	switch {
 	case err != nil:
-		if e, ok := errors.AsType[*Error](err); ok {
+		e, ok := errors.AsType[*Error](err)
+		if ok && e != nil {
 			return nil, e
+		}
+		if ok {
+			return nil, h.fail(chain, p.Info().ID, "", CodeInternal, "provider returned a nil *certcheck.Error")
 		}
 		return nil, h.fail(chain, p.Info().ID, "", CodeInternal, "provider returned an error that is not *certcheck.Error")
 	case res == nil:
