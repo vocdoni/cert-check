@@ -59,7 +59,9 @@ type App struct {
 	store         *Store
 	createLimiter *ipLimiter
 	redeemLimiter *ipLimiter
-	mainConns     int // MainMaxConns; tests shorten it
+	mainConns     int                // MainMaxConns; tests shorten it
+	shutdownWait  time.Duration      // shutdownTimeout; tests shorten it
+	stopService   context.CancelFunc // cancels auth.service when shutdown starts
 	mainUp        atomic.Bool
 	authUp        atomic.Bool
 	authTLS       *tls.Config
@@ -82,7 +84,7 @@ func New(d Deps) (*App, error) {
 	a := &App{cfg: d.Config, providers: handler.Providers(), providerIDs: map[string]bool{}, certs: d.Certs, log: d.Logger, version: d.Version, now: now,
 		publicOrigin: d.Config.PublicURL.Scheme + "://" + d.Config.PublicURL.Host,
 		store:        NewStore(TxCapacity, now), createLimiter: newIPLimiter(createPerMinute), redeemLimiter: newIPLimiter(redeemPerMinute),
-		mainConns: MainMaxConns}
+		mainConns: MainMaxConns, shutdownWait: shutdownTimeout}
 	for _, p := range a.providers {
 		a.providerIDs[p.Info().ID] = true
 	}
@@ -92,9 +94,11 @@ func New(d Deps) (*App, error) {
 		return nil, err
 	}
 	a.authTLS = tcfg
+	service, stopService := context.WithCancel(context.Background())
+	a.stopService = stopService
 	a.auth = &authHandler{store: a.store, hosts: NewAuthHosts(d.Config.AuthDomain), handler: handler,
 		publicURL: a.publicOrigin, slots: make(chan struct{}, ValidationSlots), slotWait: ValidationSlotWait,
-		budget: ValidationBudget, log: d.Logger, version: d.Version, now: now}
+		budget: ValidationBudget, service: service, log: d.Logger, version: d.Version, now: now}
 	return a, nil
 }
 
@@ -136,11 +140,14 @@ func newMainServer(h http.Handler, log *slog.Logger) *http.Server {
 // Run serves both listeners until ctx ends, then shuts down gracefully.
 // mainLn is plain TCP (the platform edge terminates TLS), wrapped with the
 // MainMaxConns cap; authLn is wrapped with the 512-connection cap and TLS
-// here, and served once the certificate is ready. Both listeners are closed
-// when Run returns.
+// here, and served once the certificate is ready. Shutdown cancels the
+// in-flight validations, drains both servers concurrently for up to 15 s and
+// then closes the connections left. Both listeners are closed when Run
+// returns. Run is called once per App.
 func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 	mainSrv := newMainServer(a.MainHandler(), a.log)
 	authSrv := newAuthServer(a.auth, a.log)
+	authSrv.BaseContext = func(net.Listener) context.Context { return a.auth.service }
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var wg sync.WaitGroup
@@ -175,12 +182,27 @@ func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 	}
 	a.mainUp.Store(false)
 	a.authUp.Store(false)
-	shutdownCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
+	a.stopService() // in-flight validations end now, so their requests finish within the drain
+	shutdownCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), a.shutdownWait)
 	defer stop()
-	runErr = errors.Join(runErr, mainSrv.Shutdown(shutdownCtx), authSrv.Shutdown(shutdownCtx))
+	errs := make(chan error, 2)
+	for _, srv := range []*http.Server{mainSrv, authSrv} {
+		go func() { errs <- shutdown(shutdownCtx, srv) }()
+	}
+	runErr = errors.Join(runErr, <-errs, <-errs)
 	cancel()
 	wg.Wait()
 	return runErr
+}
+
+// shutdown drains srv until ctx ends, then closes the connections still
+// open (requests slower than the drain).
+func shutdown(ctx context.Context, srv *http.Server) error {
+	err := srv.Shutdown(ctx)
+	if err != nil {
+		_ = srv.Close() // drain cut short: drop what is left; the Shutdown error says why
+	}
+	return err
 }
 
 // noDirFS hides directories (no listings); "/" still serves index.html

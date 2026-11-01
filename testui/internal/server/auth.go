@@ -33,8 +33,9 @@ type authHandler struct {
 	handler   *certcheck.Handler
 	publicURL string // fixed origin, never taken from the request
 	slots     chan struct{}
-	slotWait  time.Duration // ValidationSlotWait; tests shorten it
-	budget    time.Duration // ValidationBudget; tests shorten it
+	slotWait  time.Duration   // ValidationSlotWait; tests shorten it
+	budget    time.Duration   // ValidationBudget; tests shorten it
+	service   context.Context // parent of every validation; cancelled when shutdown starts
 	log       *slog.Logger
 	version   string
 	now       func() time.Time // diagnostics time of server-made errors
@@ -79,8 +80,9 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, a.publicURL+"/#code="+string(code), http.StatusSeeOther)
 }
 
-// validate runs the checker in a bounded slot with a 40 s budget detached
-// from client disconnects; a missed slot or the budget yields internal (retryable).
+// validate runs the checker in a bounded slot with a 40 s budget on the
+// service context: detached from client disconnects, cancelled by shutdown.
+// A missed slot or the budget yields internal (retryable).
 func (a *authHandler) validate(r *http.Request, provider string) Outcome {
 	wait := time.NewTimer(a.slotWait)
 	defer wait.Stop()
@@ -90,7 +92,7 @@ func (a *authHandler) validate(r *http.Request, provider string) Outcome {
 	case <-wait.C:
 		return Outcome{Err: a.serverError(r, certcheck.CodeInternal, "validation capacity exhausted")}
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), a.budget)
+	ctx, cancel := context.WithTimeout(a.service, a.budget)
 	defer cancel()
 	res, err := a.handler.AuthAs(r.WithContext(ctx), provider)
 	if err != nil {
