@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -639,8 +642,7 @@ func TestFetchIdleConnsBounded(t *testing.T) {
 }
 
 // TestFetchErrorOmitsResponseStrings: a Fetch error never quotes a Location
-// or any other response bytes; the only URL in it is the requested one. A
-// dial error keeps its text (it may name an allowlisted redirect host).
+// or any other response bytes; the only URL in it is the requested one.
 func TestFetchErrorOmitsResponseStrings(t *testing.T) {
 	const sentinel = "SENTINELPII"
 	raw := func(resp string) http.HandlerFunc {
@@ -693,6 +695,48 @@ func TestFetchErrorOmitsResponseStrings(t *testing.T) {
 			}
 			if !strings.Contains(msg, strconv.Quote(u)) {
 				t.Errorf("Fetch(%s) error = %q, want it to name the requested URL", u, msg)
+			}
+		})
+	}
+}
+
+// TestFetchDialErrorClassified: a dial error is reduced to a fixed category.
+// Its own text can name the resolver, a resolved address or an OS error.
+func TestFetchDialErrorClassified(t *testing.T) {
+	const leak = "10.1.2.3"
+	addr := &net.TCPAddr{IP: net.ParseIP(leak), Port: 80}
+	cases := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{"resolver failure", &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "server misbehaving",
+			Name: "ocsp.example.es", Server: leak + ":53"}}, errDialDNS},
+		{"no such host", &net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host",
+			Name: "ocsp.example.es", Server: leak + ":53", IsNotFound: true}}, errDialDNS},
+		{"timeout", &net.OpError{Op: "dial", Net: "tcp", Addr: addr, Err: os.ErrDeadlineExceeded}, errDialTimeout},
+		{"refused", &net.OpError{Op: "dial", Net: "tcp", Addr: addr,
+			Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}, errDialRefused},
+		{"blocked address", &net.OpError{Op: "dial", Net: "tcp", Addr: addr,
+			Err: fmt.Errorf("%w: tcp4 %s", ErrBlockedAddress, leak)}, ErrBlockedAddress},
+		{"other", &net.OpError{Op: "dial", Net: "tcp", Addr: addr,
+			Err: os.NewSyscallError("connect", syscall.ENETUNREACH)}, errDial},
+		{"opaque", errors.New("fetchT: dialer says " + leak), errDial},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := NewFetcher(FetcherOptions{DialContext: func(context.Context, string, string) (net.Conn, error) {
+				return nil, c.err
+			}})
+			const u = "http://ocsp.example.es/ocsp"
+			_, err := f.Fetch(t.Context(), FetchRequest{URL: u, Body: []byte{0x30, 0x00}, MaxBytes: 1 << 10,
+				Timeout: 5 * time.Second, AllowedHosts: []string{"ocsp.example.es"}})
+			if !errors.Is(err, c.want) {
+				t.Fatalf("Fetch error = %v, want %v", err, c.want)
+			}
+			want := (&url.Error{Op: "Post", URL: u, Err: c.want}).Error()
+			if msg := err.Error(); msg != want || strings.Contains(msg, leak) {
+				t.Errorf("Fetch error = %q, want %q", msg, want)
 			}
 		})
 	}

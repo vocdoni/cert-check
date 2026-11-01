@@ -179,8 +179,8 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 	return res, nil
 }
 
-// dialError marks an error from the dialer. It predates any response (an
-// address, an OS or resolver error), so fetchError keeps its text.
+// dialError marks an error from the dialer, which fetchError reduces to a
+// category.
 type dialError struct{ err error }
 
 func (e dialError) Error() string { return e.err.Error() }
@@ -201,6 +201,16 @@ func markDialErrors(dial DialFunc) DialFunc {
 // name).
 var errTransport = errors.New("revocation: HTTP transport error")
 
+// Dial error categories. A dialer's own text can name the resolver, a
+// resolved address or an OS error; ErrBlockedAddress stands for an address
+// the dialer refused.
+var (
+	errDialDNS     = errors.New("revocation: DNS lookup failed")
+	errDialTimeout = errors.New("revocation: dial timeout")
+	errDialRefused = errors.New("revocation: connection refused")
+	errDial        = errors.New("revocation: dial failed")
+)
+
 // fetchError rebuilds a client or body-read error around the requested URL,
 // which comes from the certificate, and a fixed classification. The client's
 // *url.Error names the last URL instead: a redirect Location, verbatim when
@@ -213,7 +223,7 @@ func fetchError(req *http.Request, err error) error {
 	var de dialError
 	switch {
 	case errors.As(err, &de):
-		err = de.err
+		err = dialCategory(de.err)
 	case errors.Is(err, ErrRedirectBlocked): // checkRedirect's fixed text
 	case errors.Is(err, context.DeadlineExceeded):
 		err = context.DeadlineExceeded
@@ -225,6 +235,22 @@ func fetchError(req *http.Request, err error) error {
 		err = errTransport
 	}
 	return &url.Error{Op: req.Method[:1] + strings.ToLower(req.Method[1:]), URL: req.URL.String(), Err: err}
+}
+
+func dialCategory(err error) error {
+	var dns *net.DNSError
+	var ne net.Error
+	switch {
+	case errors.Is(err, ErrBlockedAddress):
+		return ErrBlockedAddress
+	case errors.As(err, &dns):
+		return errDialDNS
+	case errors.As(err, &ne) && ne.Timeout():
+		return errDialTimeout
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return errDialRefused
+	}
+	return errDial
 }
 
 // hostAllowed: http/https only, no userinfo, an ASCII host (and non-default
