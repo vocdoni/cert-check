@@ -532,6 +532,49 @@ func TestParseCRLDenseBadSignature(t *testing.T) {
 	t.Logf("%d-byte CRL with a bad signature: %d bytes allocated", len(der), got)
 }
 
+// TestParseCRLOverCostLimit: a CA-signed CRL whose estimated cost exceeds
+// the cache limit is refused after its signature check without the full
+// parse: the cache could not keep it, so every check would parse it again.
+func TestParseCRLOverCostLimit(t *testing.T) {
+	ca := testpki.NewRoot(t, "crlT over limit ca", testpki.CertSpec{Now: crlTNow})
+	const entries = 100_000
+	der := crlTDense(t, ca, entries, 16, true, false)
+	estimate := int64(crlCostBase + entries*crlCostEntry)
+	cases := []struct {
+		name    string
+		limit   int64
+		corrupt bool
+		want    Status
+		wantErr string
+	}{
+		{"over the limit", estimate - 1, false, StatusUnsupportedMethod, "crl too large"},
+		{"over the limit, bad signature", estimate - 1, true, StatusInvalidEvidence, ""},
+		{"at the limit", estimate, false, StatusGood, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			der := der
+			if c.corrupt {
+				der = crlTDense(t, ca, entries, 16, true, true)
+			}
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			p, st, err := parseCRL(der, ca.Cert, c.limit)
+			runtime.ReadMemStats(&after)
+			if st != c.want || (st == StatusGood) != (err == nil && p != nil) {
+				t.Fatalf("parseCRL(limit %d) = %s, %v (parsed %v), want %s", c.limit, st, err, p != nil, c.want)
+			}
+			if c.wantErr != "" && err.Error() != c.wantErr {
+				t.Errorf("parseCRL(limit %d) error = %q, want %q", c.limit, err, c.wantErr)
+			}
+			if got := after.TotalAlloc - before.TotalAlloc; st != StatusGood && got > 256<<10 {
+				t.Errorf("parseCRL of a %d-entry CRL refused as %s allocated %d bytes, want at most 256 KiB", entries, st, got)
+			}
+		})
+	}
+}
+
 func TestSerialKey(t *testing.T) {
 	cases := []struct {
 		in   *big.Int

@@ -6,6 +6,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"time"
 
@@ -245,8 +246,21 @@ func SerialKey(n *big.Int) string { return fmt.Sprintf("%x", n) }
 // reasonCode and invalidityDate among entry extensions; certificateIssuer and
 // delta CRLs are unsupported. It returns a Status for the failure cases.
 func ParseCRL(der []byte, issuer *x509.Certificate) (*ParsedCRL, Status, error) {
-	if err := checkCRLSignature(der, issuer); err != nil {
+	return parseCRL(der, issuer, math.MaxInt64)
+}
+
+var errCRLTooLarge = errors.New("crl too large")
+
+// parseCRL is ParseCRL refusing, before the full parse, a CRL whose Cost
+// would exceed maxCost (the cache limit): the cache could not keep it, so
+// every check would pay that parse again.
+func parseCRL(der []byte, issuer *x509.Certificate, maxCost int64) (*ParsedCRL, Status, error) {
+	entries, err := checkCRLSignature(der, issuer)
+	if err != nil {
 		return nil, StatusInvalidEvidence, err
+	}
+	if crlCostBase+int64(entries)*crlCostEntry > maxCost { // a lower bound of Cost
+		return nil, StatusUnsupportedMethod, errCRLTooLarge
 	}
 	rl, err := x509.ParseRevocationList(der)
 	if err != nil {
@@ -322,28 +336,53 @@ func entrySerial(entry []byte) ([]byte, bool) {
 // checkCRLSignature authenticates der before x509.ParseRevocationList
 // allocates its entries: it splits the CertificateList, compares the TBS
 // issuer Name with issuer and checks the signature (with the issuer
-// constraints of RevocationList.CheckSignatureFrom).
-func checkCRLSignature(der []byte, issuer *x509.Certificate) error {
+// constraints of RevocationList.CheckSignatureFrom). It then counts the
+// revokedCertificates entries, without allocating per entry.
+func checkCRLSignature(der []byte, issuer *x509.Certificate) (int, error) {
 	in := cryptobyte.String(der)
 	var crl, tbs, body, sigAlg, name cryptobyte.String
 	var sig asn1.BitString
 	if !in.ReadASN1(&crl, cbasn1.SEQUENCE) || !in.Empty() ||
 		!crl.ReadASN1Element(&tbs, cbasn1.SEQUENCE) || !crl.ReadASN1(&sigAlg, cbasn1.SEQUENCE) ||
 		!crl.ReadASN1BitString(&sig) || sig.BitLength%8 != 0 || !crl.Empty() {
-		return errors.New("crl: malformed CertificateList")
+		return 0, errors.New("crl: malformed CertificateList")
 	}
 	if b := tbs; !b.ReadASN1(&body, cbasn1.SEQUENCE) || !body.SkipOptionalASN1(cbasn1.INTEGER) ||
 		!body.SkipASN1(cbasn1.SEQUENCE) || !body.ReadASN1Element(&name, cbasn1.SEQUENCE) {
-		return errors.New("crl: malformed tbsCertList")
+		return 0, errors.New("crl: malformed tbsCertList")
 	}
 	if !bytes.Equal(name, issuer.RawSubject) {
-		return errors.New("crl: issuer name differs from the certificate issuer")
+		return 0, errors.New("crl: issuer name differs from the certificate issuer")
 	}
 	rl := x509.RevocationList{RawTBSRevocationList: tbs, SignatureAlgorithm: parseSignatureAlgorithm(sigAlg), Signature: sig.Bytes}
 	if err := rl.CheckSignatureFrom(issuer); err != nil {
-		return fmt.Errorf("crl: signature: %w", err)
+		return 0, fmt.Errorf("crl: signature: %w", err)
 	}
-	return nil
+	// thisUpdate, an optional nextUpdate, then the optional entries, as
+	// x509.ParseRevocationList reads them.
+	var revoked cryptobyte.String
+	if !skipCRLTime(&body, true) || !skipCRLTime(&body, false) ||
+		!body.ReadOptionalASN1(&revoked, nil, cbasn1.SEQUENCE) {
+		return 0, errors.New("crl: malformed tbsCertList")
+	}
+	n := 0
+	for ; !revoked.Empty(); n++ {
+		if !revoked.SkipASN1(cbasn1.SEQUENCE) {
+			return 0, errors.New("crl: malformed revokedCertificates")
+		}
+	}
+	return n, nil
+}
+
+// skipCRLTime skips a UTCTime or GeneralizedTime; an absent one is an error
+// only when required.
+func skipCRLTime(s *cryptobyte.String, required bool) bool {
+	for _, tag := range []cbasn1.Tag{cbasn1.UTCTime, cbasn1.GeneralizedTime} {
+		if s.PeekASN1Tag(tag) {
+			return s.SkipASN1(tag)
+		}
+	}
+	return !required
 }
 
 // Scope is what the checked certificate is.

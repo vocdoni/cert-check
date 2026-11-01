@@ -306,7 +306,7 @@ func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Cert
 		if err != nil {
 			return crlLoad{status: StatusUnavailable, err: err, attempt: at}
 		}
-		parsed, st, err := ParseCRL(fr.Body, issuer)
+		parsed, st, err := parseCRL(fr.Body, issuer, c.crls.limit)
 		if err != nil {
 			return crlLoad{status: st, err: err, attempt: at}
 		}
