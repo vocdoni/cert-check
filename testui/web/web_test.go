@@ -355,7 +355,7 @@ func TestFontSources(t *testing.T) {
 }
 
 // Contract types, declared from the binding JSON key contract (preflight F4,
-// ruling R38). There is deliberately no certauth import.
+// ruling R38). There is deliberately no certcheck import.
 type (
 	providerEntry struct {
 		ID          string `json:"id"`

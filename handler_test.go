@@ -92,6 +92,7 @@ func TestNewHandlerRejects(t *testing.T) {
 		{"duplicate ID", []certcheck.Provider{w.alpha, fakeProvider{id: "alpha", cas: []*x509.Certificate{w.rootU.Cert}}}, `duplicate provider "alpha"`},
 		{"inert provider", []certcheck.Provider{w.alpha, hProvider(t, hDecl("delta", expired, hPolicyB), now, rc)}, `provider "delta" has no enabled profile`},
 		{"inert test double", []certcheck.Provider{fakeProvider{id: "empty"}}, `provider "empty" has no enabled profile`},
+		{"nil CA", []certcheck.Provider{fakeProvider{id: "nilca", cas: []*x509.Certificate{nil}}}, "advertises a nil certificate"},
 		{"shared CA subject", []certcheck.Provider{w.alpha, fakeProvider{id: "copy", cas: []*x509.Certificate{w.rootA.Cert}}}, "both advertise the CA"},
 		{"shared anchor key and policy", []certcheck.Provider{w.alpha, hProvider(t, hDecl("gamma", sameKey, hPolicyA), now, rc)}, "share an anchor and policy " + hPolicyA.String()},
 	} {

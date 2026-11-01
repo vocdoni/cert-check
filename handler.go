@@ -70,6 +70,9 @@ func NewHandler(providers []Provider, options ...Option) (*Handler, error) {
 			return nil, fmt.Errorf("certcheck: provider %q has no enabled profile", id)
 		}
 		for _, c := range cas {
+			if c == nil {
+				return nil, fmt.Errorf("certcheck: provider %q advertises a nil certificate", id)
+			}
 			if other, ok := h.byIssuer[string(c.RawSubject)]; ok && other.Info().ID != id {
 				return nil, fmt.Errorf("certcheck: providers %q and %q both advertise the CA %q", other.Info().ID, id, c.Subject)
 			}

@@ -94,7 +94,7 @@ type Profile struct {
 	Identity                  identity.Adapter
 	Revocation                revocation.Policy
 	TestMarkers               []TestMarker
-	HandledCriticalExtensions []string // dotted OIDs parsed by certauth itself (aoc-idcat-g2: qcStatements)
+	HandledCriticalExtensions []string // dotted OIDs parsed by the engine itself (aoc-idcat-g2: qcStatements)
 }
 
 // Provider is a selectable UI entry and auth subdomain grouping profiles.
