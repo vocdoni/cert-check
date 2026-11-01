@@ -42,8 +42,8 @@ type pinnedProfiles interface {
 // unique provider IDs, no inert provider (one whose CAs are empty because no
 // profile is valid at construction) and no ambiguity: no CA subject may be
 // advertised by two providers, and no two profiles of different providers may
-// share an anchor key and a policy OID. Acceptance therefore never depends on
-// the order of providers. A nil entry is an error; a typed nil (a nil pointer
+// share a pinned CA key (anchor or pinned intermediate) and a policy OID.
+// Acceptance therefore never depends on the order of providers. A nil entry is an error; a typed nil (a nil pointer
 // stored in a non-nil Provider) is a programmer error and may panic.
 // NewHandler uses WithClock and WithVersion; other options are ignored.
 func NewHandler(providers []Provider, options ...Option) (*Handler, error) {
