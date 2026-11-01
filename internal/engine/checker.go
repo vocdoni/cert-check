@@ -453,10 +453,15 @@ func hasExtension(c *x509.Certificate, oid asn1.ObjectIdentifier) bool {
 	return slices.ContainsFunc(c.Extensions, func(e pkix.Extension) bool { return e.Id.Equal(oid) })
 }
 
-// purposeOK applies the profile's KU and EKU rules; a CA leaf is rejected.
+// purposeOK applies the profile's KU and EKU rules. A CA leaf, or a leaf
+// that could sign OCSP responses (for its own status among others), is
+// rejected.
 func purposeOK(leaf *x509.Certificate, p profiles.Profile) (string, bool) {
 	if leaf.BasicConstraintsValid && leaf.IsCA {
 		return "leaf is a CA certificate", false
+	}
+	if slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageOCSPSigning) {
+		return "ExtendedKeyUsage lists OCSPSigning", false
 	}
 	if hasExtension(leaf, oidExtKeyUsage) {
 		if leaf.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
