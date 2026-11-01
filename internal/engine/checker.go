@@ -33,7 +33,7 @@ var (
 
 // extensionParsers validate critical extensions a profile handles itself
 // (spec step 5 exception mechanism). Every HandledCriticalExtensions entry
-// must have a parser here; NewChecker enforces it.
+// must have a parser here; New enforces it for every declared profile.
 var extensionParsers = map[string]func([]byte) error{
 	"1.3.6.1.5.5.7.1.3": parseQCStatements,
 }
@@ -110,12 +110,10 @@ func New(cfg Config) (*Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, p := range reg.Providers() {
-		for _, prof := range p.Profiles {
-			for _, oid := range prof.HandledCriticalExtensions {
-				if _, ok := extensionParsers[oid]; !ok {
-					return nil, fmt.Errorf("engine: profile %s handles %s without a parser", prof.ID, oid)
-				}
+	for _, prof := range cfg.Provider.Profiles { // every declared profile, including those disabled at load
+		for _, oid := range prof.HandledCriticalExtensions {
+			if _, ok := extensionParsers[oid]; !ok {
+				return nil, fmt.Errorf("engine: profile %s handles %s without a parser", prof.ID, oid)
 			}
 		}
 	}
