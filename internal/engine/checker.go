@@ -17,6 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/crypto/cryptobyte"
+	cbasn1 "golang.org/x/crypto/cryptobyte/asn1"
+
 	certcheck "github.com/vocdoni/cert-check"
 	"github.com/vocdoni/cert-check/internal/identity"
 	"github.com/vocdoni/cert-check/internal/profiles"
@@ -36,14 +39,27 @@ var extensionParsers = map[string]func([]byte) error{
 }
 
 // parseQCStatements: QCStatements ::= SEQUENCE OF SEQUENCE { statementId OID, statementInfo ANY OPTIONAL }.
+// Every element is consumed explicitly: a statement with a field after
+// statementInfo is malformed (encoding/asn1 would ignore it).
 func parseQCStatements(der []byte) error {
-	var stmts []struct {
-		ID   asn1.ObjectIdentifier
-		Info asn1.RawValue `asn1:"optional"`
+	errMalformed := errors.New("malformed qcStatements")
+	in := cryptobyte.String(der)
+	var stmts cryptobyte.String
+	if !in.ReadASN1(&stmts, cbasn1.SEQUENCE) || !in.Empty() || stmts.Empty() {
+		return errMalformed
 	}
-	rest, err := asn1.Unmarshal(der, &stmts)
-	if err != nil || len(rest) != 0 || len(stmts) == 0 {
-		return errors.New("malformed qcStatements")
+	for !stmts.Empty() {
+		var (
+			stmt, info cryptobyte.String
+			id         asn1.ObjectIdentifier
+			tag        cbasn1.Tag
+		)
+		if !stmts.ReadASN1(&stmt, cbasn1.SEQUENCE) || !stmt.ReadASN1ObjectIdentifier(&id) {
+			return errMalformed
+		}
+		if !stmt.Empty() && (!stmt.ReadAnyASN1Element(&info, &tag) || !stmt.Empty()) {
+			return errMalformed
+		}
 	}
 	return nil
 }
