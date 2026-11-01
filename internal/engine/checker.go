@@ -313,6 +313,9 @@ func (c *Provider) Verify(ctx context.Context, chain []*x509.Certificate) (*Resu
 			leafRev = res
 		}
 	}
+	if ctx.Err() != nil { // cached evidence answers without I/O: a cancelled validation is never a success
+		return nil, r.fail(StepRevocation, CodeInternal, "validation deadline exceeded")
+	}
 	if leafRev.Status != revocation.StatusGood { // fail closed: no Result without good leaf evidence
 		return nil, r.fail(StepRevocation, CodeInternal, "no revocation evidence for the leaf")
 	}
