@@ -18,11 +18,16 @@ jobs:
     # build is checked by its own step and by the Dockerfile.
     env:
       GOFLAGS: -mod=readonly
+      # Use the Go that setup-go installed: a go.mod above it fails instead of
+      # downloading a toolchain nobody pinned.
+      GOTOOLCHAIN: local
       # The library is the root module; the testing UI is the nested module
       # testui/ (it requires the root through `replace => ../`).
       MODULES: ". testui"
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false # no later step needs the token; keep it off the persistent runner
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version: "1.27.x"
