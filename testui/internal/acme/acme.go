@@ -6,9 +6,11 @@ package acme
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -40,6 +42,7 @@ type Manager struct {
 	// manage performs one obtain/load attempt (cfg.ManageSync); tests replace it.
 	manage    func(context.Context, []string) error
 	backoff   []time.Duration
+	attempt   time.Duration // obtainAttemptTimeout; tests shorten it
 	closeOnce sync.Once
 }
 
@@ -72,12 +75,12 @@ func NewACME(o Options) (*Manager, error) {
 		DisableHTTPChallenge:    true,
 		DisableTLSALPNChallenge: true,
 		DNS01Solver: &certmagic.DNS01Solver{DNSManager: certmagic.DNSManager{
-			DNSProvider:    &cloudflare.Provider{APIToken: o.CloudflareToken},
+			DNSProvider:    &cloudflare.Provider{APIToken: o.CloudflareToken, HTTPClient: &http.Client{Timeout: cloudflareTimeout}},
 			OverrideDomain: o.OverrideDomain,
 		}},
 	})
 	cfg.Issuers = []certmagic.Issuer{issuer}
-	m.cfg, m.cache, m.manage, m.backoff = cfg, cache, cfg.ManageSync, obtainBackoff
+	m.cfg, m.cache, m.manage, m.backoff, m.attempt = cfg, cache, cfg.ManageSync, obtainBackoff, obtainAttemptTimeout
 	return m, nil
 }
 
@@ -101,6 +104,15 @@ func LoadStatic(certFile, keyFile string) (*Manager, error) {
 // validations per hostname per hour; the process stays up and not ready).
 var obtainBackoff = []time.Duration{time.Minute, 5 * time.Minute, 15 * time.Minute, 30 * time.Minute, time.Hour}
 
+// obtainAttemptTimeout bounds one obtain attempt, so a stalled ACME or DNS
+// exchange returns to the backoff loop; cloudflareTimeout bounds each
+// Cloudflare API call, renewals included (libdns/cloudflare's default
+// client, http.DefaultClient, has no timeout).
+const (
+	obtainAttemptTimeout = 5 * time.Minute
+	cloudflareTimeout    = 30 * time.Second
+)
+
 // Run obtains (or loads from storage) the certificate, retrying with backoff
 // until it succeeds or ctx ends; certmagic then renews in the background.
 // It returns nil once the certificate is ready (static mode: immediately).
@@ -109,7 +121,9 @@ func (m *Manager) Run(ctx context.Context) error {
 		return nil
 	}
 	for i := 0; ; i++ {
-		err := m.manage(ctx, []string{m.name}) // ManageSync: one interactive attempt, no internal retries
+		attemptCtx, cancel := context.WithTimeout(ctx, m.attempt)
+		err := m.manage(attemptCtx, []string{m.name}) // ManageSync: one interactive attempt, no internal retries
+		cancel()
 		if err == nil {
 			m.ready.Store(true)
 			m.log.Info("auth certificate ready", "name", m.name)
@@ -142,18 +156,36 @@ func (m *Manager) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, 
 	return m.cfg.GetCertificate(hello)
 }
 
-// Ready reports whether a currently valid certificate is loaded.
+// Ready reports whether a currently valid certificate is loaded
+// (NotBefore <= now < NotAfter).
 func (m *Manager) Ready() bool {
 	if !m.ready.Load() {
 		return false
 	}
+	now := time.Now()
 	if m.static != nil {
-		return m.static.Leaf == nil || time.Now().Before(m.static.Leaf.NotAfter)
+		return validAt(m.static, now)
 	}
 	for _, c := range m.cache.AllMatchingCertificates("readyz" + m.name[1:]) {
-		if c.Leaf != nil && time.Now().Before(c.Leaf.NotAfter) {
+		if validAt(&c.Certificate, now) {
 			return true
 		}
 	}
 	return false
+}
+
+// validAt reports whether c's leaf is valid at now; a nil Leaf is parsed
+// from the first certificate.
+func validAt(c *tls.Certificate, now time.Time) bool {
+	leaf := c.Leaf
+	if leaf == nil {
+		if len(c.Certificate) == 0 {
+			return false
+		}
+		var err error
+		if leaf, err = x509.ParseCertificate(c.Certificate[0]); err != nil {
+			return false
+		}
+	}
+	return !now.Before(leaf.NotBefore) && now.Before(leaf.NotAfter)
 }
