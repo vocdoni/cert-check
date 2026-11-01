@@ -3,10 +3,14 @@ package revocation
 import (
 	"bufio"
 	"bytes"
+	"crypto"
+	"crypto/rand"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
@@ -14,6 +18,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -340,6 +345,8 @@ func TestParseCRL(t *testing.T) {
 			pkix.Extension{Id: testpki.OIDEntryCertIssuer, Value: certIssuer})})), ca.Cert, StatusUnsupportedMethod},
 		{"invalidity date entry extension", ca.CRL(t, spec(testpki.CRLSpec{Entries: entry(
 			testpki.InvalidityDate(crlTNow.Add(-2 * time.Hour)))})), ca.Cert, StatusGood},
+		{"trailing data", append(ca.CRL(t, spec(testpki.CRLSpec{})), 0x00), ca.Cert, StatusInvalidEvidence},
+		{"ecdsa with sha1", crlTSHA1(t, ca), ca.Cert, StatusInvalidEvidence},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -408,6 +415,106 @@ func TestParseCRL(t *testing.T) {
 			}
 		}
 	})
+}
+
+// crlTECDSAAlgID is the ecdsa-with-SHA256 AlgorithmIdentifier testpki uses
+// for its (P-256) CA keys.
+var crlTECDSAAlgID = crlTSeq(crlTDER(cbasn1.OBJECT_IDENTIFIER, []byte{0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02}))
+
+// crlTSign wraps tbs into a CertificateList signed with key (ECDSA P-256,
+// SHA-256); corrupt flips the last signature byte.
+func crlTSign(t testing.TB, key crypto.Signer, tbs []byte, corrupt bool) []byte {
+	t.Helper()
+	h := sha256.Sum256(tbs)
+	sig, err := key.Sign(rand.Reader, h[:], crypto.SHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if corrupt {
+		sig[len(sig)-1] ^= 0xff
+	}
+	return crlTSeq(tbs, crlTECDSAAlgID, crlTDER(cbasn1.BIT_STRING, append([]byte{0}, sig...)))
+}
+
+// crlTSHA1 returns an empty CRL issued by ca and signed with ecdsa-with-SHA1,
+// which x509.RevocationList.CheckSignatureFrom accepts.
+func crlTSHA1(t testing.TB, ca *testpki.CA) []byte {
+	t.Helper()
+	algID := crlTSeq(crlTDER(cbasn1.OBJECT_IDENTIFIER, []byte{0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x01}))
+	utc := func(tm time.Time) []byte { return crlTDER(cbasn1.UTCTime, []byte(tm.UTC().Format("060102150405Z"))) }
+	tbs := crlTSeq(crlTDER(cbasn1.INTEGER, []byte{1}), algID, ca.Cert.RawSubject, utc(crlTNow.Add(-time.Hour)), utc(crlTNow.Add(time.Hour)))
+	h := sha1.Sum(tbs)
+	sig, err := ca.Key.Sign(rand.Reader, h[:], crypto.SHA1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der := crlTSeq(tbs, algID, crlTDER(cbasn1.BIT_STRING, append([]byte{0}, sig...)))
+	rl, err := x509.ParseRevocationList(der)
+	if err != nil || rl.CheckSignatureFrom(ca.Cert) != nil {
+		t.Fatalf("SHA-1 CRL: parse %v, want a CRL x509 accepts", err)
+	}
+	return der
+}
+
+// crlTDense returns a CRL issued by ca that lists n distinct serials of
+// serialLen (>= 5) bytes, with a reasonCode when withReason, valid around
+// crlTNow.
+func crlTDense(t testing.TB, ca *testpki.CA, n, serialLen int, withReason, corrupt bool) []byte {
+	t.Helper()
+	utc := func(tm time.Time) []byte { return []byte(tm.UTC().Format("060102150405Z")) }
+	reason := crlTSeq(crlTSeq(crlTDER(cbasn1.OBJECT_IDENTIFIER, []byte{0x55, 0x1d, 0x15}),
+		crlTDER(cbasn1.OCTET_STRING, crlTDER(cbasn1.ENUM, []byte{1}))))
+	number := crlTSeq(crlTDER(cbasn1.OBJECT_IDENTIFIER, []byte{0x55, 0x1d, 0x14}), crlTDER(cbasn1.OCTET_STRING, crlTDER(cbasn1.INTEGER, []byte{1})))
+	var b cryptobyte.Builder
+	b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+		b.AddASN1Int64(1)
+		b.AddBytes(crlTECDSAAlgID)
+		b.AddBytes(ca.Cert.RawSubject)
+		b.AddASN1(cbasn1.UTCTime, func(b *cryptobyte.Builder) { b.AddBytes(utc(crlTNow.Add(-time.Hour))) })
+		b.AddASN1(cbasn1.UTCTime, func(b *cryptobyte.Builder) { b.AddBytes(utc(crlTNow.Add(24 * time.Hour))) })
+		b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+			serial := make([]byte, serialLen)
+			serial[0] = 0x40 // positive, minimal
+			at := utc(crlTNow.Add(-48 * time.Hour))
+			for i := range n {
+				binary.BigEndian.PutUint32(serial[serialLen-4:], uint32(i))
+				b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) {
+					b.AddASN1(cbasn1.INTEGER, func(b *cryptobyte.Builder) { b.AddBytes(serial) })
+					b.AddASN1(cbasn1.UTCTime, func(b *cryptobyte.Builder) { b.AddBytes(at) })
+					if withReason {
+						b.AddBytes(reason)
+					}
+				})
+			}
+		})
+		b.AddASN1(cbasn1.Tag(0).Constructed().ContextSpecific(), func(b *cryptobyte.Builder) {
+			b.AddASN1(cbasn1.SEQUENCE, func(b *cryptobyte.Builder) { b.AddBytes(number) })
+		})
+	})
+	return crlTSign(t, ca.Key, b.BytesOrPanic(), corrupt)
+}
+
+// TestParseCRLDenseBadSignature: an unauthenticated CRL near the size cap
+// costs one signature check, not one allocation per entry.
+func TestParseCRLDenseBadSignature(t *testing.T) {
+	ca := testpki.NewRoot(t, "crlT dense ca", testpki.CertSpec{Now: crlTNow})
+	der := crlTDense(t, ca, 1_000_000, 5, false, true)
+	if len(der) > MaxCRLResponse {
+		t.Fatalf("dense CRL is %d bytes, want within MaxCRLResponse", len(der))
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	p, st, err := ParseCRL(der, ca.Cert)
+	runtime.ReadMemStats(&after)
+	if st != StatusInvalidEvidence || err == nil || p != nil {
+		t.Fatalf("ParseCRL = %v, %s, %v, want invalid_evidence", p, st, err)
+	}
+	got := after.TotalAlloc - before.TotalAlloc
+	if got > 4<<20 {
+		t.Errorf("ParseCRL of a %d-byte CRL with a bad signature allocated %d bytes, want at most 4 MiB", len(der), got)
+	}
+	t.Logf("%d-byte CRL with a bad signature: %d bytes allocated", len(der), got)
 }
 
 func TestSerialKey(t *testing.T) {

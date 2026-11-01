@@ -228,20 +228,17 @@ type CRLRecord struct {
 // SerialKey is the map key for a serial number.
 func SerialKey(n *big.Int) string { return fmt.Sprintf("%x", n) }
 
-// ParseCRL parses der, checks issuer name and signature against issuer, and
-// enforces criticality: only IDP among critical CRL extensions; only
+// ParseCRL checks issuer name and signature against issuer, then parses der
+// and enforces criticality: only IDP among critical CRL extensions; only
 // reasonCode and invalidityDate among entry extensions; certificateIssuer and
 // delta CRLs are unsupported. It returns a Status for the failure cases.
 func ParseCRL(der []byte, issuer *x509.Certificate) (*ParsedCRL, Status, error) {
+	if err := checkCRLSignature(der, issuer); err != nil {
+		return nil, StatusInvalidEvidence, err
+	}
 	rl, err := x509.ParseRevocationList(der)
 	if err != nil {
 		return nil, StatusInvalidEvidence, fmt.Errorf("crl: parse: %w", err)
-	}
-	if !bytes.Equal(rl.RawIssuer, issuer.RawSubject) {
-		return nil, StatusInvalidEvidence, errors.New("crl: issuer name differs from the certificate issuer")
-	}
-	if err := rl.CheckSignatureFrom(issuer); err != nil {
-		return nil, StatusInvalidEvidence, fmt.Errorf("crl: signature: %w", err)
 	}
 	p := &ParsedCRL{List: rl, Listed: make(map[string]CRLRecord, len(rl.RevokedCertificateEntries)), Size: int64(len(der))}
 	for _, e := range rl.Extensions {
@@ -274,6 +271,33 @@ func ParseCRL(der []byte, issuer *x509.Certificate) (*ParsedCRL, Status, error) 
 		p.Listed[SerialKey(entry.SerialNumber)] = rec
 	}
 	return p, StatusGood, nil
+}
+
+// checkCRLSignature authenticates der before x509.ParseRevocationList
+// allocates its entries: it splits the CertificateList, compares the TBS
+// issuer Name with issuer and checks the signature (with the issuer
+// constraints of RevocationList.CheckSignatureFrom).
+func checkCRLSignature(der []byte, issuer *x509.Certificate) error {
+	in := cryptobyte.String(der)
+	var crl, tbs, body, sigAlg, name cryptobyte.String
+	var sig asn1.BitString
+	if !in.ReadASN1(&crl, cbasn1.SEQUENCE) || !in.Empty() ||
+		!crl.ReadASN1Element(&tbs, cbasn1.SEQUENCE) || !crl.ReadASN1(&sigAlg, cbasn1.SEQUENCE) ||
+		!crl.ReadASN1BitString(&sig) || sig.BitLength%8 != 0 || !crl.Empty() {
+		return errors.New("crl: malformed CertificateList")
+	}
+	if b := tbs; !b.ReadASN1(&body, cbasn1.SEQUENCE) || !body.SkipOptionalASN1(cbasn1.INTEGER) ||
+		!body.SkipASN1(cbasn1.SEQUENCE) || !body.ReadASN1Element(&name, cbasn1.SEQUENCE) {
+		return errors.New("crl: malformed tbsCertList")
+	}
+	if !bytes.Equal(name, issuer.RawSubject) {
+		return errors.New("crl: issuer name differs from the certificate issuer")
+	}
+	rl := x509.RevocationList{RawTBSRevocationList: tbs, SignatureAlgorithm: parseSignatureAlgorithm(sigAlg), Signature: sig.Bytes}
+	if err := rl.CheckSignatureFrom(issuer); err != nil {
+		return fmt.Errorf("crl: signature: %w", err)
+	}
+	return nil
 }
 
 // Scope is what the checked certificate is.
