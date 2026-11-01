@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"fmt"
 	"log/slog"
 	"math/big"
@@ -825,6 +827,96 @@ func TestCheckCAScope(t *testing.T) {
 			}
 			if len(res.Attempts) != 3 || res.Attempts[1].URL != crlURL || res.Attempts[1].Outcome != StatusGood || res.Attempts[2].URL != arlURL {
 				t.Errorf("attempts = %s, want OCSP unsupported, CRL good on %q, then %q", chkTTrace(res.Attempts), crlURL, arlURL)
+			}
+		})
+	}
+}
+
+// TestCheckCAScopeUnsupportedARLCannotYieldGood: in the AC DNIE 005/006 shape
+// the ARL URL must answer a CRL bound to it; anything the checker cannot use
+// there keeps the CA from good even though CRL.crl answers good.
+func TestCheckCAScopeUnsupportedARLCannotYieldGood(t *testing.T) {
+	const (
+		crlURL = "http://crl.test/CRL.crl"
+		arlURL = "http://arl.test/ARL.crl"
+	)
+	arlIDP := func(s testpki.IDPSpec) *testpki.IDPSpec { s.URIs = []string{arlURL}; return &s }
+	cases := []struct {
+		name       string
+		arl        testpki.CRLSpec
+		crlNoIDP   bool // CRL.crl also served without an IDP
+		wantStatus Status
+		wantARL    Status
+	}{
+		{"delta crl", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true}),
+			ExtraExtensions: []pkix.Extension{{Id: oidExtDeltaCRLIndicator, Critical: true, Value: []byte{0x02, 0x01, 0x01}}}}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"unknown critical extension", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true}),
+			ExtraExtensions: []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 9}, Critical: true, Value: []byte{0x05, 0x00}}}}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"user-only crl naming the arl", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyUser: true})}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"user-only crl naming CRL.crl", testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{crlURL}, OnlyUser: true}}, false, StatusInvalidEvidence, StatusInvalidEvidence},
+		{"partial reasons", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true, OnlySomeReasons: true})}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"empty crl without an idp", testpki.CRLSpec{}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"idp without a name", testpki.CRLSpec{IDP: &testpki.IDPSpec{OnlyCA: true}}, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"unscoped crl at both urls", testpki.CRLSpec{}, true, StatusUnavailable, StatusUnsupportedMethod},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := chkTNewFixture(t)
+			cdp := []testpki.DistributionPoint{{URIs: []string{crlURL}}, {URIs: []string{arlURL}}}
+			cert := f.ca.Intermediate(t, "chkT AC DNIE 005", testpki.CertSpec{Now: f.base, CDP: cdp}).Cert
+			crlSpec := testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{crlURL}}}
+			if tc.crlNoIDP {
+				crlSpec = testpki.CRLSpec{}
+			}
+			f.serve(t, "crl.test", f.crl(t, crlSpec))
+			f.serve(t, "arl.test", f.crl(t, tc.arl))
+			p := Policy{CRLHosts: []string{"crl.test", "arl.test"}, AllowCRL: true}
+			res := chkTCheck(t, f.checker(t, Options{}), cert, f.ca.Cert, p)
+
+			if res.Status != tc.wantStatus || res.Method != "" {
+				t.Fatalf("Check = %s via %q %s, want %s", res.Status, res.Method, chkTTrace(res.Attempts), tc.wantStatus)
+			}
+			if a := res.Attempts[len(res.Attempts)-1]; a.URL != arlURL || a.Outcome != tc.wantARL {
+				t.Errorf("last attempt = %q %s, want %q %s", a.URL, a.Outcome, arlURL, tc.wantARL)
+			}
+		})
+	}
+
+	// One DP (the AC DNIE 004 shape): a complete CRL without an IDP still
+	// covers the CA.
+	t.Run("single dp without an idp", func(t *testing.T) {
+		f := chkTNewFixture(t)
+		cert := f.ca.Intermediate(t, "chkT AC DNIE 004", testpki.CertSpec{Now: f.base, CDP: []testpki.DistributionPoint{{URIs: []string{arlURL}}}}).Cert
+		f.serve(t, "arl.test", f.crl(t, testpki.CRLSpec{}))
+		res := chkTCheck(t, f.checker(t, Options{}), cert, f.ca.Cert, Policy{CRLHosts: []string{"arl.test"}, AllowCRL: true})
+		if res.Status != StatusGood || res.Method != MethodCRL {
+			t.Fatalf("Check = %s via %q %s, want good via crl", res.Status, res.Method, chkTTrace(res.Attempts))
+		}
+	})
+}
+
+// TestCheckRealDNIeCRLs runs the real AC RAIZ DNIE 2 CRL and ARL through the
+// checker for AC DNIE 004 (ARL only) and 005 (CRL.crl then ARL.crl).
+func TestCheckRealDNIeCRLs(t *testing.T) {
+	n := testpki.NewNet()
+	mux := http.NewServeMux()
+	mux.Handle("/dnie/crls/CRL.crl", testpki.Bytes("application/pkix-crl", crlTReadFile(t, "dnie-crl.crl")))
+	mux.Handle("/dnie/crls/ARL.crl", testpki.Bytes("application/pkix-crl", crlTReadFile(t, "dnie-arl.crl")))
+	n.Serve(t, "pki.policia.es", mux)
+	root := crlTReadCert(t, "ac-raiz-dnie-2.pem")
+	c, err := NewChecker(Options{DialContext: n.DialContext, Now: func() time.Time { return crlTNow }, Logger: slog.New(&chkTLogs{})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := Policy{CRLHosts: []string{"pki.policia.es"}, AllowCRL: true}
+	for _, tc := range []struct {
+		cert     string
+		attempts int
+	}{{"ac-dnie-004.pem", 2}, {"ac-dnie-005.pem", 3}} {
+		t.Run(tc.cert, func(t *testing.T) {
+			res := chkTCheck(t, c, crlTReadCert(t, tc.cert), root, p)
+			if res.Status != StatusGood || res.Method != MethodCRL || len(res.Attempts) != tc.attempts {
+				t.Errorf("Check = %s via %q %s, want good via crl after %d attempts", res.Status, res.Method, chkTTrace(res.Attempts), tc.attempts)
 			}
 		})
 	}

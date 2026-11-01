@@ -223,15 +223,18 @@ func (c *Checker) fillOCSP(res *Result, ev OCSPEvidence, source string) {
 // certificate (pinned intermediate) is checked against every usable
 // distribution point and is good only when all of them answer good: AC RAIZ
 // DNIE 2 publishes CA revocations in ARL.crl only, while AC DNIE 005/006
-// name the empty, unscoped CRL.crl first.
+// name the empty CRL.crl first. With several DPs each CRL must name its DP
+// in an IDP, so another CRL of the same issuer cannot stand in for the ARL.
 func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, p Policy, scope Scope, now time.Time, res *Result) Status {
 	dps, err := ParseCRLDistributionPoints(cert)
 	if err != nil {
 		res.Attempts = append(res.Attempts, Attempt{Method: MethodCRL, Outcome: StatusUnsupportedMethod, Detail: err.Error()})
 		return StatusUnsupportedMethod
 	}
+	usable := usableDistributionPoints(dps, issuer)
+	needIDP := scope == ScopeCA && len(usable) > 1
 	last, tried, good, failed := StatusUnsupportedMethod, false, false, false
-	for _, dp := range usableDistributionPoints(dps, issuer) {
+	for _, dp := range usable {
 		for _, gn := range dp.FullName {
 			raw, ok := gn.URI()
 			if !ok {
@@ -242,7 +245,7 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 				continue
 			}
 			tried = true
-			switch st := c.crlOnce(ctx, raw, cert, issuer, dp, p, scope, now, res); st {
+			switch st := c.crlOnce(ctx, raw, cert, issuer, dp, p, scope, needIDP, now, res); st {
 			case StatusRevoked:
 				return st
 			case StatusGood:
@@ -250,8 +253,6 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 					return st
 				}
 				good = true
-			case StatusUnsupportedMethod:
-				last = worstFailure(last, st)
 			default:
 				failed = true
 				last = worstFailure(last, st)
@@ -268,7 +269,7 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 	return last
 }
 
-func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Certificate, dp DistributionPoint, p Policy, scope Scope, now time.Time, res *Result) Status {
+func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Certificate, dp DistributionPoint, p Policy, scope Scope, needIDP bool, now time.Time, res *Result) Status {
 	key := issuerKey(issuer) + " " + u
 	load := c.crls.load(ctx, key, now, c.crlTO, func(fctx context.Context) crlLoad {
 		at := Attempt{Method: MethodCRL, URL: u}
@@ -295,6 +296,9 @@ func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Cert
 		return load.status
 	}
 	st, rec, detail := EvaluateCRL(load.crl, cert, dp, scope, now)
+	if st == StatusGood && needIDP && (load.crl.IDP == nil || len(load.crl.IDP.FullName) == 0) {
+		st, detail = StatusUnsupportedMethod, "crl without an idp name for a CA with several DPs"
+	}
 	at.Outcome, at.Detail = st, detail
 	at.ThisUpdate, at.NextUpdate = load.crl.ThisUpdate, load.crl.NextUpdate
 	res.Attempts = append(res.Attempts, at)
