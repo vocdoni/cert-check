@@ -671,6 +671,32 @@ func TestAdapterValidate(t *testing.T) {
 		{"unset organization rule", mutate(shapePlain(), func(a *identity.Adapter) { a.Organization = 0 }), true},
 		{"SANPipeCN without DocumentOID", mutate(shapeACCV(), func(a *identity.Adapter) { a.SAN.DocumentOID = nil }), true},
 		{"SAN document without rules", mutate(shapeFNMTCitizenRSA(), func(a *identity.Adapter) { a.SAN.DocumentRules = nil }), true},
+
+		// R5.4 (U7-FABLE-2): enums are bounded and Extract's inputs required.
+		{"kinds override", mutate(shapePlain(), func(a *identity.Adapter) {
+			a.Kinds = identity.KindSet{identity.KindUTF8, identity.KindPrintable, identity.KindBMP}
+		}), false},
+		{"surname rule out of range", mutate(shapePlain(), func(a *identity.Adapter) { a.Surnames = 99 }), true},
+		{"negative surname rule", mutate(shapePlain(), func(a *identity.Adapter) { a.Surnames = -1 }), true},
+		{"SAN kind out of range", mutate(shapePlain(), func(a *identity.Adapter) { a.SAN.Kind = 99 }), true},
+		{"birth date rule out of range", mutate(shapePlain(), func(a *identity.Adapter) { a.BirthDate = 99 }), true},
+		{"organization rule out of range", mutate(shapePlain(), func(a *identity.Adapter) { a.Organization = 99 }), true},
+		{"SANAttributes without FirstSurnameOID", mutate(shapeFNMTCitizenRSA(), func(a *identity.Adapter) { a.SAN.FirstSurnameOID = nil }), true},
+		{"document rule without types", mutate(shapePlain(), func(a *identity.Adapter) {
+			a.Documents = []identity.DocumentRule{{Encoding: identity.EncodingIDCES}}
+		}), true},
+		{"document rule with an unknown encoding", mutate(shapePlain(), func(a *identity.Adapter) {
+			a.Documents = []identity.DocumentRule{{Encoding: "IDCFR", Types: dniNIE}}
+		}), true},
+		{"document rule with an unknown type", mutate(shapePlain(), func(a *identity.Adapter) {
+			a.Documents = []identity.DocumentRule{{Encoding: identity.EncodingIDCES, Types: []identity.DocumentType{"PASSPORT"}}}
+		}), true},
+		{"SAN document rule without types", mutate(shapeFNMTCitizenRSA(), func(a *identity.Adapter) {
+			a.SAN.DocumentRules = []identity.DocumentRule{{Encoding: identity.EncodingBare}}
+		}), true},
+		{"empty KindSet", mutate(shapePlain(), func(a *identity.Adapter) { a.Kinds = identity.KindSet{} }), true},
+		{"KindOther in KindSet", mutate(shapePlain(), func(a *identity.Adapter) { a.Kinds = identity.KindSet{identity.KindUTF8, identity.KindOther} }), true},
+		{"unset kind in KindSet", mutate(shapePlain(), func(a *identity.Adapter) { a.Kinds = identity.KindSet{identity.KindUTF8, 0} }), true},
 	}
 	ca := testpki.NewRoot(t, "validate-root", testpki.CertSpec{})
 	leaf := ca.Leaf(t, testpki.CertSpec{Subject: person("IDCES-12345678Z", "JUAN", "GARCIA LOPEZ")})

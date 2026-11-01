@@ -4,6 +4,7 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"errors"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -91,15 +92,28 @@ type Adapter struct {
 	Organization         OrganizationRule
 }
 
-// Validate checks the adapter declaration. Every returned error wraps
-// ErrInvalid (ruling R54).
+// Validate checks the adapter declaration: every rule is set and known, and
+// every field Extract relies on is present (R5.4). Every returned error
+// wraps ErrInvalid (ruling R54).
 func (a Adapter) Validate() error {
 	var errs []error
 	if len(a.Documents) == 0 {
 		errs = append(errs, invalidf("adapter has no document rules"))
 	}
-	if a.Surnames == 0 || a.SAN.Kind == 0 || a.BirthDate == 0 || a.Organization == 0 {
-		errs = append(errs, invalidf("adapter has unset rules"))
+	if a.Surnames < SurnamesFromSN || a.Surnames > SurnamesDNIeCN {
+		errs = append(errs, invalidf("adapter surname rule unset or unknown"))
+	}
+	if a.SAN.Kind < SANNone || a.SAN.Kind > SANPipeCN {
+		errs = append(errs, invalidf("adapter SAN kind unset or unknown"))
+	}
+	if a.BirthDate < BirthDateNone || a.BirthDate > BirthDateOptional {
+		errs = append(errs, invalidf("adapter birth date rule unset or unknown"))
+	}
+	if a.Organization < OrganizationNone || a.Organization > OrganizationFromSubject {
+		errs = append(errs, invalidf("adapter organization rule unset or unknown"))
+	}
+	if a.SAN.Kind == SANAttributes && a.SAN.FirstSurnameOID == nil {
+		errs = append(errs, invalidf("adapter SANAttributes needs FirstSurnameOID"))
 	}
 	if a.SAN.Kind == SANPipeCN && a.SAN.DocumentOID == nil {
 		errs = append(errs, invalidf("adapter SANPipeCN needs DocumentOID"))
@@ -107,7 +121,26 @@ func (a Adapter) Validate() error {
 	if a.SAN.DocumentOID != nil && len(a.SAN.DocumentRules) == 0 {
 		errs = append(errs, invalidf("adapter SAN document without rules"))
 	}
+	for _, r := range slices.Concat(a.Documents, a.SAN.DocumentRules) {
+		if !validRule(r) {
+			errs = append(errs, invalidf("adapter document rule has an unknown encoding or no known types"))
+		}
+	}
+	if a.Kinds != nil && (len(a.Kinds) == 0 || slices.ContainsFunc(a.Kinds, func(k StringKind) bool { return k < KindUTF8 || k > KindIA5 })) {
+		errs = append(errs, invalidf("adapter kinds empty or outside KindUTF8..KindIA5"))
+	}
 	return errors.Join(errs...)
+}
+
+// validRule reports whether r has a known encoding and at least one document
+// type, all of them known.
+func validRule(r DocumentRule) bool {
+	switch r.Encoding {
+	case EncodingIDCES, EncodingPNOES, EncodingBare:
+	default:
+		return false
+	}
+	return len(r.Types) > 0 && !slices.ContainsFunc(r.Types, func(t DocumentType) bool { return t != DocumentDNI && t != DocumentNIE })
 }
 
 // Identity is the typed identity extracted from validated fields.
