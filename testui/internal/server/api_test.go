@@ -8,6 +8,7 @@ import (
 	"encoding/asn1"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -567,12 +568,33 @@ func TestCreateErrors(t *testing.T) {
 		}
 	})
 
+	// One subscriber's /56 holds 256 /64s: a flood from all of them is one
+	// bucket (U11-FABLE-1).
+	t.Run("rate limited per IPv6 /56", func(t *testing.T) {
+		w := newSrvWorld(t, srvOptions{})
+		created := 0
+		for i := range 256 {
+			r := jsonRequest(http.MethodPost, "/api/v1/transactions", valid)
+			r.Header.Set("X-Forwarded-For", fmt.Sprintf("2001:db8:1:1%02x::1", i))
+			if rec := w.serve(r); rec.Code == http.StatusCreated {
+				created++
+			} else if rec.Code != http.StatusTooManyRequests {
+				t.Fatalf("request %d: status = %d, want 201 or 429", i+1, rec.Code)
+			}
+		}
+		if created != createPerMinute {
+			t.Errorf("created %d transactions from 256 /64s of one /56, want %d (one bucket)", created, createPerMinute)
+		}
+	})
+
 	t.Run("store full", func(t *testing.T) {
 		w := newSrvWorld(t, srvOptions{})
 		w.app.store = NewStore(1, w.clk.Now)
 		w.app.auth.store = w.app.store
-		if rec := w.serve(create(valid, nil)()); rec.Code != http.StatusCreated {
-			t.Fatalf("first create: status = %d, want 201", rec.Code)
+		authURL, _ := w.createTx(t, "alpha")
+		// A transaction whose validation started is never evicted.
+		if _, err := w.app.store.ConsumeState(stateOf(t, authURL), "alpha"); err != nil {
+			t.Fatalf("ConsumeState: %v", err)
 		}
 		rec := w.serve(create(valid, nil)())
 		if rec.Code != http.StatusServiceUnavailable {
