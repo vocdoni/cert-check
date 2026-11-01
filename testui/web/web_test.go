@@ -258,6 +258,51 @@ func TestAppJSAPIDeadline(t *testing.T) {
 	}
 }
 
+// TestAppJSRepliesAreValidated covers U14-ASTRA-3. Reply envelopes and the members of their arrays
+// are shape-checked before rendering, and any exception while handling a reply ends in the
+// bad_response view instead of a stuck "Checking" view.
+func TestAppJSRepliesAreValidated(t *testing.T) {
+	js := readStatic(t, "app.js")
+
+	for _, fn := range []string{"isObject", "isApiError", "isDiagnostics", "isRedeemReply", "isProviderList", "guard"} {
+		jsFunc(t, js, fn)
+	}
+	// Array members of the diagnostics must be objects: a null entry in chain threw while the
+	// report was built.
+	diag := jsFunc(t, js, "isDiagnostics")
+	for _, key := range []string{"tls", "certificate", "chain", "profileCandidates", "revocationAttempts"} {
+		if !strings.Contains(diag, "'"+key+"'") {
+			t.Errorf("isDiagnostics() does not check %q", key)
+		}
+	}
+	for fn, check := range map[string]string{
+		"redeem":        "isRedeemReply(",
+		"authenticate":  "isApiError(",
+		"loadProviders": "isProviderList(",
+	} {
+		if src := jsFunc(t, js, fn); !strings.Contains(src, check) {
+			t.Errorf("%s() does not validate its reply with %s", fn, check)
+		}
+	}
+
+	// Whatever the load logic or a click handler throws is routed to the bad_response view.
+	if g := jsFunc(t, js, "guard"); !strings.Contains(g, "catch") || !strings.Contains(g, "code: 'bad_response'") {
+		t.Errorf("guard() = %q, want a catch that renders bad_response", g)
+	}
+	for _, want := range []string{"guard(authenticate)", "guard(init)"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js does not wrap its entry point with %s", want)
+		}
+	}
+	// No entry point runs unguarded: init is only declared (once) and handed to guard.
+	if strings.Contains(js, ", authenticate)") {
+		t.Error("app.js registers authenticate without guard()")
+	}
+	if n := len(regexp.MustCompile(`\binit\(`).FindAllString(js, -1)); n != 1 {
+		t.Errorf("app.js has %d init( occurrences, want only its declaration (callers use the guarded copy)", n)
+	}
+}
+
 func TestRequiredText(t *testing.T) {
 	html := readStatic(t, "index.html")
 	js := readStatic(t, "app.js")

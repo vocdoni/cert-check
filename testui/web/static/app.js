@@ -208,6 +208,62 @@
     return e && e.name === 'TimeoutError' ? 'timeout' : 'network_error';
   }
 
+  // ---------- reply validation ----------
+
+  // These check the shapes the renderers read. A reply that fails them is shown as bad_response.
+
+  function isObject(v) {
+    return v !== null && typeof v === 'object' && !Array.isArray(v);
+  }
+
+  // null and undefined both stand for an absent member (Go marshals a nil pointer or slice as null).
+  function isOptionalObject(v) {
+    return v === undefined || v === null || isObject(v);
+  }
+
+  function isOptionalObjectList(v) {
+    return v === undefined || v === null || (Array.isArray(v) && v.every(isObject));
+  }
+
+  function isApiError(e) {
+    return isObject(e) && [e.code, e.message].every((v) => v === undefined || typeof v === 'string');
+  }
+
+  function isDiagnostics(d) {
+    return d === undefined || d === null || (isObject(d) &&
+      ['tls', 'certificate'].every((key) => isOptionalObject(d[key])) &&
+      ['chain', 'profileCandidates', 'revocationAttempts'].every((key) => isOptionalObjectList(d[key])));
+  }
+
+  function isRedeemReply(body) {
+    if (!isObject(body)) {
+      return false;
+    }
+    if (body.status === 'success') {
+      const r = body.result;
+      return isObject(r) && isDiagnostics(r.diagnostics) &&
+        ['provider', 'profile', 'identity', 'organization', 'certificate', 'revocation'].every((key) => isOptionalObject(r[key]));
+    }
+    return body.status === 'error' && isApiError(body.error) && isDiagnostics(body.diagnostics);
+  }
+
+  function isProviderList(providers) {
+    return Array.isArray(providers) && providers.length > 0 &&
+      providers.every((p) => isObject(p) && typeof p.id === 'string' && typeof p.name === 'string');
+  }
+
+  // Runs an async entry point. Whatever it throws ends in the bad_response view, so a reply that
+  // breaks a renderer cannot leave the page on a view that never resolves.
+  function guard(fn) {
+    return async (...args) => {
+      try {
+        await fn(...args);
+      } catch (e) {
+        showClientError({ code: 'bad_response' });
+      }
+    };
+  }
+
   // ---------- views ----------
 
   function showView(name, announcement) {
@@ -273,7 +329,7 @@
     $('authenticate').disabled = true;
     try {
       const reply = await api('GET', '/api/v1/providers');
-      if (reply.status !== 200 || !Array.isArray(reply.body) || reply.body.length === 0) {
+      if (reply.status !== 200 || !isProviderList(reply.body)) {
         throw new Error('bad providers reply');
       }
       fillProviders(reply.body);
@@ -346,7 +402,7 @@
       showClientError({ code: 'bad_response', provider });
       return;
     }
-    if (body && body.status === 'error' && body.error) {
+    if (isObject(body) && body.status === 'error' && isApiError(body.error)) {
       showClientError({ code: str(body.error.code) || 'generic', message: str(body.error.message), provider });
       return;
     }
@@ -589,16 +645,16 @@
     }
     clearPending();
     const body = reply.body;
-    if (body && body.status === 'success' && body.result) {
+    if (!isRedeemReply(body)) {
+      showClientError({ code: 'bad_response', entry });
+      return;
+    }
+    if (body.status === 'success') {
       rememberVersion(body.result.diagnostics);
       showSuccess(body.result);
       return;
     }
-    if (body && body.status === 'error' && body.error) {
-      showServerError(body.error, body.diagnostics, entry);
-      return;
-    }
-    showClientError({ code: 'bad_response', entry });
+    showServerError(body.error, body.diagnostics, entry);
   }
 
   function showHashError(code, diag, entry) {
@@ -660,17 +716,19 @@
   }
 
   $('provider').addEventListener('change', updateHint);
-  $('authenticate').addEventListener('click', authenticate);
+  $('authenticate').addEventListener('click', guard(authenticate));
   $('again').addEventListener('click', showStart);
   $('retry').addEventListener('click', showStart);
   $('copy-report').addEventListener('click', copyReport);
 
+  const guardedInit = guard(init);
+
   // A page restored from the back/forward cache keeps its old state; run the load logic again.
   window.addEventListener('pageshow', (event) => {
     if (event.persisted) {
-      init();
+      guardedInit();
     }
   });
 
-  init();
+  guardedInit();
 })();
