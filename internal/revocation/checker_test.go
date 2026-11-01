@@ -612,6 +612,55 @@ func TestCheckTimeouts(t *testing.T) {
 	})
 }
 
+// TestCheckCRLFetchesLeaveOCSPSlots: CRL fetches that hang for their whole
+// timeout hold at most half the fetch slots, so an OCSP check on another
+// host still answers within its own timeout.
+func TestCheckCRLFetchesLeaveOCSPSlots(t *testing.T) {
+	f := chkTNewFixture(t)
+	release := make(chan struct{})
+	var hung atomic.Int64
+	hang := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hung.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+		http.Error(w, "released", http.StatusServiceUnavailable)
+	})
+	p := Policy{OCSPHosts: []string{chkTOCSPHost}, AllowCRL: true}
+	var leaves []*x509.Certificate
+	for i := range MaxConcurrent { // one host each: the transport also caps connections per host
+		host := fmt.Sprintf("crl-hung-%d.test", i)
+		f.serve(t, host, hang)
+		p.CRLHosts = append(p.CRLHosts, host)
+		leaves = append(leaves, f.leaf(t, nil, []string{"http://" + host + "/a.crl"}))
+	}
+	f.serve(t, chkTOCSPHost, f.ocsp.Handler(t))
+	ocspLeaf := f.leaf(t, []string{chkTOCSPURL}, nil)
+	const ocspTimeout = 2 * time.Second
+	c := f.checker(t, Options{OCSPTimeout: ocspTimeout, CRLTimeout: time.Minute})
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	defer close(release)
+	for _, leaf := range leaves {
+		wg.Go(func() { c.Check(context.Background(), leaf, f.ca.Cert, p) })
+	}
+	crlTEventually(t, func() bool { return hung.Load() >= MaxConcurrent/2 })
+	time.Sleep(100 * time.Millisecond) // let the other CRL checks queue
+	start := time.Now()
+	res := chkTCheck(t, c, ocspLeaf, f.ca.Cert, p)
+	if res.Status != StatusGood || res.Method != MethodOCSP {
+		t.Errorf("OCSP Check = %s via %q %s after %v, want good via ocsp", res.Status, res.Method, chkTTrace(res.Attempts), time.Since(start))
+	}
+	if d := time.Since(start); d >= ocspTimeout {
+		t.Errorf("OCSP Check took %v, want under the %v OCSP timeout", d, ocspTimeout)
+	}
+	if got := hung.Load(); got != MaxConcurrent/2 {
+		t.Errorf("CRL fetches in flight = %d, want %d", got, MaxConcurrent/2)
+	}
+}
+
 func TestCheckOversizedOCSP(t *testing.T) {
 	f := chkTNewFixture(t)
 	f.ocsp.SetRawAnswer(func(testpki.Request) []byte { return bytes.Repeat([]byte{0x30}, 70<<10) })

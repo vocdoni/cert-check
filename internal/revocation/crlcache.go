@@ -21,7 +21,10 @@ const (
 	crlMaxMarks          = 4096
 )
 
-var errCRLRollback = errors.New("crl number rolled back")
+var (
+	errCRLRollback = errors.New("crl number rolled back")
+	errCRLPanic    = errors.New("crl fetch failed: internal error")
+)
 
 func issuerKey(issuer *x509.Certificate) string {
 	s := sha256.Sum256(issuer.Raw)
@@ -145,12 +148,22 @@ type crlLoad struct {
 
 // load returns the cached CRL or fetches it once for all concurrent callers.
 // Only an admitted CRL is cached and raises the CRL-number mark of key; one
-// numbered below the mark is invalid evidence.
+// numbered below the mark is invalid evidence. A caller already cancelled
+// starts no fetch, and a panic in the fetch is an unavailable result: under
+// DoChan singleflight would re-raise it where nothing can recover it.
 func (c *crlCache) load(ctx context.Context, key string, now time.Time, timeout time.Duration, fetch func(context.Context) crlLoad) crlLoad {
 	if p, ok := c.get(key, now); ok {
 		return crlLoad{crl: p, status: StatusGood, attempt: Attempt{Method: MethodCRL, URL: p.URL, FromCache: true}}
 	}
-	ch := c.sf.DoChan(key, func() (any, error) {
+	if err := ctx.Err(); err != nil {
+		return crlLoad{status: StatusUnavailable, err: err, attempt: Attempt{Method: MethodCRL, Outcome: StatusUnavailable, Detail: "cancelled before CRL fetch"}}
+	}
+	ch := c.sf.DoChan(key, func() (v any, _ error) {
+		defer func() {
+			if recover() != nil {
+				v = crlLoad{status: StatusUnavailable, err: errCRLPanic, attempt: Attempt{Method: MethodCRL}}
+			}
+		}()
 		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
 		res := fetch(fctx)

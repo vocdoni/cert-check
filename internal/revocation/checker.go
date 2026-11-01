@@ -34,6 +34,7 @@ type Checker struct {
 	log     *slog.Logger
 	ocspTO  time.Duration
 	crlTO   time.Duration
+	crlSem  chan struct{} // CRL fetches take at most half the fetch slots
 }
 
 // NewChecker builds a Checker. Zero cache bounds and timeouts take the
@@ -63,6 +64,7 @@ func NewChecker(o Options) (*Checker, error) {
 		log:     o.Logger,
 		ocspTO:  cmp.Or(o.OCSPTimeout, OCSPTimeout),
 		crlTO:   cmp.Or(o.CRLTimeout, CRLTimeout),
+		crlSem:  make(chan struct{}, MaxConcurrent/2),
 	}
 	if c.now == nil {
 		c.now = time.Now
@@ -273,6 +275,12 @@ func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Cert
 	key := issuerKey(issuer) + " " + u
 	load := c.crls.load(ctx, key, now, c.crlTO, func(fctx context.Context) crlLoad {
 		at := Attempt{Method: MethodCRL, URL: u}
+		select {
+		case c.crlSem <- struct{}{}:
+			defer func() { <-c.crlSem }()
+		case <-fctx.Done():
+			return crlLoad{status: StatusUnavailable, err: fctx.Err(), attempt: at}
+		}
 		fr, err := c.fetcher.Fetch(fctx, FetchRequest{URL: u, MaxBytes: MaxCRLResponse, Timeout: c.crlTO, AllowedHosts: p.AllHosts()})
 		at.HTTPStatus, at.Duration = fr.StatusCode, fr.Duration
 		if err != nil {

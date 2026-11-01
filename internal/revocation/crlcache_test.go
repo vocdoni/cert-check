@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/big"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -309,6 +310,45 @@ func TestCRLCache(t *testing.T) {
 			t.Errorf("load for issuer a = %p (fromCache %v), want issuer a's cached CRL", r.crl, r.attempt.FromCache)
 		}
 	})
+}
+
+// TestCRLCachePanickingFetch: singleflight re-raises a panic of the shared
+// function in a new goroutine, which would end the process; load recovers it.
+func TestCRLCachePanickingFetch(t *testing.T) {
+	c := newCRLCache(DefaultCRLCacheBytes)
+	var calls atomic.Int64
+	fetch := func(context.Context) crlLoad {
+		calls.Add(1)
+		panic("crlT: SENTINEL panic value")
+	}
+	for i := range 2 {
+		r := c.load(t.Context(), "k", crlTNow, time.Second, fetch)
+		if r.status != StatusUnavailable || r.err == nil || r.crl != nil || r.attempt.Method != MethodCRL {
+			t.Fatalf("load %d = %+v, want unavailable", i, r)
+		}
+		if strings.Contains(r.err.Error(), "SENTINEL") {
+			t.Errorf("load %d error %q carries the panic value, want a fixed detail", i, r.err)
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Errorf("fetches = %d, want 2 (the panicked flight is not reused)", got)
+	}
+}
+
+func TestCRLCacheCancelledBeforeFlight(t *testing.T) {
+	c := newCRLCache(DefaultCRLCacheBytes)
+	f := &crlTFetcher{p: crlTParsed(100, crlTNow.Add(time.Hour)), gate: make(chan struct{})}
+	t.Cleanup(func() { close(f.gate) })
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	r := c.load(ctx, "k", crlTNow, time.Second, f.fetch)
+	if r.status != StatusUnavailable || !errors.Is(r.err, context.Canceled) || r.attempt.Method != MethodCRL || r.attempt.Outcome != StatusUnavailable {
+		t.Errorf("load with a cancelled context = %+v, want unavailable with context.Canceled", r)
+	}
+	time.Sleep(100 * time.Millisecond) // a detached flight would have started by now
+	if got := f.calls.Load(); got != 0 {
+		t.Errorf("fetches = %d, want 0", got)
+	}
 }
 
 func TestCRLCacheMarks(t *testing.T) {
