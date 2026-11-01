@@ -42,12 +42,15 @@ jobs:
         run: for m in $MODULES; do (cd "$m" && CGO_ENABLED=0 go build -trimpath ./...); done
       - name: test
         run: |
+          out="$RUNNER_TEMP/go-test.json" # outside the checkout (and the Docker build context)
           for m in $MODULES; do
-            if ! (cd "$m" && go test -race -count=1 -json ./... > test.json); then
-              grep -E '"Action":"fail"' "$m/test.json" | head -50
+            if ! (cd "$m" && go test -race -count=1 -json ./... > "$out"); then
+              # The output (t.Errorf text, panics) of the failing packages and any build errors.
+              jq -js '(map(select(.Action == "fail") | .Package) | unique) as $failed | .[]
+                | select(.Action == "build-output" or (.Action == "output" and (.Package | IN($failed[])))) | .Output' "$out" | tail -400
               exit 1
             fi
-            skipped="$(grep '"Action":"skip"' "$m/test.json" | grep -c '"Test":' || true)"
+            skipped="$(grep '"Action":"skip"' "$out" | grep -c '"Test":' || true)"
             if [ "$skipped" != "0" ]; then
               echo "$m: $skipped skipped tests"
               exit 1
