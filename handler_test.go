@@ -3,6 +3,8 @@ package certcheck_test
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -437,6 +439,31 @@ func TestLogAttrsOmitsClientIssuer(t *testing.T) {
 			}
 			if !strings.Contains(buf.String(), e.Diagnostics.DiagnosticID) {
 				t.Errorf("log lines lack the diagnostic ID:\n%s", buf.String())
+			}
+		})
+	}
+}
+
+// TestDescribeCertificateNil: a server that builds its own Diagnostics may
+// describe a missing leaf or a certificate without a usable key.
+func TestDescribeCertificateNil(t *testing.T) {
+	if d := certcheck.DescribeCertificate(nil); d != nil {
+		t.Errorf("DescribeCertificate(nil) = %+v, want nil", d)
+	}
+	for _, tc := range []struct {
+		name string
+		cert *x509.Certificate
+		want string
+	}{
+		{"nil RSA key", &x509.Certificate{PublicKeyAlgorithm: x509.RSA, PublicKey: (*rsa.PublicKey)(nil)}, "RSA"},
+		{"RSA key without modulus", &x509.Certificate{PublicKeyAlgorithm: x509.RSA, PublicKey: &rsa.PublicKey{}}, "RSA"},
+		{"nil ECDSA key", &x509.Certificate{PublicKeyAlgorithm: x509.ECDSA, PublicKey: (*ecdsa.PublicKey)(nil)}, "ECDSA"},
+		{"ECDSA key without curve", &x509.Certificate{PublicKeyAlgorithm: x509.ECDSA, PublicKey: &ecdsa.PublicKey{}}, "ECDSA"},
+		{"no key", &x509.Certificate{}, x509.UnknownPublicKeyAlgorithm.String()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := certcheck.DescribeCertificate(tc.cert).KeyAlgorithm; got != tc.want {
+				t.Errorf("KeyAlgorithm = %q, want %q", got, tc.want)
 			}
 		})
 	}

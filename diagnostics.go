@@ -115,6 +115,9 @@ func DescribeTLS(cs *tls.ConnectionState) *TLSInfo {
 
 // DescribeCertificate describes a received leaf for Diagnostics.Certificate.
 func DescribeCertificate(c *x509.Certificate) *CertificateDetails {
+	if c == nil {
+		return nil
+	}
 	sum := sha256.Sum256(c.Raw)
 	d := &CertificateDetails{
 		Subject: c.Subject.String(), Issuer: c.Issuer.String(), SerialHex: fmt.Sprintf("%x", c.SerialNumber),
@@ -148,9 +151,13 @@ func DescribeCertificate(c *x509.Certificate) *CertificateDetails {
 func keyAlgorithm(c *x509.Certificate) string {
 	switch k := c.PublicKey.(type) {
 	case *rsa.PublicKey:
-		return fmt.Sprintf("RSA-%d", k.N.BitLen())
+		if k != nil && k.N != nil {
+			return fmt.Sprintf("RSA-%d", k.N.BitLen())
+		}
 	case *ecdsa.PublicKey:
-		return "ECDSA-" + k.Curve.Params().Name
+		if k != nil && k.Curve != nil {
+			return "ECDSA-" + k.Curve.Params().Name
+		}
 	}
 	return c.PublicKeyAlgorithm.String()
 }
