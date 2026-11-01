@@ -268,6 +268,12 @@ func nameFieldTextCases(tb testing.TB) []fieldCase {
 		{name: "wholly Cyrillic", der: utf8("ИВАН ПЕТРОВ"), oid: oidGN, kinds: k, want: "ИВАН ПЕТРОВ", found: true},
 		{name: "wholly Greek", der: utf8("ΓΙΩΡΓΟΣ"), oid: oidGN, kinds: k, want: "ΓΙΩΡΓΟΣ", found: true},
 
+		// R10.3 (U6-FABLE-3): overlong and out-of-range UTF-8 is rejected.
+		{name: "overlong 2-byte U+0020", der: utf8("JU\xc0\xa0AN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xc0\xa0AN"}},
+		{name: "overlong 3-byte U+002F", der: utf8("JU\xe0\x80\xafAN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xe0\x80\xafAN"}},
+		{name: "overlong 4-byte U+002F", der: utf8("JU\xf0\x80\x80\xafAN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xf0\x80\x80\xafAN"}},
+		{name: "beyond U+10FFFF", der: utf8("JU\xf4\x90\x80\x80AN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "invalid UTF-8", values: []string{"JU\xf4\x90\x80\x80AN"}},
+
 		// R5.1: a run of more than 4 combining marks is rejected; x/text
 		// itself inserts U+034F after 30 non-starters.
 		{name: "four combining marks", der: utf8(combiningRun(4)), oid: oidGN, kinds: k, want: combiningRun(4), found: true},

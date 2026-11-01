@@ -57,7 +57,7 @@ jobs:
         run: for m in $MODULES; do (cd "$m" && go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...); done
       - name: fuzz smoke (30 s per target)
         run: |
-          for t in FuzzParseName FuzzParseSANDirectoryNames FuzzParseDateOfBirth FuzzParseDocument FuzzDateUnmarshalJSON; do
+          for t in FuzzParseName FuzzParseSANDirectoryNames FuzzParseDateOfBirth FuzzParseDocument FuzzDateUnmarshalJSON FuzzAdapterExtract; do
             go test -run '^$' -fuzz "^$t\$" -fuzztime 30s ./internal/identity
           done
           for t in FuzzParseResponse FuzzParseIDP FuzzParseCDP; do
