@@ -89,6 +89,12 @@
     return value === undefined || value === null ? '' : String(value);
   }
 
+  // Own-property lookup for the code tables. A code comes from the URL fragment or the API, so a
+  // plain table[code] would answer "__proto__" or "constructor" with Object.prototype or Object.
+  function lookup(table, key) {
+    return Object.hasOwn(table, key) ? table[key] : undefined;
+  }
+
   function list(values) {
     return Array.isArray(values) && values.length > 0 ? values.map(str).join(', ') : 'none';
   }
@@ -488,7 +494,7 @@
   }
 
   function guidanceFor(code, port) {
-    const g = GUIDANCE[code];
+    const g = lookup(GUIDANCE, code);
     if (typeof g === 'function') {
       return g(port);
     }
@@ -498,7 +504,7 @@
   // An error the server reported. Full diagnostics, when present, drive the report.
   function showServerError(error, diagnostics, entry) {
     const code = str(error.code) || 'generic';
-    const message = str(error.message) || CLIENT_MESSAGES[code] || CLIENT_MESSAGES.generic;
+    const message = str(error.message) || lookup(CLIENT_MESSAGES, code) || CLIENT_MESSAGES.generic;
     rememberVersion(diagnostics);
     let report;
     if (diagnostics) {
@@ -515,7 +521,7 @@
   function showClientError(opts) {
     const code = opts.code;
     const entry = opts.entry || null;
-    const message = opts.message || CLIENT_MESSAGES[code] || CLIENT_MESSAGES.generic;
+    const message = opts.message || lookup(CLIENT_MESSAGES, code) || CLIENT_MESSAGES.generic;
     let attempt = [];
     if (entry) {
       attempt = attemptLines(entry);

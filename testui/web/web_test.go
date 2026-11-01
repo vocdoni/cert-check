@@ -175,6 +175,35 @@ func TestCSPCompatible(t *testing.T) {
 	}
 }
 
+// jsFunc returns the source of a function declared at the top level of app.js's wrapper.
+func jsFunc(t *testing.T, js, name string) string {
+	t.Helper()
+	src := regexp.MustCompile(`(?ms)^  (?:async )?function ` + name + `\(.*?^  }$`).FindString(js)
+	if src == "" {
+		t.Fatalf("app.js has no function %s", name)
+	}
+	return src
+}
+
+// TestAppJSCodeTables covers U14-ASTRA-1. An error code from the URL fragment or from the API must
+// never index a plain object: "__proto__" would return Object.prototype and "constructor" would
+// return Object, and the error view would then fail to render. The table lookups are own-property
+// only, so an unknown code falls back to the generic message and guidance.
+func TestAppJSCodeTables(t *testing.T) {
+	js := readStatic(t, "app.js")
+	if loc := regexp.MustCompile(`\b(?:GUIDANCE|CLIENT_MESSAGES)\s*\[`).FindStringIndex(js); loc != nil {
+		t.Errorf("app.js indexes a code table directly near %q, want the own-property lookup", js[loc[0]:min(len(js), loc[0]+40)])
+	}
+	if lookup := jsFunc(t, js, "lookup"); !strings.Contains(lookup, "Object.hasOwn(") {
+		t.Errorf("lookup() = %q, want an Object.hasOwn own-property check", lookup)
+	}
+	for _, fn := range []string{"guidanceFor", "showServerError", "showClientError"} {
+		if src := jsFunc(t, js, fn); !strings.Contains(src, "lookup(") {
+			t.Errorf("%s() does not use lookup() for its code table", fn)
+		}
+	}
+}
+
 func TestRequiredText(t *testing.T) {
 	html := readStatic(t, "index.html")
 	js := readStatic(t, "app.js")
