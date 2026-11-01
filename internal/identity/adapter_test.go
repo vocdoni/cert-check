@@ -388,6 +388,14 @@ func adapterCases(tb testing.TB) []adapterCase {
 		{name: "fnmt-representative without organizationIdentifier", adapter: shapeFNMTRepresentative(),
 			spec: testpki.CertSpec{Subject: with(person(idces, gn, sn), rdnO("EMPRESA EJEMPLO SL")), SANDirNames: san(fnmtDir(idces, gn, sn1, sn2))},
 			want: withOrg(fnmtIdentity(dniDoc(num, idces), gn, sn, sn1, sn2), &identity.Organization{Name: "EMPRESA EJEMPLO SL"})},
+		// R5.5 (U7-FABLE-4): the identifier is normalised like every other
+		// string, and a blank one records no source.
+		{name: "fnmt-representative blank organizationIdentifier", adapter: shapeFNMTRepresentative(),
+			spec: testpki.CertSpec{Subject: with(person(idces, gn, sn), rdnO("EMPRESA EJEMPLO SL"), rdnOrgID("   ")), SANDirNames: san(fnmtDir(idces, gn, sn1, sn2))},
+			want: withOrg(fnmtIdentity(dniDoc(num, idces), gn, sn, sn1, sn2), &identity.Organization{Name: "EMPRESA EJEMPLO SL"})},
+		{name: "fnmt-representative organizationIdentifier inner spaces", adapter: shapeFNMTRepresentative(),
+			spec: testpki.CertSpec{Subject: with(person(idces, gn, sn), rdnO("EMPRESA EJEMPLO SL"), rdnOrgID(" VATES-B00000000  X ")), SANDirNames: san(fnmtDir(idces, gn, sn1, sn2))},
+			want: withOrg(fnmtIdentity(dniDoc(num, idces), gn, sn, sn1, sn2), &identity.Organization{Name: "EMPRESA EJEMPLO SL", Identifier: "VATES-B00000000 X"})},
 		{name: "fnmt-representative O missing", adapter: shapeFNMTRepresentative(),
 			spec:    testpki.CertSpec{Subject: with(person(idces, gn, sn), rdnOrgID("VATES-B00000000")), SANDirNames: san(fnmtDir(idces, gn, sn1, sn2))},
 			wantErr: invalid},
@@ -497,6 +505,13 @@ func adapterCases(tb testing.TB) []adapterCase {
 			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ, PEDRO (AUTENTICACIÓN)")}, wantErr: invalid},
 		{name: "dnie CN without the comma separator", adapter: shapeDNIe(),
 			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ,JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
+		// R5.3 (U7-FABLE-1): the surnames are a plain word sequence.
+		{name: "dnie CN space before comma", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ , JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
+		{name: "dnie CN surnames with an extra comma segment", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ, PEDRO, JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
+		{name: "dnie CN surnames with a parenthesised token", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ (FIRMA), JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
 		{name: "dnie CN without suffix", adapter: shapeDNIe(),
 			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA LÓPEZ, JOSÉ")}, wantErr: invalid},
 		{name: "dnie CN with FIRMA suffix", adapter: shapeDNIe(),
@@ -552,6 +567,29 @@ func adapterCases(tb testing.TB) []adapterCase {
 			spec: testpki.CertSpec{Subject: person(idces, "MARÍA ÀNGELS", "D'ARBÓS-GÜELL COL·L PEÑA"),
 				SANDirNames: san(fnmtDir(num, "MARÍA ÀNGELS", "D'ARBÓS-GÜELL", "COL·L PEÑA"))},
 			want: ext(fnmtIdentity(dniDoc(num, idces), "MARÍA ÀNGELS", "D'ARBÓS-GÜELL COL·L PEÑA", "D'ARBÓS-GÜELL", "COL·L PEÑA"))},
+		{name: "fnmt-rsa decomposed Catalan names in the SAN", adapter: rsa,
+			spec: testpki.CertSpec{Subject: person(idces, "NÚRIA", "ÇALÓ COL·L"),
+				SANDirNames: san(fnmtDir(num, "NU\u0301RIA", "C\u0327ALO\u0301", "COL·L"))},
+			want: ext(fnmtIdentity(dniDoc(num, idces), "NÚRIA", "ÇALÓ COL·L", "ÇALÓ", "COL·L"))},
+
+		// R5.1 (U6-ASTRA-1): a name needs a letter, and a long combining run
+		// is rejected on both paths.
+		{name: "plain subject GN invisible only", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, "\u034f", sn)}, wantErr: invalid},
+		{name: "plain subject GN a lone combining mark", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, "\u0301", sn)}, wantErr: invalid},
+		{name: "plain subject SN punctuation only", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, gn, "- ·")}, wantErr: invalid},
+		{name: "plain subject SN long combining run", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, gn, "GARCI"+strings.Repeat("\u0301", 5)+"A LOPEZ")}, wantErr: invalid},
+		{name: "fnmt-rsa SAN first surname without a letter", adapter: rsa,
+			spec: testpki.CertSpec{Subject: person(idces, gn, "- "+sn2), SANDirNames: san(fnmtDir(num, gn, "-", sn2))}, wantErr: invalid},
+		{name: "fnmt-rsa SAN second surname without a letter", adapter: rsa,
+			spec: testpki.CertSpec{Subject: person(idces, gn, sn1+" -"), SANDirNames: san(fnmtDir(num, gn, sn1, "-"))}, wantErr: invalid},
+		{name: "dnie CN second surname without a letter", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA -, JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
+		{name: "fnmt-rsa SAN first surname long combining run", adapter: rsa,
+			spec: testpki.CertSpec{Subject: person(idces, gn, sn), SANDirNames: san(fnmtDir(num, gn, "GARCI"+strings.Repeat("\u0301", 5)+"A", sn2))}, wantErr: invalid},
 	}
 	// R53: each rejected class, in a subject attribute and in a SAN
 	// dirName attribute. NBSP and the other spaces matter most here: before
@@ -597,6 +635,11 @@ func TestAdapterExtract(t *testing.T) {
 			if want := id.GivenNames + " " + id.Surnames; id.FullName != want {
 				t.Errorf("FullName = %q, want GivenNames + \" \" + Surnames = %q", id.FullName, want)
 			}
+			for _, v := range []string{id.GivenNames, id.Surnames, id.FirstSurname, id.SecondSurname} {
+				if v != identity.NormalizeName(v) {
+					t.Errorf("name %q is not normalised", v)
+				}
+			}
 			if !maps.Equal(id.Sources, tc.want.Identity.Sources) {
 				t.Errorf("Sources:\n got %v\nwant %v", id.Sources, tc.want.Identity.Sources)
 			}
@@ -636,6 +679,32 @@ func TestAdapterValidate(t *testing.T) {
 		{"unset organization rule", mutate(shapePlain(), func(a *identity.Adapter) { a.Organization = 0 }), true},
 		{"SANPipeCN without DocumentOID", mutate(shapeACCV(), func(a *identity.Adapter) { a.SAN.DocumentOID = nil }), true},
 		{"SAN document without rules", mutate(shapeFNMTCitizenRSA(), func(a *identity.Adapter) { a.SAN.DocumentRules = nil }), true},
+
+		// R5.4 (U7-FABLE-2): enums are bounded and Extract's inputs required.
+		{"kinds override", mutate(shapePlain(), func(a *identity.Adapter) {
+			a.Kinds = identity.KindSet{identity.KindUTF8, identity.KindPrintable, identity.KindBMP}
+		}), false},
+		{"surname rule out of range", mutate(shapePlain(), func(a *identity.Adapter) { a.Surnames = 99 }), true},
+		{"negative surname rule", mutate(shapePlain(), func(a *identity.Adapter) { a.Surnames = -1 }), true},
+		{"SAN kind out of range", mutate(shapePlain(), func(a *identity.Adapter) { a.SAN.Kind = 99 }), true},
+		{"birth date rule out of range", mutate(shapePlain(), func(a *identity.Adapter) { a.BirthDate = 99 }), true},
+		{"organization rule out of range", mutate(shapePlain(), func(a *identity.Adapter) { a.Organization = 99 }), true},
+		{"SANAttributes without FirstSurnameOID", mutate(shapeFNMTCitizenRSA(), func(a *identity.Adapter) { a.SAN.FirstSurnameOID = nil }), true},
+		{"document rule without types", mutate(shapePlain(), func(a *identity.Adapter) {
+			a.Documents = []identity.DocumentRule{{Encoding: identity.EncodingIDCES}}
+		}), true},
+		{"document rule with an unknown encoding", mutate(shapePlain(), func(a *identity.Adapter) {
+			a.Documents = []identity.DocumentRule{{Encoding: "IDCFR", Types: dniNIE}}
+		}), true},
+		{"document rule with an unknown type", mutate(shapePlain(), func(a *identity.Adapter) {
+			a.Documents = []identity.DocumentRule{{Encoding: identity.EncodingIDCES, Types: []identity.DocumentType{"PASSPORT"}}}
+		}), true},
+		{"SAN document rule without types", mutate(shapeFNMTCitizenRSA(), func(a *identity.Adapter) {
+			a.SAN.DocumentRules = []identity.DocumentRule{{Encoding: identity.EncodingBare}}
+		}), true},
+		{"empty KindSet", mutate(shapePlain(), func(a *identity.Adapter) { a.Kinds = identity.KindSet{} }), true},
+		{"KindOther in KindSet", mutate(shapePlain(), func(a *identity.Adapter) { a.Kinds = identity.KindSet{identity.KindUTF8, identity.KindOther} }), true},
+		{"unset kind in KindSet", mutate(shapePlain(), func(a *identity.Adapter) { a.Kinds = identity.KindSet{identity.KindUTF8, 0} }), true},
 	}
 	ca := testpki.NewRoot(t, "validate-root", testpki.CertSpec{})
 	leaf := ca.Leaf(t, testpki.CertSpec{Subject: person("IDCES-12345678Z", "JUAN", "GARCIA LOPEZ")})

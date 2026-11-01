@@ -257,6 +257,16 @@ func nameFieldTextCases(tb testing.TB) []fieldCase {
 		{name: "decomposed accents", der: utf8("PEN\u0303A GU\u0308ELL"), oid: oidGN, kinds: k, want: "PEN\u0303A GU\u0308ELL", found: true},
 		{name: "teletex Latin-1 letters", der: nameDER(atvDER(tb, oidGN, testpki.TagTeletex, []byte("PE\xd1A \xc7\xc0\xdc\xb7L'O-K"))), oid: oidGN, kinds: all, want: "PEÑA ÇÀÜ·L'O-K", found: true},
 		{name: "bmp Spanish letters", der: bmp('P', 'E', 0x00d1, 'A', ' ', 0x00b7), oid: oidGN, kinds: all, want: "PEÑA ·", found: true},
+		{name: "decomposed Catalan lower case", der: utf8(decomposedCatalan), oid: oidGN, kinds: k, want: decomposedCatalan, found: true},
+
+		// R5.1: a run of more than 4 combining marks is rejected; x/text
+		// itself inserts U+034F after 30 non-starters.
+		{name: "four combining marks", der: utf8(combiningRun(4)), oid: oidGN, kinds: k, want: combiningRun(4), found: true},
+		{name: "five combining marks", der: utf8(combiningRun(5)), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "too many combining marks", values: []string{combiningRun(5)}},
+		{name: "31 combining marks", der: utf8(combiningRun(31)), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "too many combining marks", values: []string{combiningRun(31)}},
+		{name: "five combining marks of mixed classes", der: utf8("JU\u0301\u0903\u0302\u20dd\u0303AN"), oid: oidGN, kinds: k, wantErr: identity.ErrInvalid, rule: "too many combining marks"},
+		{name: "two runs of four combining marks", der: utf8("JU\u0301\u0302\u0303\u0308A\u0301\u0302\u0303\u0308N"), oid: oidGN, kinds: k,
+			want: "JU\u0301\u0302\u0303\u0308A\u0301\u0302\u0303\u0308N", found: true},
 	}
 	for _, ic := range invisibleChars {
 		v := "JU" + string(ic.r) + "AN"
@@ -268,6 +278,13 @@ func nameFieldTextCases(tb testing.TB) []fieldCase {
 // spanishNames exercises every non-ASCII letter class a Spanish or Catalan
 // name uses; ruling R53 must keep accepting it.
 const spanishNames = "MARÍA ÀNGELS D'ARBÓS-GÜELL PEÑA COL·LEGI ÇALÓ"
+
+// decomposedCatalan is lower-case Catalan and Spanish in NFD: ç, ó, l·l, ñ,
+// ú, à and an apostrophe.
+const decomposedCatalan = "c\u0327alo\u0301 col·l n\u0303u\u0301ria d'a\u0300ngels"
+
+// combiningRun returns "JUA", n combining acute accents, then "N".
+func combiningRun(n int) string { return "JUA" + strings.Repeat("\u0301", n) + "N" }
 
 // invisibleChars has at least one code point per class rejected by ruling
 // R53, with the rule its error must name.
@@ -304,6 +321,14 @@ var invisibleChars = []struct {
 	{"Zs narrow no-break space U+202F", 0x202f, "space other than U+0020"},
 	{"Zs medium math space U+205F", 0x205f, "space other than U+0020"},
 	{"Zs ideographic space U+3000", 0x3000, "space other than U+0020"},
+	// U6-ASTRA-1: invisible code points outside Cf. ComparisonKey drops the
+	// Mn ones, so before R5.1 they also survived the SAN consistency check.
+	{"Mn combining grapheme joiner U+034F", 0x034f, "default-ignorable character"},
+	{"Lo Hangul choseong filler U+115F", 0x115f, "default-ignorable character"},
+	{"Lo Hangul filler U+3164", 0x3164, "default-ignorable character"},
+	{"Mn variation selector-16 U+FE0F", 0xfe0f, "variation selector"},
+	{"Mn Mongolian free variation selector U+180B", 0x180b, "variation selector"},
+	{"Mn variation selector-17 U+E0100", 0xe0100, "variation selector"},
 }
 
 func TestNameFieldText(t *testing.T) { runFieldCases(t, nameFieldTextCases(t)) }
