@@ -172,9 +172,10 @@ func extKeyUsageName(e x509.ExtKeyUsage) string {
 }
 
 // LogAttrs returns the non-PII fields allowed in logs: id, code, step,
-// provider, candidates (x509 error class only), issuer DN,
-// policy OIDs, revocation host/status/duration, TLS version/cipher. Never
-// subject, names, document, serial, leaf hash, URL paths or technicalDetail.
+// provider, candidates (x509 error class only), policy OIDs, revocation
+// host/status/duration, TLS version/cipher. Never subject, issuer or any
+// other DN the client presented, names, document, serial, leaf hash, URL
+// paths or technicalDetail.
 func (d Diagnostics) LogAttrs() []slog.Attr {
 	attrs := []slog.Attr{
 		slog.String("diagnosticId", d.DiagnosticID),
@@ -188,7 +189,7 @@ func (d Diagnostics) LogAttrs() []slog.Attr {
 	}
 	attrs = append(attrs, slog.Any("candidates", cands))
 	if d.Certificate != nil {
-		attrs = append(attrs, slog.String("issuer", d.Certificate.Issuer), slog.Any("policies", d.Certificate.PolicyOIDs))
+		attrs = append(attrs, slog.Any("policies", d.Certificate.PolicyOIDs))
 	}
 	var revs []string
 	for _, a := range d.RevocationAttempts {

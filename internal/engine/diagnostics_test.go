@@ -184,14 +184,14 @@ func TestLogAttrsNoPII(t *testing.T) {
 			slog.New(slog.NewJSONHandler(&buf, nil)).LogAttrs(t.Context(), slog.LevelInfo, "certauth outcome", tc.d.LogAttrs()...)
 			out := buf.String()
 			for _, pii := range []string{
-				tc.leaf.Subject.String(), cwGiven, "GARCÍA", "LÓPEZ", cwSurnames, cwDNI,
+				tc.leaf.Subject.String(), tc.leaf.Issuer.String(), cwGiven, "GARCÍA", "LÓPEZ", cwSurnames, cwDNI,
 				fmt.Sprintf("%x", tc.leaf.SerialNumber), testpki.SHA256Hex(tc.leaf.Raw), cwOCSPPath,
 			} {
 				if strings.Contains(out, pii) {
 					t.Errorf("log line contains %q:\n%s", pii, out)
 				}
 			}
-			for _, want := range []string{tc.d.DiagnosticID, cwOCSPHost, w.rootA.Cert.Subject.String(), cwPolicyA, "alpha-a"} {
+			for _, want := range []string{tc.d.DiagnosticID, cwOCSPHost, cwPolicyA, "alpha-a"} {
 				if !strings.Contains(out, want) {
 					t.Errorf("log line lacks %q:\n%s", want, out)
 				}

@@ -9,6 +9,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -373,6 +374,45 @@ func TestHandlerBoundsBeforeDiagnostics(t *testing.T) {
 			}
 			if described := d.Certificate != nil; described != tc.describeLeaf {
 				t.Errorf("leaf described %v, want %v", described, tc.describeLeaf)
+			}
+		})
+	}
+}
+
+// TestLogAttrsOmitsClientIssuer: the issuer DN of a presented certificate is
+// client text. A self-signed personal certificate (issuer == subject) must
+// not put the holder's names or document number in the log line.
+func TestLogAttrsOmitsClientIssuer(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	personal := testpki.NewRoot(t, "personal", testpki.CertSpec{Now: w.now, Subject: testpki.Name{
+		testpki.Printable(testpki.OIDCountry, "ES"), testpki.Printable(testpki.OIDSerialNumber, "IDCES-12345678Z"),
+		testpki.UTF8(testpki.OIDGivenName, "JUAN"), testpki.UTF8(testpki.OIDSurname, "GARCÍA LÓPEZ"),
+		testpki.UTF8(testpki.OIDCommonName, "JUAN GARCÍA LÓPEZ - 12345678Z")}}).Cert
+	chain := []*x509.Certificate{personal}
+	for _, tc := range []struct {
+		name   string
+		verify func() (*certcheck.Result, error)
+	}{
+		{"Verify", func() (*certcheck.Result, error) { return w.h.Verify(t.Context(), chain) }},
+		{"VerifyAs", func() (*certcheck.Result, error) { return w.h.VerifyAs(t.Context(), "alpha", chain) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.verify()
+			e := hErr(t, err)
+			if e.Code != certcheck.CodeUntrustedIssuer || e.Diagnostics.Certificate == nil {
+				t.Fatalf("code %s, certificate %v; want %s with the leaf described", e.Code, e.Diagnostics.Certificate, certcheck.CodeUntrustedIssuer)
+			}
+			var buf bytes.Buffer
+			slog.New(slog.NewTextHandler(&buf, nil)).LogAttrs(t.Context(), slog.LevelInfo, "rejected", e.Diagnostics.LogAttrs()...)
+			slog.New(slog.NewJSONHandler(&buf, nil)).LogAttrs(t.Context(), slog.LevelInfo, "rejected", e.Diagnostics.LogAttrs()...)
+			for _, pii := range []string{"JUAN", "GARC", "PEZ", "12345678Z"} {
+				if strings.Contains(buf.String(), pii) {
+					t.Errorf("log lines contain %q:\n%s", pii, buf.String())
+				}
+			}
+			if !strings.Contains(buf.String(), e.Diagnostics.DiagnosticID) {
+				t.Errorf("log lines lack the diagnostic ID:\n%s", buf.String())
 			}
 		})
 	}

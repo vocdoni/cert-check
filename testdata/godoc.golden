@@ -149,9 +149,10 @@ type Diagnostics struct {
 
 func (d Diagnostics) LogAttrs() []slog.Attr
     LogAttrs returns the non-PII fields allowed in logs: id, code, step,
-    provider, candidates (x509 error class only), issuer DN, policy OIDs,
-    revocation host/status/duration, TLS version/cipher. Never subject, names,
-    document, serial, leaf hash, URL paths or technicalDetail.
+    provider, candidates (x509 error class only), policy OIDs, revocation
+    host/status/duration, TLS version/cipher. Never subject, issuer or any other
+    DN the client presented, names, document, serial, leaf hash, URL paths or
+    technicalDetail.
 
 type Document = identity.Document
     Field types owned by internal packages, aliased so that a program can name
