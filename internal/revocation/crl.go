@@ -295,8 +295,28 @@ func ParseCRL(der []byte, issuer *x509.Certificate) (*ParsedCRL, Status, error) 
 		k := SerialKey(entry.SerialNumber)
 		p.Listed[k] = rec
 		p.Cost += crlCostEntry + int64(len(k))
+		// Serials are positive: a negative one is a CA that dropped the
+		// leading zero (02 01 80 for 128), so its unsigned reading is listed too.
+		if entry.SerialNumber.Sign() < 0 {
+			if raw, ok := entrySerial(entry.Raw); ok {
+				k := SerialKey(new(big.Int).SetBytes(raw))
+				p.Listed[k] = rec
+				p.Cost += crlCostEntry + int64(len(k))
+			}
+		}
 	}
 	return p, StatusGood, nil
+}
+
+// entrySerial returns the userCertificate INTEGER content of a
+// revokedCertificates entry.
+func entrySerial(entry []byte) ([]byte, bool) {
+	s := cryptobyte.String(entry)
+	var seq, serial cryptobyte.String
+	if !s.ReadASN1(&seq, cbasn1.SEQUENCE) || !seq.ReadASN1(&serial, cbasn1.INTEGER) {
+		return nil, false
+	}
+	return serial, true
 }
 
 // checkCRLSignature authenticates der before x509.ParseRevocationList
