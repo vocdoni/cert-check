@@ -289,7 +289,8 @@ func (a Adapter) Extract(cert *x509.Certificate) (Extracted, error) {
 		if err != nil {
 			return Extracted{}, err
 		}
-		out.Organization = &Organization{Name: NormalizeName(name), Identifier: strings.TrimSpace(ident)}
+		ident = NormalizeName(ident)
+		out.Organization = &Organization{Name: NormalizeName(name), Identifier: ident}
 		src["organization"] = "subject.2.5.4.10"
 		if ident != "" {
 			src["organizationIdentifier"] = "subject.2.5.4.97"

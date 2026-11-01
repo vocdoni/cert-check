@@ -388,6 +388,14 @@ func adapterCases(tb testing.TB) []adapterCase {
 		{name: "fnmt-representative without organizationIdentifier", adapter: shapeFNMTRepresentative(),
 			spec: testpki.CertSpec{Subject: with(person(idces, gn, sn), rdnO("EMPRESA EJEMPLO SL")), SANDirNames: san(fnmtDir(idces, gn, sn1, sn2))},
 			want: withOrg(fnmtIdentity(dniDoc(num, idces), gn, sn, sn1, sn2), &identity.Organization{Name: "EMPRESA EJEMPLO SL"})},
+		// R5.5 (U7-FABLE-4): the identifier is normalised like every other
+		// string, and a blank one records no source.
+		{name: "fnmt-representative blank organizationIdentifier", adapter: shapeFNMTRepresentative(),
+			spec: testpki.CertSpec{Subject: with(person(idces, gn, sn), rdnO("EMPRESA EJEMPLO SL"), rdnOrgID("   ")), SANDirNames: san(fnmtDir(idces, gn, sn1, sn2))},
+			want: withOrg(fnmtIdentity(dniDoc(num, idces), gn, sn, sn1, sn2), &identity.Organization{Name: "EMPRESA EJEMPLO SL"})},
+		{name: "fnmt-representative organizationIdentifier inner spaces", adapter: shapeFNMTRepresentative(),
+			spec: testpki.CertSpec{Subject: with(person(idces, gn, sn), rdnO("EMPRESA EJEMPLO SL"), rdnOrgID(" VATES-B00000000  X ")), SANDirNames: san(fnmtDir(idces, gn, sn1, sn2))},
+			want: withOrg(fnmtIdentity(dniDoc(num, idces), gn, sn, sn1, sn2), &identity.Organization{Name: "EMPRESA EJEMPLO SL", Identifier: "VATES-B00000000 X"})},
 		{name: "fnmt-representative O missing", adapter: shapeFNMTRepresentative(),
 			spec:    testpki.CertSpec{Subject: with(person(idces, gn, sn), rdnOrgID("VATES-B00000000")), SANDirNames: san(fnmtDir(idces, gn, sn1, sn2))},
 			wantErr: invalid},
