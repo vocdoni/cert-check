@@ -160,10 +160,8 @@ func loadProfile(p Profile, files fs.FS, now time.Time, log *slog.Logger) (*Enab
 		e.Anchors = append(e.Anchors, c)
 		e.Roots.AddCert(c)
 	}
-	if len(e.Anchors) == 0 {
-		log.Warn("profile disabled: no valid anchor", "profile", p.ID)
-		return nil, nil
-	}
+	// Intermediates are pinned and signature-checked even when no anchor is
+	// valid, so a misdeclared one fails whatever the load date.
 	for _, a := range p.Intermediates {
 		c, err := loadAnchor(a, files)
 		if err != nil {
@@ -183,6 +181,10 @@ func loadProfile(p Profile, files fs.FS, now time.Time, log *slog.Logger) (*Enab
 		}
 		e.Intermediates = append(e.Intermediates, c)
 		e.Inter.AddCert(c)
+	}
+	if len(e.Anchors) == 0 {
+		log.Warn("profile disabled: no valid anchor", "profile", p.ID)
+		return nil, nil
 	}
 	if len(p.Intermediates) > 0 && len(e.Intermediates) == 0 {
 		log.Warn("profile disabled: no valid pinned intermediate", "profile", p.ID)

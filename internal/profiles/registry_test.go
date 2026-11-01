@@ -167,6 +167,7 @@ func TestRegistryErrors(t *testing.T) {
 	interB := rootB.Intermediate(t, "inter B", testpki.CertSpec{Now: now})
 	// crossA is a cross-certificate: rootA's subject and key, issued by rootB.
 	crossA := rootB.Intermediate(t, "root A", testpki.CertSpec{Now: now, KeyPair: rootA.Key})
+	expiredRoot := testpki.NewRoot(t, "expired root", testpki.CertSpec{Now: now, NotBefore: now.AddDate(-3, 0, 0), NotAfter: now.AddDate(0, 0, -1)})
 	leaf := rootA.Leaf(t, testpki.CertSpec{Now: now, Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, "leaf")}})
 
 	a, b, a2 := profiles.TestAnchor(rootA.Cert), profiles.TestAnchor(rootB.Cert), profiles.TestAnchor(rootA2.Cert)
@@ -272,6 +273,9 @@ func TestRegistryErrors(t *testing.T) {
 			{OID: identity.OIDGivenName, Value: "NOMDOS"}, {OID: identity.OIDSurname, Value: " \t"}}, Source: "x"}), wantErr: "test marker attribute needs an OID and a value"},
 		{name: "marker without Source", cfg: marker(profiles.TestMarker{SHA256: a.SHA256}), wantErr: "test marker without Source"},
 		{name: "intermediate not signed by an anchor", cfg: one(func(p *profiles.Profile) { p.Intermediates = []profiles.Anchor{profiles.TestAnchor(interB.Cert)} }), wantErr: "is not signed by a profile anchor"},
+		{name: "all anchors expired, intermediate signed by an undeclared key", cfg: one(func(p *profiles.Profile) {
+			p.Anchors, p.Intermediates = []profiles.Anchor{profiles.TestAnchor(expiredRoot.Cert)}, []profiles.Anchor{profiles.TestAnchor(interB.Cert)}
+		}), wantErr: "is not signed by a profile anchor"},
 		{name: "intermediate pin mismatch", cfg: one(func(p *profiles.Profile) {
 			in := profiles.TestAnchor(interB.Cert)
 			in.SPKISHA256 = a.SPKISHA256
@@ -339,6 +343,8 @@ func TestValidityDisables(t *testing.T) {
 		wantLog       []string
 	}{
 		{name: "all anchors expired", anchors: []*testpki.CA{dead},
+			wantLog: []string{"anchor outside validity", "profile disabled: no valid anchor", "provider hidden"}},
+		{name: "all anchors expired, intermediate signed by one", anchors: []*testpki.CA{dead}, intermediates: []*testpki.CA{orphanInter},
 			wantLog: []string{"anchor outside validity", "profile disabled: no valid anchor", "provider hidden"}},
 		{name: "anchor not yet valid", anchors: []*testpki.CA{early},
 			wantLog: []string{"anchor outside validity", "profile disabled: no valid anchor", "provider hidden"}},
