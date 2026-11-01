@@ -1073,22 +1073,24 @@ func TestCheckCAScopeUnsupportedARLCannotYieldGood(t *testing.T) {
 	)
 	arlIDP := func(s testpki.IDPSpec) *testpki.IDPSpec { s.URIs = []string{arlURL}; return &s }
 	cases := []struct {
-		name       string
-		arl        testpki.CRLSpec
-		crlNoIDP   bool // CRL.crl also served without an IDP
-		wantStatus Status
-		wantARL    Status
+		name          string
+		arl           testpki.CRLSpec
+		crlNoIDP      bool // CRL.crl also served without an IDP
+		arlNotAllowed bool // arl.test missing from CRLHosts: the ARL DP is never fetched
+		wantStatus    Status
+		wantARL       Status
 	}{
 		{"delta crl", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true}),
-			ExtraExtensions: []pkix.Extension{{Id: oidExtDeltaCRLIndicator, Critical: true, Value: []byte{0x02, 0x01, 0x01}}}}, false, StatusUnavailable, StatusUnsupportedMethod},
+			ExtraExtensions: []pkix.Extension{{Id: oidExtDeltaCRLIndicator, Critical: true, Value: []byte{0x02, 0x01, 0x01}}}}, false, false, StatusUnavailable, StatusUnsupportedMethod},
 		{"unknown critical extension", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true}),
-			ExtraExtensions: []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 9}, Critical: true, Value: []byte{0x05, 0x00}}}}, false, StatusUnavailable, StatusUnsupportedMethod},
-		{"user-only crl naming the arl", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyUser: true})}, false, StatusUnavailable, StatusUnsupportedMethod},
-		{"user-only crl naming CRL.crl", testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{crlURL}, OnlyUser: true}}, false, StatusInvalidEvidence, StatusInvalidEvidence},
-		{"partial reasons", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true, OnlySomeReasons: true})}, false, StatusUnavailable, StatusUnsupportedMethod},
-		{"empty crl without an idp", testpki.CRLSpec{}, false, StatusUnavailable, StatusUnsupportedMethod},
-		{"idp without a name", testpki.CRLSpec{IDP: &testpki.IDPSpec{OnlyCA: true}}, false, StatusUnavailable, StatusUnsupportedMethod},
-		{"unscoped crl at both urls", testpki.CRLSpec{}, true, StatusUnavailable, StatusUnsupportedMethod},
+			ExtraExtensions: []pkix.Extension{{Id: asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 99999, 9}, Critical: true, Value: []byte{0x05, 0x00}}}}, false, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"user-only crl naming the arl", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyUser: true})}, false, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"user-only crl naming CRL.crl", testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{crlURL}, OnlyUser: true}}, false, false, StatusInvalidEvidence, StatusInvalidEvidence},
+		{"partial reasons", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true, OnlySomeReasons: true})}, false, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"empty crl without an idp", testpki.CRLSpec{}, false, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"idp without a name", testpki.CRLSpec{IDP: &testpki.IDPSpec{OnlyCA: true}}, false, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"unscoped crl at both urls", testpki.CRLSpec{}, true, false, StatusUnavailable, StatusUnsupportedMethod},
+		{"arl host not allowlisted", testpki.CRLSpec{IDP: arlIDP(testpki.IDPSpec{OnlyCA: true})}, false, true, StatusUnavailable, StatusUnsupportedMethod},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1100,15 +1102,24 @@ func TestCheckCAScopeUnsupportedARLCannotYieldGood(t *testing.T) {
 				crlSpec = testpki.CRLSpec{}
 			}
 			f.serve(t, "crl.test", f.crl(t, crlSpec))
-			f.serve(t, "arl.test", f.crl(t, tc.arl))
+			arlHits := f.serve(t, "arl.test", f.crl(t, tc.arl))
 			p := Policy{CRLHosts: []string{"crl.test", "arl.test"}, AllowCRL: true}
+			wantURL, wantDetail := arlURL, ""
+			if tc.arlNotAllowed {
+				p.CRLHosts = []string{"crl.test"}
+				wantURL, wantDetail = "", "no allowlisted CDP URL for a CA distribution point"
+			}
 			res := chkTCheck(t, f.checker(t, Options{}), cert, f.ca.Cert, p)
 
 			if res.Status != tc.wantStatus || res.Method != "" {
 				t.Fatalf("Check = %s via %q %s, want %s", res.Status, res.Method, chkTTrace(res.Attempts), tc.wantStatus)
 			}
-			if a := res.Attempts[len(res.Attempts)-1]; a.URL != arlURL || a.Outcome != tc.wantARL {
-				t.Errorf("last attempt = %q %s, want %q %s", a.URL, a.Outcome, arlURL, tc.wantARL)
+			a := res.Attempts[len(res.Attempts)-1]
+			if a.URL != wantURL || a.Outcome != tc.wantARL || (wantDetail != "" && a.Detail != wantDetail) {
+				t.Errorf("last attempt = %q %s %q, want %q %s", a.URL, a.Outcome, a.Detail, wantURL, tc.wantARL)
+			}
+			if tc.arlNotAllowed && arlHits.Load() != 0 {
+				t.Errorf("arl.test requests = %d, want 0 (not allowlisted)", arlHits.Load())
 			}
 		})
 	}
