@@ -5,6 +5,7 @@ import (
 	"encoding/asn1"
 	"errors"
 	"strings"
+	"unicode"
 )
 
 // Subject attribute OIDs used by adapters.
@@ -220,6 +221,11 @@ func (a Adapter) Extract(cert *x509.Certificate) (Extracted, error) {
 	if err := a.crossCheckSAN(cert, &id, kinds); err != nil {
 		return Extracted{}, err
 	}
+	for _, s := range []string{id.FirstSurname, id.SecondSurname} {
+		if s != "" && !hasLetter(s) {
+			return Extracted{}, invalidf("surname without a letter")
+		}
+	}
 
 	out := Extracted{}
 	switch a.BirthDate {
@@ -268,11 +274,15 @@ func requiredName(n Name, oid asn1.ObjectIdentifier, kinds KindSet) (string, err
 		return "", err
 	}
 	v = NormalizeName(v)
-	if !ok || v == "" {
-		return "", invalidf("subject %s absent or empty", oid)
+	if !ok || !hasLetter(v) {
+		return "", invalidf("subject %s absent, empty or without a letter", oid)
 	}
 	return v, nil
 }
+
+// hasLetter reports whether s holds a letter. checkText has already rejected
+// the invisible ones (the Hangul fillers), so the letter is visible (R5.1).
+func hasLetter(s string) bool { return strings.IndexFunc(s, unicode.IsLetter) >= 0 }
 
 // dnieSurnames applies the DNIe CN grammar against the known SN and GN.
 func dnieSurnames(cn, sn, given string) (string, error) {

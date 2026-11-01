@@ -552,6 +552,29 @@ func adapterCases(tb testing.TB) []adapterCase {
 			spec: testpki.CertSpec{Subject: person(idces, "MARÍA ÀNGELS", "D'ARBÓS-GÜELL COL·L PEÑA"),
 				SANDirNames: san(fnmtDir(num, "MARÍA ÀNGELS", "D'ARBÓS-GÜELL", "COL·L PEÑA"))},
 			want: ext(fnmtIdentity(dniDoc(num, idces), "MARÍA ÀNGELS", "D'ARBÓS-GÜELL COL·L PEÑA", "D'ARBÓS-GÜELL", "COL·L PEÑA"))},
+		{name: "fnmt-rsa decomposed Catalan names in the SAN", adapter: rsa,
+			spec: testpki.CertSpec{Subject: person(idces, "NÚRIA", "ÇALÓ COL·L"),
+				SANDirNames: san(fnmtDir(num, "NU\u0301RIA", "C\u0327ALO\u0301", "COL·L"))},
+			want: ext(fnmtIdentity(dniDoc(num, idces), "NÚRIA", "ÇALÓ COL·L", "ÇALÓ", "COL·L"))},
+
+		// R5.1 (U6-ASTRA-1): a name needs a letter, and a long combining run
+		// is rejected on both paths.
+		{name: "plain subject GN invisible only", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, "\u034f", sn)}, wantErr: invalid},
+		{name: "plain subject GN a lone combining mark", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, "\u0301", sn)}, wantErr: invalid},
+		{name: "plain subject SN punctuation only", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, gn, "- ·")}, wantErr: invalid},
+		{name: "plain subject SN long combining run", adapter: shapePlain(),
+			spec: testpki.CertSpec{Subject: person(idces, gn, "GARCI"+strings.Repeat("\u0301", 5)+"A LOPEZ")}, wantErr: invalid},
+		{name: "fnmt-rsa SAN first surname without a letter", adapter: rsa,
+			spec: testpki.CertSpec{Subject: person(idces, gn, "- "+sn2), SANDirNames: san(fnmtDir(num, gn, "-", sn2))}, wantErr: invalid},
+		{name: "fnmt-rsa SAN second surname without a letter", adapter: rsa,
+			spec: testpki.CertSpec{Subject: person(idces, gn, sn1+" -"), SANDirNames: san(fnmtDir(num, gn, sn1, "-"))}, wantErr: invalid},
+		{name: "dnie CN second surname without a letter", adapter: shapeDNIe(),
+			spec: testpki.CertSpec{Subject: dnieSubject(num, "GARCÍA -, JOSÉ (AUTENTICACIÓN)")}, wantErr: invalid},
+		{name: "fnmt-rsa SAN first surname long combining run", adapter: rsa,
+			spec: testpki.CertSpec{Subject: person(idces, gn, sn), SANDirNames: san(fnmtDir(num, gn, "GARCI"+strings.Repeat("\u0301", 5)+"A", sn2))}, wantErr: invalid},
 	}
 	// R53: each rejected class, in a subject attribute and in a SAN
 	// dirName attribute. NBSP and the other spaces matter most here: before
