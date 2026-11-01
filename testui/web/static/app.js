@@ -6,6 +6,8 @@
   const PENDING_KEY = 'certcheck.pending';
   const VERSION_KEY = 'certcheck.serverVersion';
   const PENDING_MAX_AGE_MS = 5 * 60 * 1000;
+  // One deadline for an API call, request and body read together. The server's write timeout is 30 s.
+  const API_TIMEOUT_MS = 20 * 1000;
   const REPORT_TITLE = 'Vocdoni Certificate Authentication Checker - diagnostic report';
   const NEVER_REACHED_RESULT = 'Result: authentication step never reached the server';
 
@@ -23,6 +25,7 @@
     invalid_or_expired: 'This authentication link is no longer valid. Please start again.',
     never_reached: 'The authentication step never reached our server.',
     network_error: 'We could not reach the server. Check your connection and try again.',
+    timeout: 'The server took too long to answer.',
     bad_response: 'The server sent a reply this page could not understand.',
     generic: 'Something went wrong.',
   };
@@ -58,6 +61,7 @@
     rate_limited: TEMPORARY,
     store_full: TEMPORARY,
     network_error: TEMPORARY,
+    timeout: TEMPORARY,
     revocation_unknown: ['The issuer does not recognise this certificate. Contact the organization that issued it.'],
     identity_invalid: ['The identity data in this certificate could not be read in a supported form. Try another certificate.'],
     identity_unsupported_document: ['This certificate identifies its holder with a document other than a Spanish DNI or NIE. Try another certificate.'],
@@ -87,6 +91,12 @@
 
   function str(value) {
     return value === undefined || value === null ? '' : String(value);
+  }
+
+  // Own-property lookup for the code tables. A code comes from the URL fragment or the API, so a
+  // plain table[code] would answer "__proto__" or "constructor" with Object.prototype or Object.
+  function lookup(table, key) {
+    return Object.hasOwn(table, key) ? table[key] : undefined;
   }
 
   function list(values) {
@@ -165,20 +175,93 @@
     }
   }
 
+  // Rejects with a TimeoutError when the server does not finish its reply in API_TIMEOUT_MS. Nothing
+  // here retries: a redemption code is single use, so the user starts again instead.
   async function api(method, path, body) {
-    const init = { method, credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' } };
+    const deadline = new AbortController();
+    const init = {
+      method, credentials: 'same-origin', cache: 'no-store', headers: { Accept: 'application/json' }, signal: deadline.signal,
+    };
     if (body !== undefined) {
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
-    const res = await fetch(path, init);
-    let json = null;
+    const timer = setTimeout(() => deadline.abort(new DOMException('API deadline exceeded', 'TimeoutError')), API_TIMEOUT_MS);
     try {
-      json = await res.json();
-    } catch (e) {
-      // The body is not JSON; callers treat a null body as a bad reply.
+      const res = await fetch(path, init);
+      // A stalled or failed body read rejects here, under the same deadline.
+      const text = await res.text();
+      let json = null;
+      try {
+        json = JSON.parse(text);
+      } catch (e) {
+        // The body is not JSON; callers treat a null body as a bad reply.
+      }
+      return { status: res.status, body: json };
+    } finally {
+      clearTimeout(timer);
     }
-    return { status: res.status, body: json };
+  }
+
+  // The error code for a request that produced no reply: the deadline, or the network.
+  function failureCode(e) {
+    return e && e.name === 'TimeoutError' ? 'timeout' : 'network_error';
+  }
+
+  // ---------- reply validation ----------
+
+  // These check the shapes the renderers read. A reply that fails them is shown as bad_response.
+
+  function isObject(v) {
+    return v !== null && typeof v === 'object' && !Array.isArray(v);
+  }
+
+  // null and undefined both stand for an absent member (Go marshals a nil pointer or slice as null).
+  function isOptionalObject(v) {
+    return v === undefined || v === null || isObject(v);
+  }
+
+  function isOptionalObjectList(v) {
+    return v === undefined || v === null || (Array.isArray(v) && v.every(isObject));
+  }
+
+  function isApiError(e) {
+    return isObject(e) && [e.code, e.message].every((v) => v === undefined || typeof v === 'string');
+  }
+
+  function isDiagnostics(d) {
+    return d === undefined || d === null || (isObject(d) &&
+      ['tls', 'certificate'].every((key) => isOptionalObject(d[key])) &&
+      ['chain', 'profileCandidates', 'revocationAttempts'].every((key) => isOptionalObjectList(d[key])));
+  }
+
+  function isRedeemReply(body) {
+    if (!isObject(body)) {
+      return false;
+    }
+    if (body.status === 'success') {
+      const r = body.result;
+      return isObject(r) && isDiagnostics(r.diagnostics) &&
+        ['provider', 'profile', 'identity', 'organization', 'certificate', 'revocation'].every((key) => isOptionalObject(r[key]));
+    }
+    return body.status === 'error' && isApiError(body.error) && isDiagnostics(body.diagnostics);
+  }
+
+  function isProviderList(providers) {
+    return Array.isArray(providers) && providers.length > 0 &&
+      providers.every((p) => isObject(p) && typeof p.id === 'string' && typeof p.name === 'string');
+  }
+
+  // Runs an async entry point. Whatever it throws ends in the bad_response view, so a reply that
+  // breaks a renderer cannot leave the page on a view that never resolves.
+  function guard(fn) {
+    return async (...args) => {
+      try {
+        await fn(...args);
+      } catch (e) {
+        showClientError({ code: 'bad_response' });
+      }
+    };
   }
 
   // ---------- views ----------
@@ -246,7 +329,7 @@
     $('authenticate').disabled = true;
     try {
       const reply = await api('GET', '/api/v1/providers');
-      if (reply.status !== 200 || !Array.isArray(reply.body) || reply.body.length === 0) {
+      if (reply.status !== 200 || !isProviderList(reply.body)) {
         throw new Error('bad providers reply');
       }
       fillProviders(reply.body);
@@ -297,7 +380,7 @@
     try {
       reply = await api('POST', '/api/v1/transactions', { provider });
     } catch (e) {
-      showClientError({ code: 'network_error', provider });
+      showClientError({ code: failureCode(e), provider });
       return;
     }
     const body = reply.body;
@@ -319,7 +402,7 @@
       showClientError({ code: 'bad_response', provider });
       return;
     }
-    if (body && body.status === 'error' && body.error) {
+    if (isObject(body) && body.status === 'error' && isApiError(body.error)) {
       showClientError({ code: str(body.error.code) || 'generic', message: str(body.error.message), provider });
       return;
     }
@@ -488,7 +571,7 @@
   }
 
   function guidanceFor(code, port) {
-    const g = GUIDANCE[code];
+    const g = lookup(GUIDANCE, code);
     if (typeof g === 'function') {
       return g(port);
     }
@@ -498,7 +581,7 @@
   // An error the server reported. Full diagnostics, when present, drive the report.
   function showServerError(error, diagnostics, entry) {
     const code = str(error.code) || 'generic';
-    const message = str(error.message) || CLIENT_MESSAGES[code] || CLIENT_MESSAGES.generic;
+    const message = str(error.message) || lookup(CLIENT_MESSAGES, code) || CLIENT_MESSAGES.generic;
     rememberVersion(diagnostics);
     let report;
     if (diagnostics) {
@@ -515,7 +598,7 @@
   function showClientError(opts) {
     const code = opts.code;
     const entry = opts.entry || null;
-    const message = opts.message || CLIENT_MESSAGES[code] || CLIENT_MESSAGES.generic;
+    const message = opts.message || lookup(CLIENT_MESSAGES, code) || CLIENT_MESSAGES.generic;
     let attempt = [];
     if (entry) {
       attempt = attemptLines(entry);
@@ -557,21 +640,21 @@
       reply = await api('POST', '/api/v1/transactions/redeem', { code });
     } catch (e) {
       clearPending();
-      showClientError({ code: 'network_error', entry });
+      showClientError({ code: failureCode(e), entry });
       return;
     }
     clearPending();
     const body = reply.body;
-    if (body && body.status === 'success' && body.result) {
+    if (!isRedeemReply(body)) {
+      showClientError({ code: 'bad_response', entry });
+      return;
+    }
+    if (body.status === 'success') {
       rememberVersion(body.result.diagnostics);
       showSuccess(body.result);
       return;
     }
-    if (body && body.status === 'error' && body.error) {
-      showServerError(body.error, body.diagnostics, entry);
-      return;
-    }
-    showClientError({ code: 'bad_response', entry });
+    showServerError(body.error, body.diagnostics, entry);
   }
 
   function showHashError(code, diag, entry) {
@@ -633,17 +716,19 @@
   }
 
   $('provider').addEventListener('change', updateHint);
-  $('authenticate').addEventListener('click', authenticate);
+  $('authenticate').addEventListener('click', guard(authenticate));
   $('again').addEventListener('click', showStart);
   $('retry').addEventListener('click', showStart);
   $('copy-report').addEventListener('click', copyReport);
 
+  const guardedInit = guard(init);
+
   // A page restored from the back/forward cache keeps its old state; run the load logic again.
   window.addEventListener('pageshow', (event) => {
     if (event.persisted) {
-      init();
+      guardedInit();
     }
   });
 
-  init();
+  guardedInit();
 })();

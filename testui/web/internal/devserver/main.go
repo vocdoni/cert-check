@@ -84,10 +84,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	srv := &http.Server{
-		Handler:           newHandler(root, port),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	srv := newServer(newHandler(root, port))
 
 	slog.Info("devserver listening", "url", "http://"+ln.Addr().String(), "fixtures", *fixturesDir)
 	var wg sync.WaitGroup
@@ -104,6 +101,18 @@ func run() error {
 	err = srv.Shutdown(shutdownCtx)
 	wg.Wait()
 	return err
+}
+
+// newServer wraps h in an http.Server. The mock only serves small bodies on loopback, so every
+// phase gets a short deadline and a stalled client cannot hold a connection open.
+func newServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 }
 
 type mock struct {
