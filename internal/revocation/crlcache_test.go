@@ -1,10 +1,12 @@
 package revocation
 
 import (
+	"container/list"
 	"context"
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math/big"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -49,7 +51,7 @@ func (f *crlTFetcher) fetch(ctx context.Context) crlLoad {
 	if f.err != nil {
 		return crlLoad{status: StatusUnavailable, err: f.err, attempt: at}
 	}
-	return crlLoad{crl: f.p, status: StatusGood, attempt: at}
+	return crlLoad{crl: f.p, status: StatusGood, attempt: at, admit: true}
 }
 
 func TestCRLCache(t *testing.T) {
@@ -244,7 +246,7 @@ func TestCRLCache(t *testing.T) {
 			case <-ctx.Done():
 			}
 			fetchCtxErr <- ctx.Err()
-			return crlLoad{crl: p, status: StatusGood}
+			return crlLoad{crl: p, status: StatusGood, admit: true}
 		}
 		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
@@ -305,6 +307,62 @@ func TestCRLCache(t *testing.T) {
 		}
 		if r := c.load(t.Context(), ka, now, timeout, fb.fetch); r.crl != fa.p || !r.attempt.FromCache {
 			t.Errorf("load for issuer a = %p (fromCache %v), want issuer a's cached CRL", r.crl, r.attempt.FromCache)
+		}
+	})
+}
+
+func TestCRLCacheMarks(t *testing.T) {
+	now := crlTNow
+	numbered := func(n int64) *ParsedCRL {
+		p := crlTParsed(100, now.Add(24*time.Hour))
+		p.Number = big.NewInt(n)
+		return p
+	}
+	fetchOf := func(p *ParsedCRL) func(context.Context) crlLoad {
+		return func(context.Context) crlLoad { return crlLoad{crl: p, status: StatusGood, admit: true} }
+	}
+
+	t.Run("not admitted is not marked", func(t *testing.T) {
+		c := newCRLCache(DefaultCRLCacheBytes)
+		c.load(t.Context(), "k", now, time.Second, func(context.Context) crlLoad {
+			return crlLoad{crl: numbered(9), status: StatusGood}
+		})
+		if r := c.load(t.Context(), "k", now, time.Second, fetchOf(numbered(3))); r.err != nil {
+			t.Errorf("load after an unadmitted CRL 9 = %v, want CRL 3 accepted", r.err)
+		}
+	})
+
+	t.Run("without a number", func(t *testing.T) {
+		c := newCRLCache(DefaultCRLCacheBytes)
+		c.load(t.Context(), "k", now, time.Second, fetchOf(numbered(5)))
+		c.removeLocked(c.items["k"])
+		if r := c.load(t.Context(), "k", now, time.Second, fetchOf(crlTParsed(100, now.Add(time.Hour)))); r.err != nil {
+			t.Errorf("load of a CRL without a number = %v, want accepted", r.err)
+		}
+	})
+
+	t.Run("bounded, oldest evicted", func(t *testing.T) {
+		c := newCRLCache(DefaultCRLCacheBytes)
+		for i := range crlMaxMarks + 1 {
+			c.load(t.Context(), fmt.Sprint(i), now, time.Second, fetchOf(numbered(10)))
+		}
+		if len(c.marks) != crlMaxMarks || c.markList.Len() != crlMaxMarks {
+			t.Fatalf("marks = %d (list %d), want %d", len(c.marks), c.markList.Len(), crlMaxMarks)
+		}
+		for _, k := range []struct {
+			key  string
+			want bool
+		}{{"1", true}, {fmt.Sprint(crlMaxMarks), true}, {"0", false}} { // "0" last: marking it evicts "1"
+			key, want := k.key, k.want
+			c.mu.Lock()
+			c.items = map[string]*list.Element{}
+			c.lru.Init()
+			c.cost = 0
+			c.mu.Unlock()
+			r := c.load(t.Context(), key, now, time.Second, fetchOf(numbered(9)))
+			if rolledBack := errors.Is(r.err, errCRLRollback); rolledBack != want {
+				t.Errorf("key %s: CRL 9 after CRL 10 rolled back = %v, want %v", key, rolledBack, want)
+			}
 		}
 	})
 }

@@ -283,7 +283,8 @@ func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Cert
 			return crlLoad{status: st, err: err, attempt: at}
 		}
 		parsed.URL = u
-		return crlLoad{crl: parsed, status: StatusGood, attempt: at}
+		applies, _ := crlApplies(parsed, dp, now)
+		return crlLoad{crl: parsed, status: StatusGood, attempt: at, admit: applies == StatusGood}
 	})
 	at := load.attempt
 	if at.URL == "" {

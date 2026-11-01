@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
+	"errors"
+	"math/big"
 	"sync"
 	"time"
 
@@ -16,7 +18,10 @@ import (
 const (
 	DefaultCRLCacheBytes = 128 << 20
 	crlCacheMaxAge       = time.Hour
+	crlMaxMarks          = 4096
 )
+
+var errCRLRollback = errors.New("crl number rolled back")
 
 func issuerKey(issuer *x509.Certificate) string {
 	s := sha256.Sum256(issuer.Raw)
@@ -27,6 +32,8 @@ func issuerKey(issuer *x509.Certificate) string {
 // min(nextUpdate, fetched+1h). Each costs ParsedCRL.Cost; the least
 // recently used entries are evicted past the bound. Fetch+parse run once per
 // key under singleflight, detached from any single caller's cancellation.
+// The highest CRL number seen per key outlives the entries, so a replayed
+// older CRL is rejected after the newer one expired from the cache.
 type crlCache struct {
 	mu    sync.Mutex
 	items map[string]*list.Element
@@ -34,6 +41,15 @@ type crlCache struct {
 	cost  int64
 	limit int64
 	sf    singleflight.Group
+
+	marks    map[string]*list.Element // key -> *crlMark; outlives items
+	markList *list.List
+}
+
+// crlMark is the highest CRL number admitted for a key.
+type crlMark struct {
+	key    string
+	number *big.Int
 }
 
 type crlItem struct {
@@ -44,7 +60,8 @@ type crlItem struct {
 }
 
 func newCRLCache(limit int64) *crlCache {
-	return &crlCache{items: make(map[string]*list.Element), lru: list.New(), limit: limit}
+	return &crlCache{items: make(map[string]*list.Element), lru: list.New(), limit: limit,
+		marks: make(map[string]*list.Element), markList: list.New()}
 }
 
 func (c *crlCache) get(key string, now time.Time) (*ParsedCRL, bool) {
@@ -91,14 +108,44 @@ func (c *crlCache) removeLocked(el *list.Element) {
 	c.cost -= it.cost
 }
 
+// raiseMark makes number the high-water mark of key, unless it is below the
+// mark (a rolled-back CRL); a CRL without a number leaves the mark alone.
+// The least recently raised marks are evicted past crlMaxMarks.
+func (c *crlCache) raiseMark(key string, number *big.Int) bool {
+	if number == nil {
+		return true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.marks[key]; ok {
+		m := el.Value.(*crlMark)
+		if number.Cmp(m.number) < 0 {
+			return false
+		}
+		m.number = number
+		c.markList.MoveToFront(el)
+		return true
+	}
+	c.marks[key] = c.markList.PushFront(&crlMark{key: key, number: number})
+	if c.markList.Len() > crlMaxMarks {
+		back := c.markList.Back()
+		c.markList.Remove(back)
+		delete(c.marks, back.Value.(*crlMark).key)
+	}
+	return true
+}
+
 type crlLoad struct {
 	crl     *ParsedCRL
 	status  Status
 	attempt Attempt
 	err     error
+	admit   bool // crl is fresh and issued for the DP of its URL: it may be cached
 }
 
 // load returns the cached CRL or fetches it once for all concurrent callers.
+// Only an admitted CRL is cached and raises the CRL-number mark of key; one
+// numbered below the mark is invalid evidence.
 func (c *crlCache) load(ctx context.Context, key string, now time.Time, timeout time.Duration, fetch func(context.Context) crlLoad) crlLoad {
 	if p, ok := c.get(key, now); ok {
 		return crlLoad{crl: p, status: StatusGood, attempt: Attempt{Method: MethodCRL, URL: p.URL, FromCache: true}}
@@ -107,7 +154,10 @@ func (c *crlCache) load(ctx context.Context, key string, now time.Time, timeout 
 		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
 		res := fetch(fctx)
-		if res.err == nil && res.crl != nil {
+		if res.err == nil && res.crl != nil && res.admit {
+			if !c.raiseMark(key, res.crl.Number) {
+				return crlLoad{status: StatusInvalidEvidence, err: errCRLRollback, attempt: res.attempt}, nil
+			}
 			c.put(key, res.crl, now)
 		}
 		return res, nil

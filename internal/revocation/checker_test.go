@@ -718,6 +718,96 @@ func TestCheckPrivateIPBlocked(t *testing.T) {
 	}
 }
 
+// chkTSwitch serves whatever CRL was last set.
+type chkTSwitch struct{ body atomic.Pointer[[]byte] }
+
+func (s *chkTSwitch) set(der []byte) { s.body.Store(&der) }
+
+func (s *chkTSwitch) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	testpki.Bytes("application/pkix-crl", *s.body.Load()).ServeHTTP(w, r)
+}
+
+// TestCheckCRLCacheAdmission: a CRL that is not fresh or names another DP is
+// rejected and not cached, so the right CRL is fetched on the next check.
+func TestCheckCRLCacheAdmission(t *testing.T) {
+	cases := []struct {
+		name  string
+		first func(f *chkTFixture) testpki.CRLSpec
+		want  Status
+	}{
+		{"wrong partition", func(*chkTFixture) testpki.CRLSpec {
+			return testpki.CRLSpec{IDP: &testpki.IDPSpec{URIs: []string{"http://crl.test/b.crl"}, OnlyUser: true}}
+		}, StatusInvalidEvidence},
+		{"this update in the future", func(f *chkTFixture) testpki.CRLSpec {
+			return testpki.CRLSpec{ThisUpdate: f.base.Add(10 * time.Minute)}
+		}, StatusStale},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := chkTNewFixture(t)
+			sw := &chkTSwitch{}
+			first := tc.first(f)
+			first.Now = f.base
+			sw.set(f.ca.CRL(t, first))
+			hits := f.serve(t, chkTCRLHost, sw)
+			leaf := f.leaf(t, nil, []string{chkTCRLURL})
+			c := f.checker(t, Options{})
+			if res := chkTCheck(t, c, leaf, f.ca.Cert, chkTPolicy()); res.Status != tc.want {
+				t.Fatalf("first Check = %s %s, want %s", res.Status, chkTTrace(res.Attempts), tc.want)
+			}
+			sw.set(f.ca.CRL(t, testpki.CRLSpec{Now: f.base, IDP: &testpki.IDPSpec{URIs: []string{chkTCRLURL}, OnlyUser: true}}))
+			if res := chkTCheck(t, c, leaf, f.ca.Cert, chkTPolicy()); res.Status != StatusGood || res.Method != MethodCRL {
+				t.Fatalf("second Check = %s via %q %s, want good via crl", res.Status, res.Method, chkTTrace(res.Attempts))
+			}
+			if got := hits.Load(); got != 2 {
+				t.Errorf("CRL requests = %d, want 2 (the first CRL not cached)", got)
+			}
+		})
+	}
+}
+
+// TestCRLRollbackRejected: once a CRL number is seen for an (issuer, URL), a
+// lower one is invalid evidence, also after the cached CRL expired.
+func TestCRLRollbackRejected(t *testing.T) {
+	f := chkTNewFixture(t)
+	sw := &chkTSwitch{}
+	hits := f.serve(t, chkTCRLHost, sw)
+	leaf := f.leaf(t, nil, []string{chkTCRLURL})
+	c := f.checker(t, Options{})
+	listed := []testpki.CRLEntry{{Serial: leaf.SerialNumber, RevokedAt: f.base.Add(-time.Hour), Reason: 1}}
+	steps := []struct {
+		name   string
+		number int64
+		listed bool
+		want   Status
+	}{
+		{"crl 44 lists the leaf", 44, true, StatusRevoked},
+		{"crl 43 replayed", 43, false, StatusInvalidEvidence},
+		{"crl 44 again", 44, true, StatusRevoked},
+		{"crl 45", 45, false, StatusGood},
+		{"crl 44 replayed", 44, true, StatusInvalidEvidence},
+	}
+	for i, s := range steps {
+		now := f.base.Add(time.Duration(i) * 61 * time.Minute) // past the cache's one hour
+		f.clock.Set(now)
+		spec := testpki.CRLSpec{Now: now, Number: s.number}
+		if s.listed {
+			spec.Entries = listed
+		}
+		sw.set(f.ca.CRL(t, spec))
+		res := chkTCheck(t, c, leaf, f.ca.Cert, chkTPolicy())
+		if res.Status != s.want {
+			t.Fatalf("%s: Check = %s %s, want %s", s.name, res.Status, chkTTrace(res.Attempts), s.want)
+		}
+		if a := res.Attempts[len(res.Attempts)-1]; s.want == StatusInvalidEvidence && a.Detail != errCRLRollback.Error() {
+			t.Errorf("%s: CRL attempt detail = %q, want %q", s.name, a.Detail, errCRLRollback)
+		}
+	}
+	if got := hits.Load(); got != int64(len(steps)) {
+		t.Errorf("CRL requests = %d, want %d", got, len(steps))
+	}
+}
+
 func TestCheckRedirectToForeignHost(t *testing.T) {
 	f := chkTNewFixture(t)
 	crlHits := f.serve(t, chkTCRLHost, testpki.Redirect("http://foreign.test/a.crl"))
