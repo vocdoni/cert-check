@@ -301,6 +301,48 @@ func TestRunMainConnectionCap(t *testing.T) {
 	}
 }
 
+// TestRunReportsDroppedConnections: connections closed over a listener's
+// capacity are counted and reported, as counts only, in at most one Warn
+// line per interval and only after drops (U11-FABLE-4).
+func TestRunReportsDroppedConnections(t *testing.T) {
+	w := newSrvWorld(t, srvOptions{})
+	if w.app.dropReport != time.Minute {
+		t.Fatalf("dropReport = %v, want one minute", w.app.dropReport)
+	}
+	const interval = 50 * time.Millisecond
+	w.app.mainConns, w.app.dropReport = 1, interval
+	run := w.start(t)
+	dial := func(t *testing.T) net.Conn {
+		t.Helper()
+		c, err := net.DialTimeout("tcp", run.mainAddr, time.Second)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = c.Close() }) // test teardown
+		if err := c.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatalf("SetDeadline: %v", err)
+		}
+		return c
+	}
+	held := dial(t)
+	if _, err := io.WriteString(held, "GET /healthz HTTP/1.1\r\nHost: check.test\r\n\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if resp, err := http.ReadResponse(bufio.NewReader(held), nil); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("held connection: /healthz = (%v, %v), want 200", resp, err)
+	}
+	if n, err := dial(t).Read(make([]byte, 1)); n != 0 || err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("connection over capacity: Read = (%d, %v), want it closed", n, err)
+	}
+	const msg = "connections dropped over capacity"
+	waitFor(t, "a drop report", func() bool { return len(w.logs.withMsg(t, msg)) > 0 })
+	time.Sleep(4 * interval) // intervals without drops add no line
+	recs := w.logs.withMsg(t, msg)
+	if len(recs) != 1 || recs[0]["level"] != "WARN" || recs[0]["mainDropped"] != float64(1) || recs[0]["authDropped"] != float64(0) {
+		t.Errorf("drop reports = %v, want one WARN with mainDropped 1 and authDropped 0", recs)
+	}
+}
+
 func TestNewRequiresDeps(t *testing.T) {
 	w := newSrvWorld(t, srvOptions{})
 	full := Deps{Config: srvConfig(t), Providers: w.providers, Certs: w.certs, Logger: srvDiscard, Version: srvVersion}

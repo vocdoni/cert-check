@@ -35,7 +35,8 @@ func main() {
 type probeFunc func(ctx context.Context, specimenDirs []string, w io.Writer) (probe.Summary, error)
 
 // dispatch runs `cert-check probe [specimen-dir...]` (exit 1 on any FAIL
-// line) or, with any other arguments, the service. It returns the exit status.
+// line or when no line is OK) or, with any other arguments, the service. It
+// returns the exit status.
 func dispatch(args []string, getenv func(string) string, probeRun probeFunc, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "probe" {
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -67,7 +68,10 @@ func runProbe(ctx context.Context, specimenDirs []string, w io.Writer) (probe.Su
 	for _, dir := range specimenDirs {
 		sp, err := probe.LoadSpecimens(os.DirFS(dir))
 		if err != nil {
-			return probe.Summary{}, err
+			return probe.Summary{}, fmt.Errorf("%s: %w", dir, err)
+		}
+		if len(sp) == 0 { // an unmounted or wrong directory would skip the specimen checks silently
+			return probe.Summary{}, fmt.Errorf("%s: no known live specimen", dir)
 		}
 		targets = append(targets, sp...)
 	}

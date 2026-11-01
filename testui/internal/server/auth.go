@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	certcheck "github.com/vocdoni/cert-check"
@@ -22,6 +24,7 @@ const (
 	ValidationBudget     = 40 * time.Second
 	authenticatePath     = "/v1/authenticate"
 	fragmentInvalidState = "/#error=invalid_state&diag="
+	fragmentInternal     = "/#error=internal&diag="
 )
 
 // authHandler serves only GET /v1/authenticate on the auth listener. Every
@@ -43,6 +46,12 @@ type authHandler struct {
 
 func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	authHeaders(w)
+	var provider string // known after the SNI lookup
+	defer func() {
+		if v := recover(); v != nil {
+			a.panicked(w, r, provider, v)
+		}
+	}()
 	if r.Method != http.MethodGet || r.URL.Path != authenticatePath {
 		w.WriteHeader(http.StatusNotFound)
 		return
@@ -62,22 +71,36 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ref, err = a.store.ConsumeState(Secret(states[0]), provider)
 	}
 	if err != nil {
+		// Info: a bad state is user error or scanner noise, not an operator event.
 		diag := certcheck.NewDiagnosticID()
-		a.log.Warn("auth state rejected", "diagnosticId", diag, "sni", r.TLS.ServerName, "reason", err.Error())
+		a.log.Info("auth state rejected", "diagnosticId", diag, "sni", r.TLS.ServerName, "reason", err.Error())
 		http.Redirect(w, r, a.publicURL+fragmentInvalidState+diag, http.StatusSeeOther)
 		return
 	}
 
 	outcome := a.validate(r, provider)
 	code, err := a.store.Complete(ref, outcome)
+	a.logOutcome(outcome)
 	if err != nil {
 		diag := certcheck.NewDiagnosticID()
-		a.log.Warn("auth transaction expired during validation", "diagnosticId", diag, "sni", r.TLS.ServerName)
+		a.log.Warn("auth transaction gone during validation", "diagnosticId", diag, "sni", r.TLS.ServerName,
+			"outcomeDiagnosticId", outcome.diagnosticID(), "reason", err.Error())
 		http.Redirect(w, r, a.publicURL+fragmentInvalidState+diag, http.StatusSeeOther)
 		return
 	}
-	a.logOutcome(outcome)
 	http.Redirect(w, r, a.publicURL+"/#code="+string(code), http.StatusSeeOther)
+}
+
+// panicked answers a panic recovered from ServeHTTP. net/http would log it
+// only through the auth server's ErrorLog, at debug. The value may hold
+// certificate data, so only its type is logged.
+func (a *authHandler) panicked(w http.ResponseWriter, r *http.Request, provider string, v any) {
+	if v == http.ErrAbortHandler {
+		panic(v) // net/http's own abort, not a fault
+	}
+	diag := certcheck.NewDiagnosticID()
+	a.log.Error("auth handler panic", "diagnosticId", diag, "provider", provider, "panicType", fmt.Sprintf("%T", v))
+	http.Redirect(w, r, a.publicURL+fragmentInternal+diag, http.StatusSeeOther)
 }
 
 // validate runs the checker in a bounded slot with a 40 s budget on the
@@ -122,6 +145,14 @@ func (a *authHandler) serverError(r *http.Request, code certcheck.ErrorCode, det
 	return &certcheck.Error{Code: code, Retryable: code.Retryable(), Detail: detail, Diagnostics: d}
 }
 
+// diagnosticID is the diagnostic ID stamped on the outcome.
+func (o Outcome) diagnosticID() string {
+	if o.Err != nil {
+		return o.Err.Diagnostics.DiagnosticID
+	}
+	return o.Result.Diagnostics.DiagnosticID
+}
+
 // logOutcome writes one line with non-PII fields only.
 func (a *authHandler) logOutcome(o Outcome) {
 	if o.Err != nil {
@@ -134,13 +165,14 @@ func (a *authHandler) logOutcome(o Outcome) {
 }
 
 // limitListener closes connections beyond its capacity before anything is
-// read (on the auth listener, before the TLS handshake).
+// read (on the auth listener, before the TLS handshake) and counts them.
 type limitListener struct {
 	net.Listener
-	sem chan struct{}
+	sem     chan struct{}
+	dropped atomic.Int64 // connections closed over capacity; App.reportDrops resets it
 }
 
-func newLimitListener(l net.Listener, limit int) net.Listener {
+func newLimitListener(l net.Listener, limit int) *limitListener {
 	return &limitListener{Listener: l, sem: make(chan struct{}, limit)}
 }
 
@@ -154,7 +186,8 @@ func (l *limitListener) Accept() (net.Conn, error) {
 		case l.sem <- struct{}{}:
 			return &limitConn{Conn: c, release: func() { <-l.sem }}, nil
 		default:
-			_ = c.Close() // over capacity: drop before the handshake; nothing to report
+			l.dropped.Add(1)
+			_ = c.Close() // over capacity: drop before the handshake; counted above
 		}
 	}
 }
@@ -172,15 +205,17 @@ func (c *limitConn) Close() error {
 }
 
 // newAuthServer returns the auth http.Server: HTTP/1.1 only (empty
-// TLSNextProto) and the spec timeouts. Its ErrorLog (TLS handshake errors,
-// mostly scanners on a public port) goes to slog at debug (ruling R61).
+// TLSNextProto) and the spec timeouts. ReadHeaderTimeout, the shortest, also
+// bounds the TLS handshake: a silent connection holds a slot for 5 s. Its
+// ErrorLog (TLS handshake errors, mostly scanners on a public port) goes to
+// slog at debug (ruling R61); ServeHTTP logs its own panics.
 // "OPTIONS *" reaches h (404 with the auth headers) instead of net/http's
 // header-less 200.
 func newAuthServer(h http.Handler, log *slog.Logger) *http.Server {
 	return &http.Server{
 		Handler:                      h,
 		DisableGeneralOptionsHandler: true,
-		ReadHeaderTimeout:            10 * time.Second,
+		ReadHeaderTimeout:            5 * time.Second,
 		ReadTimeout:                  30 * time.Second,
 		WriteTimeout:                 60 * time.Second,
 		IdleTimeout:                  30 * time.Second,

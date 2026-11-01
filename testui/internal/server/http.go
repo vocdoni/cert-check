@@ -63,9 +63,12 @@ func mainHeaders(next http.Handler) http.Handler {
 
 // authHeaders sets the auth-listener headers (redirects and 404s alike). The
 // Content-Type is fixed so that http.Redirect writes no HTML body: the auth
-// listener never renders HTML (spec "Authentication flow" step 4).
+// listener never renders HTML (spec "Authentication flow" step 4). Every
+// response is terminal (the browser leaves for the public origin), so the
+// connection closes after it: one connection cannot pipeline a request flood.
 func authHeaders(w http.ResponseWriter) {
 	h := w.Header()
+	h.Set("Connection", "close")
 	h.Set("Content-Security-Policy", authCSP)
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Content-Type-Options", "nosniff")
@@ -137,12 +140,13 @@ func clientIP(r *http.Request, trustedHops int) netip.Addr {
 	return bucket(a)
 }
 
-// bucket keys IPv6 clients by their /64 (one allocation), IPv4 by address.
-// One /64 holder cannot fill the limiter table with distinct addresses.
+// bucket keys IPv6 clients by their /56 (a residential subscriber's
+// allocation: 256 /64s), IPv4 by address. One subscriber cannot spread its
+// requests over many buckets or fill the limiter table.
 func bucket(a netip.Addr) netip.Addr {
 	a = a.Unmap()
 	if a.Is6() {
-		return netip.PrefixFrom(a, 64).Masked().Addr()
+		return netip.PrefixFrom(a, 56).Masked().Addr()
 	}
 	return a
 }

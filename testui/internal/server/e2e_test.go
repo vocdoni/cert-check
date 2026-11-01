@@ -483,7 +483,7 @@ func (s *e2eServer) authenticate(t *testing.T, c *http.Client, authURL string) s
 }
 
 // invalidState GETs rawURL with c and expects the 303 to #error=invalid_state;
-// it returns the diagnostic ID, which must be in a WARN log line.
+// it returns the diagnostic ID, which must be in an INFO log line.
 func (s *e2eServer) invalidState(t *testing.T, c *http.Client, rawURL string) string {
 	t.Helper()
 	resp, body := authGet(t, c, rawURL, "")
@@ -495,12 +495,12 @@ func (s *e2eServer) invalidState(t *testing.T, c *http.Client, rawURL string) st
 	}
 	var found bool
 	for _, r := range s.logs.withMsg(t, "auth state rejected") {
-		if r["diagnosticId"] == diag && r["level"] == "WARN" {
+		if r["diagnosticId"] == diag && r["level"] == "INFO" {
 			found = true
 		}
 	}
 	if !found {
-		t.Errorf("no WARN \"auth state rejected\" line with diagnosticId %s", diag)
+		t.Errorf("no INFO \"auth state rejected\" line with diagnosticId %s", diag)
 	}
 	s.diagIDs = append(s.diagIDs, diag)
 	return diag

@@ -36,6 +36,10 @@ const shutdownTimeout = 15 * time.Second
 // connection is closed before anything is read.
 const MainMaxConns = 1024
 
+// dropReportInterval is how often Run reports the connections both
+// listeners closed over capacity (one Warn line, only after drops).
+const dropReportInterval = time.Minute
+
 // Deps are the App's collaborators.
 type Deps struct {
 	Config    config.Config
@@ -61,6 +65,7 @@ type App struct {
 	redeemLimiter *ipLimiter
 	mainConns     int                // MainMaxConns; tests shorten it
 	shutdownWait  time.Duration      // shutdownTimeout; tests shorten it
+	dropReport    time.Duration      // dropReportInterval; tests shorten it
 	stopService   context.CancelFunc // cancels auth.service when the shutdown drain expires
 	mainUp        atomic.Bool
 	authUp        atomic.Bool
@@ -84,7 +89,7 @@ func New(d Deps) (*App, error) {
 	a := &App{cfg: d.Config, providers: handler.Providers(), providerIDs: map[string]bool{}, certs: d.Certs, log: d.Logger, version: d.Version, now: now,
 		publicOrigin: d.Config.PublicURL.Scheme + "://" + d.Config.PublicURL.Host,
 		store:        NewStore(TxCapacity, now), createLimiter: newIPLimiter(createPerMinute), redeemLimiter: newIPLimiter(redeemPerMinute),
-		mainConns: MainMaxConns, shutdownWait: shutdownTimeout}
+		mainConns: MainMaxConns, shutdownWait: shutdownTimeout, dropReport: dropReportInterval}
 	for _, p := range a.providers {
 		a.providerIDs[p.Info().ID] = true
 	}
@@ -150,12 +155,14 @@ func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 	authSrv.BaseContext = func(net.Listener) context.Context { return a.auth.service }
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	mainLim, authLim := newLimitListener(mainLn, a.mainConns), newLimitListener(authLn, AuthMaxConns)
 	var wg sync.WaitGroup
 	errc := make(chan error, 2)
 	wg.Go(func() { a.store.RunJanitor(ctx, JanitorInterval) })
+	wg.Go(func() { a.reportDrops(ctx, mainLim, authLim) })
 	wg.Go(func() {
 		a.mainUp.Store(true)
-		if err := mainSrv.Serve(newLimitListener(mainLn, a.mainConns)); !errors.Is(err, http.ErrServerClosed) {
+		if err := mainSrv.Serve(mainLim); !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
 	})
@@ -171,7 +178,7 @@ func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 			}
 		}
 		a.authUp.Store(true)
-		if err := authSrv.Serve(tls.NewListener(newLimitListener(authLn, AuthMaxConns), a.authTLS)); !errors.Is(err, http.ErrServerClosed) {
+		if err := authSrv.Serve(tls.NewListener(authLim, a.authTLS)); !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}
 	})
@@ -196,6 +203,24 @@ func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 	cancel()
 	wg.Wait()
 	return runErr
+}
+
+// reportDrops logs, at most once per a.dropReport and only when some were
+// dropped, how many connections each listener closed over capacity: a full
+// listener otherwise looks like an idle service.
+func (a *App) reportDrops(ctx context.Context, mainLn, authLn *limitListener) {
+	t := time.NewTicker(a.dropReport)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if m, au := mainLn.dropped.Swap(0), authLn.dropped.Swap(0); m+au > 0 {
+				a.log.Warn("connections dropped over capacity", "mainDropped", m, "authDropped", au)
+			}
+		}
+	}
 }
 
 // shutdown drains srv until ctx ends, then closes the connections still
