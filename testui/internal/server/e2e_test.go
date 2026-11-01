@@ -704,9 +704,10 @@ func (w *e2eWorld) flowReplayedCode(t *testing.T) []byte {
 
 func (w *e2eWorld) flowRedeemWithoutCookie(t *testing.T) {
 	t.Helper()
-	authURL, _ := w.create(t, "alpha")
+	authURL, cookie := w.create(t, "alpha")
 	code := w.authenticate(t, w.client(t, "alpha"), authURL)
 	w.redeemRejected(t, code, "", "cookie_missing")
+	w.redeemRejected(t, code, cookie, "code_unknown_or_expired") // the cookie-less attempt spent the code
 }
 
 func (w *e2eWorld) flowRedeemOtherCookie(t *testing.T) {
@@ -952,9 +953,9 @@ func TestE2ELogsNoPII(t *testing.T) {
 	}
 	logs := w.logs.String()
 	// Failures with a diagnostic ID: no certificate 1, wrong SNI 2, replayed
-	// state 1, replayed code 1, no cookie 1, other cookie 1, expired 2.
-	if len(w.diagIDs) != 9 {
-		t.Errorf("%d failure diagnostic IDs collected, want 9", len(w.diagIDs))
+	// state 1, replayed code 1, no cookie 2, other cookie 1, expired 2.
+	if len(w.diagIDs) != 10 {
+		t.Errorf("%d failure diagnostic IDs collected, want 10", len(w.diagIDs))
 	}
 	for _, id := range w.diagIDs {
 		if !strings.Contains(logs, id) {

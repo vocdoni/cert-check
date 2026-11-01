@@ -686,8 +686,10 @@ func TestRedeem(t *testing.T) {
 	})
 
 	t.Run("no cookie", func(t *testing.T) {
-		code, _ := w.completeTx(t, "alpha", Outcome{Result: res})
+		code, cookie := w.completeTx(t, "alpha", Outcome{Result: res})
 		invalid(t, w.redeem(code, ""), "cookie_missing")
+		// The code was spent by the cookie-less attempt (U11-ASTRA-2).
+		invalid(t, w.redeem(code, cookie), "code_unknown_or_expired")
 	})
 
 	t.Run("another valid cookie", func(t *testing.T) {
