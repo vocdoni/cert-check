@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -316,6 +317,54 @@ func TestRegistryErrors(t *testing.T) {
 				t.Errorf("New returned a registry with error %v", err)
 			}
 		})
+	}
+}
+
+// TestRegistryRejectInvalidOIDArcs: under a first arc of 0 or 1 the second
+// arc is at most 39, so such an OID has no DER encoding and could never match.
+func TestRegistryRejectInvalidOIDArcs(t *testing.T) {
+	now := time.Now()
+	root := testpki.NewRoot(t, "root", testpki.CertSpec{Now: now})
+	for _, tc := range []struct {
+		oid   string
+		valid bool
+	}{
+		{"0.39", true}, {"0.40", false}, {"0.40.1", false},
+		{"1.39.3", true}, {"1.40", false}, {"1.40.3", false}, {"1.400.3.4", false},
+		{"2.40", true}, {"2.999.1.2", true},
+	} {
+		var arcs []int
+		for s := range strings.SplitSeq(tc.oid, ".") {
+			n, err := strconv.Atoi(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			arcs = append(arcs, n)
+		}
+		for _, field := range []struct {
+			name    string
+			set     func(*profiles.Profile)
+			wantErr string
+		}{
+			{"policy", func(p *profiles.Profile) { p.PolicyOIDs = []string{tc.oid} }, fmt.Sprintf("invalid OID %q", tc.oid)},
+			{"handled extension", func(p *profiles.Profile) { p.HandledCriticalExtensions = []string{tc.oid} }, fmt.Sprintf("invalid OID %q", tc.oid)},
+			{"marker", func(p *profiles.Profile) {
+				p.TestMarkers = []profiles.TestMarker{{Subject: []profiles.AttributeMatch{{OID: arcs, Value: "NOMDOS"}}, Source: "x"}}
+			}, "test marker attribute needs an OID and a value"},
+		} {
+			t.Run(field.name+" "+tc.oid, func(t *testing.T) {
+				p := regTProfile("p1", "prov", profiles.TestAnchor(root.Cert))
+				field.set(&p)
+				logger, _ := regTLogger()
+				_, err := profiles.New(profiles.Config{Providers: []profiles.Provider{regTProvider("prov", p)}, Now: now, Logger: logger})
+				switch {
+				case tc.valid && err != nil:
+					t.Errorf("New error = %v, want success", err)
+				case !tc.valid && (err == nil || !strings.Contains(err.Error(), field.wantErr)):
+					t.Errorf("New error = %v, want one containing %q", err, field.wantErr)
+				}
+			})
+		}
 	}
 }
 

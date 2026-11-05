@@ -211,7 +211,7 @@ func validateProfile(p Profile) error {
 		errs = append(errs, errors.New("anchors and policy OIDs are required"))
 	}
 	for _, o := range append(slices.Clone(p.PolicyOIDs), p.HandledCriticalExtensions...) {
-		if !oidRe.MatchString(o) {
+		if !validOID(o) {
 			errs = append(errs, fmt.Errorf("invalid OID %q", o))
 		}
 	}
@@ -232,7 +232,7 @@ func validateProfile(p Profile) error {
 			errs = append(errs, errors.New("test marker needs exactly one of SHA256 or Subject"))
 		}
 		for _, am := range m.Subject {
-			if !oidRe.MatchString(am.OID.String()) || strings.TrimSpace(am.Value) == "" {
+			if !validOID(am.OID.String()) || strings.TrimSpace(am.Value) == "" {
 				errs = append(errs, errors.New("test marker attribute needs an OID and a value"))
 			}
 		}
@@ -244,6 +244,16 @@ func validateProfile(p Profile) error {
 		return fmt.Errorf("profiles: %s: %w", p.ID, err)
 	}
 	return nil
+}
+
+// validOID reports whether o is canonical dotted text of an encodable OID
+// (x509.ParseOID bounds the second arc under a first arc of 0 or 1).
+func validOID(o string) bool {
+	if !oidRe.MatchString(o) {
+		return false
+	}
+	_, err := x509.ParseOID(o)
+	return err == nil
 }
 
 func loadAnchor(a Anchor, files fs.FS) (*x509.Certificate, error) {
