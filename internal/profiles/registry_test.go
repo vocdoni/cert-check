@@ -379,6 +379,7 @@ func TestValidityDisables(t *testing.T) {
 	early := testpki.NewRoot(t, "future root", future)
 	deadInter := live.Intermediate(t, "expired inter", expired)
 	liveInter := live.Intermediate(t, "live inter", valid)
+	earlyInter := live.Intermediate(t, "future inter", future)
 	orphanInter := dead.Intermediate(t, "inter under expired root", valid)
 	anc := profiles.TestAnchor
 
@@ -400,6 +401,8 @@ func TestValidityDisables(t *testing.T) {
 		{name: "one of two anchors expired", anchors: []*testpki.CA{dead, live},
 			wantEnabled: true, wantAnchors: []*testpki.CA{live}, wantLog: []string{"anchor outside validity"}},
 		{name: "intermediates all expired", anchors: []*testpki.CA{live}, intermediates: []*testpki.CA{deadInter},
+			wantLog: []string{"intermediate outside validity", "profile disabled: no valid pinned intermediate", "provider hidden"}},
+		{name: "not-yet-valid-intermediate", anchors: []*testpki.CA{live}, intermediates: []*testpki.CA{earlyInter},
 			wantLog: []string{"intermediate outside validity", "profile disabled: no valid pinned intermediate", "provider hidden"}},
 		{name: "one of two intermediates expired", anchors: []*testpki.CA{live}, intermediates: []*testpki.CA{deadInter, liveInter},
 			wantEnabled: true, wantAnchors: []*testpki.CA{live}, wantInter: []*testpki.CA{liveInter}, wantLog: []string{"intermediate outside validity"}},
@@ -458,6 +461,50 @@ func TestValidityDisables(t *testing.T) {
 				t.Errorf("Inter: got %d intermediates, want exactly the %d valid ones", len(e[0].Intermediates), len(wantI))
 			}
 		})
+	}
+}
+
+// TestValidityBoundaries: validity includes NotBefore and NotAfter, to the
+// second, for anchors and pinned intermediates alike.
+func TestValidityBoundaries(t *testing.T) {
+	notBefore := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	notAfter := notBefore.AddDate(1, 0, 0)
+	window := testpki.CertSpec{Now: notBefore, NotBefore: notBefore, NotAfter: notAfter}
+	root := testpki.NewRoot(t, "window root", window)
+	wideRoot := testpki.NewRoot(t, "wide root", testpki.CertSpec{Now: notBefore, NotBefore: notBefore.AddDate(-1, 0, 0), NotAfter: notAfter.AddDate(1, 0, 0)})
+	inter := wideRoot.Intermediate(t, "window inter", window)
+	viaInter := regTProfile("p1", "prov", profiles.TestAnchor(wideRoot.Cert))
+	viaInter.Intermediates = []profiles.Anchor{profiles.TestAnchor(inter.Cert)}
+	for _, at := range []struct {
+		name  string
+		now   time.Time
+		valid bool
+	}{
+		{"NotBefore-1s", notBefore.Add(-time.Second), false},
+		{"NotBefore", notBefore, true},
+		{"NotBefore+1s", notBefore.Add(time.Second), true},
+		{"NotAfter-1s", notAfter.Add(-time.Second), true},
+		{"NotAfter", notAfter, true},
+		{"NotAfter+1s", notAfter.Add(time.Second), false},
+	} {
+		for _, ca := range []struct {
+			name string
+			p    profiles.Profile
+		}{
+			{"anchor", regTProfile("p1", "prov", profiles.TestAnchor(root.Cert))},
+			{"intermediate", viaInter},
+		} {
+			t.Run(ca.name+" "+at.name, func(t *testing.T) {
+				logger, _ := regTLogger()
+				r, err := profiles.New(profiles.Config{Providers: []profiles.Provider{regTProvider("prov", ca.p)}, Now: at.now, Logger: logger})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				if got := len(r.Enabled("prov")) == 1; got != at.valid {
+					t.Errorf("profile enabled = %v at %v, want %v", got, at.now, at.valid)
+				}
+			})
+		}
 	}
 }
 
