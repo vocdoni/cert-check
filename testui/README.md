@@ -114,11 +114,11 @@ a message that lists every problem and never prints a secret.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `8080` | Main listener port (Railway sets it) |
-| `CERTCHECK_PUBLIC_URL` | required | Fixed callback origin, e.g. `https://cert-check.vocdoni.dev`. https only, http for localhost and 127.0.0.1. No path other than `/`, no query, fragment or userinfo; the host is lowercased and a default port dropped |
+| `CERTCHECK_PUBLIC_URL` | required | Fixed callback origin, e.g. `https://cert-check.vocdoni.dev`. https only, http for localhost and 127.0.0.1. No path other than `/`, no query, fragment or userinfo. The host is a DNS name (no trailing dot, IDNs in punycode), an IP literal or `localhost`; it is lowercased and a default port dropped |
 | `CERTCHECK_AUTH_DOMAIN` | required | Lowercase DNS name whose wildcard hosts the providers, e.g. `auth.cert-check.vocdoni.dev` |
 | `CERTCHECK_AUTH_PUBLIC_PORT` | `$RAILWAY_TCP_PROXY_PORT` | External auth port used in `authUrl`. Required: set it when `RAILWAY_TCP_PROXY_PORT` is absent |
 | `CERTCHECK_AUTH_LISTEN` | `:8443` | Auth listener address, `host:port` with a numeric port between 1 and 65535 |
-| `CERTCHECK_DATA_DIR` | `/data` | ACME storage: `<dir>/certmagic` (the Railway volume) |
+| `CERTCHECK_DATA_DIR` | `/data` | ACME storage: `<dir>/certmagic` (the Railway volume), created 0700 if missing. Startup fails if it cannot be written |
 | `CERTCHECK_ACME_EMAIL` | required with ACME | ACME account contact (a mailbox the owner controls) |
 | `CERTCHECK_ACME_CA` | `production` | `production` or `staging` (Let's Encrypt) |
 | `CLOUDFLARE_API_TOKEN` | required with ACME | DNS-01 token (secret). Permissions: **Zone:Read + Zone.DNS:Edit** on `vocdoni.dev` |
@@ -126,7 +126,7 @@ a message that lists every problem and never prints a secret.
 | `CERTCHECK_TLS_CERT_FILE` / `CERTCHECK_TLS_KEY_FILE` | unset | Static certificate and key instead of ACME; mutually exclusive with the three ACME variables above |
 | `CERTCHECK_AUTH_TLS13` | `false` | Allow TLS 1.3 on the auth listener (see [Security notes](#6-security-notes)) |
 | `CERTCHECK_TRUSTED_PROXY_HOPS` | `1` | Trusted proxy hops, 0 to 10. The client IP is the entry that many places from the right of `X-Forwarded-For` |
-| `CERTCHECK_LOG_LEVEL` | `info` | slog level: `debug`, `info`, `warn`, `error` |
+| `CERTCHECK_LOG_LEVEL` | `info` | slog level: `debug`, `info`, `warn`, `error`. Also applies to the ACME (certmagic) lines, written as JSON to the same stdout stream |
 | `RAILWAY_RUN_UID` | set on the service: `0` | Platform setting, not read by the app. Railway mounts volumes as root, so the process must run as root to create `/data/certmagic` (accepted, see [Security notes](#6-security-notes)) |
 | `RAILWAY_GIT_COMMIT_SHA` | `dev` | Docker build argument, injected by Railway; becomes the reported `serverVersion` |
 

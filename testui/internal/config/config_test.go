@@ -142,6 +142,15 @@ func TestLoadErrors(t *testing.T) {
 		{"public url port not a number", withVar("CERTCHECK_PUBLIC_URL", "https://example.org:abc"), "CERTCHECK_PUBLIC_URL"},
 		{"public url with empty query", withVar("CERTCHECK_PUBLIC_URL", "https://example.org/?"), "CERTCHECK_PUBLIC_URL"},
 		{"public url with empty userinfo", withVar("CERTCHECK_PUBLIC_URL", "https://@example.org"), "CERTCHECK_PUBLIC_URL"},
+		// No browser sends these hosts in Origin (U12-FABLE-1).
+		{"public url host trailing comma", withVar("CERTCHECK_PUBLIC_URL", "https://cert-check.vocdoni.dev,"), "CERTCHECK_PUBLIC_URL"},
+		{"public url host trailing semicolon", withVar("CERTCHECK_PUBLIC_URL", "https://cert-check.vocdoni.dev;"), "CERTCHECK_PUBLIC_URL"},
+		{"public url host trailing dot", withVar("CERTCHECK_PUBLIC_URL", "https://cert-check.vocdoni.dev."), "CERTCHECK_PUBLIC_URL"},
+		{"public url host with angle bracket", withVar("CERTCHECK_PUBLIC_URL", "https://exa<mple.com"), "CERTCHECK_PUBLIC_URL"},
+		{"public url non-ascii host", withVar("CERTCHECK_PUBLIC_URL", "https://certificación.example"), "CERTCHECK_PUBLIC_URL"},
+		{"public url host with underscore", withVar("CERTCHECK_PUBLIC_URL", "https://cert_check.example.org"), "CERTCHECK_PUBLIC_URL"},
+		{"public url host label starts with hyphen", withVar("CERTCHECK_PUBLIC_URL", "https://-cert.example.org"), "CERTCHECK_PUBLIC_URL"},
+		{"public url ipv6 zone", withVar("CERTCHECK_PUBLIC_URL", "https://[fe80::1%25eth0]"), "CERTCHECK_PUBLIC_URL"},
 		{"auth domain uppercase", withVar("CERTCHECK_AUTH_DOMAIN", "Auth.Example.org"), "CERTCHECK_AUTH_DOMAIN"},
 		{"auth domain single label", withVar("CERTCHECK_AUTH_DOMAIN", "x"), "CERTCHECK_AUTH_DOMAIN"},
 		{"auth domain empty", withVar("CERTCHECK_AUTH_DOMAIN", ""), "CERTCHECK_AUTH_DOMAIN"},
@@ -312,6 +321,9 @@ func TestLoadPublicURLNormalised(t *testing.T) {
 		{"HTTPS://cert.example.org", "https://cert.example.org"},
 		{"https://[2001:DB8::1]:443", "https://[2001:db8::1]"},
 		{"https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"},
+		{"https://[2001:0db8:0:0::1]", "https://[2001:db8::1]"},
+		{"https://192.0.2.1", "https://192.0.2.1"},
+		{"https://XN--Bcher-kva.example", "https://xn--bcher-kva.example"},
 		{"http://LOCALHOST:8080", "http://localhost:8080"},
 		{"http://localhost:80", "http://localhost"},
 		{"http://127.0.0.1:80/", "http://127.0.0.1"},
@@ -329,6 +341,47 @@ func TestLoadPublicURLNormalised(t *testing.T) {
 				t.Errorf("PublicURL = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestLoadProduction: the Railway production environment still loads. The
+// ACME e-mail, the token and Railway's TCP proxy port are placeholders for
+// values set on the service; CERTCHECK_DATA_DIR and CERTCHECK_AUTH_LISTEN
+// are unset there.
+func TestLoadProduction(t *testing.T) {
+	env := map[string]string{
+		"CERTCHECK_PUBLIC_URL":         "https://cert-check.vocdoni.dev",
+		"CERTCHECK_AUTH_DOMAIN":        "auth.cert-check.vocdoni.dev",
+		"PORT":                         "8080",
+		"CERTCHECK_TRUSTED_PROXY_HOPS": "2",
+		"CERTCHECK_ACME_CA":            "production",
+		"CERTCHECK_ACME_EMAIL":         "ops@example.org",
+		"CLOUDFLARE_API_TOKEN":         testToken,
+		"RAILWAY_TCP_PROXY_PORT":       "12345",
+	}
+	c, err := Load(getenvFrom(env))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	checks := []struct {
+		name      string
+		got, want any
+	}{
+		{"PublicURL", c.PublicURL.String(), "https://cert-check.vocdoni.dev"},
+		{"AuthDomain", c.AuthDomain, "auth.cert-check.vocdoni.dev"},
+		{"Port", c.Port, 8080},
+		{"AuthPublicPort", c.AuthPublicPort, 12345},
+		{"AuthListen", c.AuthListen, ":8443"},
+		{"DataDir", c.DataDir, "/data"},
+		{"CertMode", c.CertMode, CertACME},
+		{"ACMECA", c.ACMECA, ACMEProduction},
+		{"TrustedProxyHops", c.TrustedProxyHops, 2},
+		{"LogLevel", c.LogLevel, slog.LevelInfo},
+	}
+	for _, tc := range checks {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
+		}
 	}
 }
 

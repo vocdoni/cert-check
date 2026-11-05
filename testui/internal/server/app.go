@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -31,6 +32,11 @@ const readyPoll = 500 * time.Millisecond
 
 // shutdownTimeout bounds the graceful shutdown of both listeners.
 const shutdownTimeout = 15 * time.Second
+
+// ErrDrainCutShort is wrapped by Run's error when ctx ended and the shutdown
+// drain expired first: the requests still running were cancelled and their
+// connections closed, as designed. No listener failed.
+var ErrDrainCutShort = errors.New("shutdown drain cut short")
 
 // MainMaxConns caps the main listener's open connections; beyond it a
 // connection is closed before anything is read.
@@ -147,7 +153,9 @@ func newMainServer(h http.Handler, log *slog.Logger) *http.Server {
 // MainMaxConns cap; authLn is wrapped with the 512-connection cap and TLS
 // here, and served once the certificate is ready. Shutdown drains both
 // servers concurrently for up to 15 s; when that expires it cancels the
-// validations still running and closes the connections left. Both listeners
+// validations still running and closes the connections left; Run then
+// returns an error wrapping ErrDrainCutShort, unless a listener failed
+// first (that error is returned, joined with the drain's). Both listeners
 // are closed when Run returns. Run is called once per App.
 func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 	mainSrv := newMainServer(a.MainHandler(), a.log)
@@ -198,11 +206,14 @@ func (a *App) Run(ctx context.Context, mainLn, authLn net.Listener) error {
 	for _, srv := range []*http.Server{mainSrv, authSrv} {
 		go func() { errs <- shutdown(shutdownCtx, srv) }()
 	}
-	runErr = errors.Join(runErr, <-errs, <-errs)
+	drainErr := errors.Join(<-errs, <-errs)
 	a.stopService() // nothing outlives Run
 	cancel()
 	wg.Wait()
-	return runErr
+	if runErr == nil && errors.Is(drainErr, context.DeadlineExceeded) { // asked to stop, and the drain expired
+		return fmt.Errorf("%w after %v: %w", ErrDrainCutShort, a.shutdownWait, drainErr)
+	}
+	return errors.Join(runErr, drainErr)
 }
 
 // reportDrops logs, at most once per a.dropReport and only when some were
