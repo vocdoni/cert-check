@@ -678,6 +678,15 @@
 
   // ---------- page load ----------
 
+  // "Start again" on the working view. The auth navigation may never replace this page (a blocked
+  // port, a slow auth host, Esc), so this forgets the attempt and reloads: that also stops the
+  // navigation and drops any reply still on its way. The URL is already / (init replaced the
+  // fragment), so the reload redeems nothing.
+  function startOver() {
+    clearPending();
+    location.reload();
+  }
+
   async function redeem(code, entry) {
     showWorking('Checking your certificate…');
     let reply;
@@ -764,6 +773,7 @@
   $('authenticate').addEventListener('click', guard(authenticate));
   $('again').addEventListener('click', showStart);
   $('retry').addEventListener('click', showStart);
+  $('cancel').addEventListener('click', startOver);
   $('copy-report').addEventListener('click', copyReport);
 
   const guardedInit = guard(init);

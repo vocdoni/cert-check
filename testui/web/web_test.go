@@ -354,6 +354,34 @@ func TestAppJSFatalFallback(t *testing.T) {
 	}
 }
 
+// TestWorkingViewExit covers U14-FABLE-2. The working view has a "Start again" pill that forgets the
+// attempt and reloads the page. The reload cannot redeem a code again: init() replaces the URL with
+// / before its first await.
+func TestWorkingViewExit(t *testing.T) {
+	html := readStatic(t, "index.html")
+	working := regexp.MustCompile(`(?s)<section id="view-working"[^>]*>(.*?)</section>`).FindStringSubmatch(html)
+	if working == nil || !strings.Contains(working[1], `<button id="cancel" class="pill" type="button">Start again</button>`) {
+		t.Error(`the working view lacks <button id="cancel" class="pill" type="button">Start again</button>`)
+	}
+	js := readStatic(t, "app.js")
+	if !strings.Contains(js, "$('cancel').addEventListener('click', startOver);") {
+		t.Error("app.js does not wire the cancel button to startOver")
+	}
+	over := jsFunc(t, js, "startOver")
+	for _, want := range []string{"clearPending()", "location.reload()"} {
+		if !strings.Contains(over, want) {
+			t.Errorf("startOver() lacks %q", want)
+		}
+	}
+	if strings.Contains(over, "redeem") {
+		t.Error("startOver() redeems; a redemption is never retried")
+	}
+	initSrc := jsFunc(t, js, "init")
+	if r, a := strings.Index(initSrc, "history.replaceState(null, '', '/');"), strings.Index(initSrc, "await "); r < 0 || r > a {
+		t.Error("init() does not replace the URL with / before its first await")
+	}
+}
+
 func TestRequiredText(t *testing.T) {
 	html := readStatic(t, "index.html")
 	js := readStatic(t, "app.js")
