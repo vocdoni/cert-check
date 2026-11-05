@@ -195,8 +195,8 @@ func TestAppJSCodeTables(t *testing.T) {
 	if loc := regexp.MustCompile(`\b(?:GUIDANCE|CLIENT_MESSAGES)\s*\[`).FindStringIndex(js); loc != nil {
 		t.Errorf("app.js indexes a code table directly near %q, want the own-property lookup", js[loc[0]:min(len(js), loc[0]+40)])
 	}
-	if lookup := jsFunc(t, js, "lookup"); !strings.Contains(lookup, "Object.hasOwn(") {
-		t.Errorf("lookup() = %q, want an Object.hasOwn own-property check", lookup)
+	if lookup := jsFunc(t, js, "lookup"); !strings.Contains(lookup, "Object.prototype.hasOwnProperty.call(") {
+		t.Errorf("lookup() = %q, want an Object.prototype.hasOwnProperty own-property check", lookup)
 	}
 	for _, fn := range []string{"guidanceFor", "showServerError", "showClientError"} {
 		if src := jsFunc(t, js, fn); !strings.Contains(src, "lookup(") {
@@ -285,9 +285,14 @@ func TestAppJSRepliesAreValidated(t *testing.T) {
 		}
 	}
 
-	// Whatever the load logic or a click handler throws is routed to the bad_response view.
-	if g := jsFunc(t, js, "guard"); !strings.Contains(g, "catch") || !strings.Contains(g, "code: 'bad_response'") {
+	// Whatever the load logic or a click handler throws is routed to the bad_response view, and
+	// when that view throws too, to the self-contained fallback.
+	g := jsFunc(t, js, "guard")
+	if !strings.Contains(g, "catch") || !strings.Contains(g, "code: 'bad_response'") {
 		t.Errorf("guard() = %q, want a catch that renders bad_response", g)
+	}
+	if !regexp.MustCompile(`(?s)catch \(e\) \{\s*try \{\s*showClientError\(\{ code: 'bad_response' \}\);\s*\} catch \(\w+\) \{\s*showFatal\(\);\s*\}`).MatchString(g) {
+		t.Errorf("guard() = %q, want showClientError in a try whose catch calls only showFatal()", g)
 	}
 	for _, want := range []string{"guard(authenticate)", "guard(init)"} {
 		if !strings.Contains(js, want) {
@@ -300,6 +305,80 @@ func TestAppJSRepliesAreValidated(t *testing.T) {
 	}
 	if n := len(regexp.MustCompile(`\binit\(`).FindAllString(js, -1)); n != 1 {
 		t.Errorf("app.js has %d init( occurrences, want only its declaration (callers use the guarded copy)", n)
+	}
+}
+
+// TestAppJSOlderBrowsers covers U14-FABLE-1. The error paths use no API newer than Chrome 90,
+// Firefox 90 and Safari 15: Object.hasOwn (Chrome 93, Firefox 92, Safari 15.4) threw in every
+// lookup there, and abort(reason) (Chrome 98, Firefox 97, Safari 15.4) is ignored there, so the
+// deadline is a plain abort() and a flag of our own.
+func TestAppJSOlderBrowsers(t *testing.T) {
+	js := readStatic(t, "app.js")
+	if strings.Contains(js, "Object.hasOwn") {
+		t.Error("app.js uses Object.hasOwn, which Safari before 15.4 lacks")
+	}
+	if loc := regexp.MustCompile(`\.abort\(\s*[^)\s]`).FindStringIndex(js); loc != nil {
+		t.Errorf("app.js passes a reason to abort() near %q; older browsers ignore it", js[loc[0]:min(len(js), loc[0]+40)])
+	}
+	api := jsFunc(t, js, "api")
+	for _, want := range []string{".abort()", "'TimeoutError'"} {
+		if !strings.Contains(api, want) {
+			t.Errorf("api() lacks %q: the deadline must reject with a TimeoutError on its own", want)
+		}
+	}
+}
+
+// TestAppJSFatalFallback covers U14-FABLE-1. The last resort of guard() must not depend on the
+// helpers, tables or views it stands in for: it writes a fixed message and a reload control with
+// plain DOM calls, inside a try.
+func TestAppJSFatalFallback(t *testing.T) {
+	js := readStatic(t, "app.js")
+	fatal := jsFunc(t, js, "showFatal")
+	body := strings.TrimSpace(fatal[strings.Index(fatal, "{")+1 : strings.LastIndex(fatal, "}")])
+	if !strings.HasPrefix(body, "try {") || !strings.HasSuffix(body, "}") || !strings.Contains(body, "} catch (") {
+		t.Errorf("showFatal() body is not one try statement:\n%s", body)
+	}
+	helper := regexp.MustCompile(`(?:^|[^\w$.])(\$|el|str|lookup|showView|showWorking|renderError|showClientError|showServerError|guidanceFor|reportHeader|attemptLines)\(`)
+	if m := helper.FindStringSubmatch(fatal); m != nil {
+		t.Errorf("showFatal() calls %s(), one of the helpers it stands in for", m[1])
+	}
+	for _, banned := range []string{"replaceChildren(", ".append(", "await ", "setTimeout("} {
+		if strings.Contains(fatal, banned) {
+			t.Errorf("showFatal() uses %q", banned)
+		}
+	}
+	for _, want := range []string{"CLIENT_MESSAGES.bad_response", "'Start again'", "location.reload()"} {
+		if !strings.Contains(fatal, want) {
+			t.Errorf("showFatal() lacks %q", want)
+		}
+	}
+}
+
+// TestWorkingViewExit covers U14-FABLE-2. The working view has a "Start again" pill that forgets the
+// attempt and reloads the page. The reload cannot redeem a code again: init() replaces the URL with
+// / before its first await.
+func TestWorkingViewExit(t *testing.T) {
+	html := readStatic(t, "index.html")
+	working := regexp.MustCompile(`(?s)<section id="view-working"[^>]*>(.*?)</section>`).FindStringSubmatch(html)
+	if working == nil || !strings.Contains(working[1], `<button id="cancel" class="pill" type="button">Start again</button>`) {
+		t.Error(`the working view lacks <button id="cancel" class="pill" type="button">Start again</button>`)
+	}
+	js := readStatic(t, "app.js")
+	if !strings.Contains(js, "$('cancel').addEventListener('click', startOver);") {
+		t.Error("app.js does not wire the cancel button to startOver")
+	}
+	over := jsFunc(t, js, "startOver")
+	for _, want := range []string{"clearPending()", "location.reload()"} {
+		if !strings.Contains(over, want) {
+			t.Errorf("startOver() lacks %q", want)
+		}
+	}
+	if strings.Contains(over, "redeem") {
+		t.Error("startOver() redeems; a redemption is never retried")
+	}
+	initSrc := jsFunc(t, js, "init")
+	if r, a := strings.Index(initSrc, "history.replaceState(null, '', '/');"), strings.Index(initSrc, "await "); r < 0 || r > a {
+		t.Error("init() does not replace the URL with / before its first await")
 	}
 }
 

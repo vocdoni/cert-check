@@ -37,10 +37,6 @@ import (
 	"github.com/vocdoni/cert-check/testui/web"
 )
 
-// csp is the production Content-Security-Policy (spec, "Main listener").
-const csp = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; font-src 'self'; " +
-	"connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
-
 const (
 	cookieTx      = "certcheck_tx"
 	cookieResult  = "mock-result"
@@ -130,20 +126,7 @@ func newHandler(fixtures *os.Root, port int) http.Handler {
 	mux.HandleFunc("GET /__auth", m.auth)
 	mux.HandleFunc("GET /__mock", m.control)
 	mux.Handle("GET /", http.FileServerFS(web.FS()))
-	return secure(mux)
-}
-
-// secure sets the production security headers on every response.
-func secure(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := w.Header()
-		h.Set("Content-Security-Policy", csp)
-		h.Set("Referrer-Policy", "no-referrer")
-		h.Set("X-Content-Type-Options", "nosniff")
-		h.Set("Strict-Transport-Security", "max-age=31536000")
-		h.Set("Cache-Control", "no-store")
-		next.ServeHTTP(w, r)
-	})
+	return web.SecurityHeaders(mux) // the production header set
 }
 
 func (m *mock) writeJSON(w http.ResponseWriter, status int, name string) {

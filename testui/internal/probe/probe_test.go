@@ -135,8 +135,11 @@ func (w *probeFakeWorld) checker(t *testing.T) *revocation.Checker {
 	return rc
 }
 
-func (w *probeFakeWorld) fetcher() *revocation.Fetcher {
-	return revocation.NewFetcher(revocation.FetcherOptions{DialContext: w.net.DialContext})
+// prober probes on the fake network at probeNow with the production CRL
+// cost limit; rc may be nil.
+func (w *probeFakeWorld) prober(rc *revocation.Checker) prober {
+	return prober{rc: rc, fetcher: revocation.NewFetcher(revocation.FetcherOptions{DialContext: w.net.DialContext}),
+		now: func() time.Time { return probeNow }, crlLimit: revocation.DefaultCRLCacheBytes}
 }
 
 func TestProbeAgainstFakeNetwork(t *testing.T) {
@@ -205,7 +208,7 @@ func TestProbeAgainstFakeNetwork(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	got, err := run(t.Context(), w.checker(t), w.fetcher(), targets, probeNow, &out)
+	got, err := w.prober(w.checker(t)).run(t.Context(), targets, &out)
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out.String())
 	}
@@ -263,6 +266,8 @@ func TestRunRejectsInvalidTargets(t *testing.T) {
 	w := newProbeFakeWorld(t)
 	good := Target{Profile: "p", Kind: KindOCSP, URL: "http://ocsp-good.test/", Issuer: w.ca.Cert, Policy: w.policy}
 	specimen := w.specimen(t, "http://ocsp-good.test/")
+	foreign := testpki.NewRoot(t, "Foreign CA", testpki.CertSpec{Now: probeNow, CDP: []testpki.DistributionPoint{{URIs: []string{probeCRLURL("/fresh.crl")}}}}).Cert
+	otherDP := w.ca.Intermediate(t, "Probe CA other DP", testpki.CertSpec{Now: probeNow, CDP: []testpki.DistributionPoint{{URIs: []string{probeCRLURL("/other.crl")}}}}).Cert
 	cases := []struct {
 		name   string
 		mutate func(*Target)
@@ -277,13 +282,19 @@ func TestRunRejectsInvalidTargets(t *testing.T) {
 		{"specimen without checker", func(t *Target) {
 			t.Kind, t.URL, t.Specimen = KindSpecimen, "", specimen
 		}, nil},
+		{"crl covering a certificate of another issuer", func(t *Target) {
+			t.Kind, t.URL, t.Covers = KindCRL, probeCRLURL("/fresh.crl"), []*x509.Certificate{foreign}
+		}, nil},
+		{"crl covering a certificate whose CDP does not name it", func(t *Target) {
+			t.Kind, t.URL, t.Covers = KindCRL, probeCRLURL("/fresh.crl"), []*x509.Certificate{otherDP}
+		}, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			tg := good
 			c.mutate(&tg)
 			var out bytes.Buffer
-			sum, err := run(t.Context(), c.rc, w.fetcher(), []Target{good, tg}, probeNow, &out)
+			sum, err := w.prober(c.rc).run(t.Context(), []Target{good, tg}, &out)
 			if err == nil {
 				t.Fatalf("run = %+v, nil; want an error", sum)
 			}
@@ -300,7 +311,7 @@ func TestRunStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	var out bytes.Buffer
-	if _, err := run(ctx, nil, w.fetcher(), []Target{tg}, probeNow, &out); !errors.Is(err, context.Canceled) {
+	if _, err := w.prober(nil).run(ctx, []Target{tg}, &out); !errors.Is(err, context.Canceled) {
 		t.Errorf("run with a cancelled context = %v, want context.Canceled", err)
 	}
 }
@@ -309,7 +320,7 @@ func TestRunStopsOnCancel(t *testing.T) {
 func (w *probeFakeWorld) runLines(t *testing.T, targets []Target) (Summary, []string) {
 	t.Helper()
 	var out bytes.Buffer
-	sum, err := run(t.Context(), w.checker(t), w.fetcher(), targets, probeNow, &out)
+	sum, err := w.prober(w.checker(t)).run(t.Context(), targets, &out)
 	if err != nil {
 		t.Fatalf("run: %v\n%s", err, out.String())
 	}
@@ -392,13 +403,17 @@ func TestProbeCRLMatchesChecker(t *testing.T) {
 		if !strings.Contains(line, `detail="`+c.detail) {
 			t.Errorf("%s scope %d: line %q lacks detail %q", c.path, c.scope, line, c.detail)
 		}
+		// The checker on a certificate of that scope (a leaf or an
+		// intermediate) whose only revocation source is this CRL agrees.
+		cdp := []testpki.DistributionPoint{{URIs: []string{probeCRLURL(c.path)}}}
+		var cert *x509.Certificate
 		if c.scope == revocation.ScopeCA {
-			continue
+			cert = w.ca.Intermediate(t, "probe crl ca", testpki.CertSpec{Now: probeNow, CDP: cdp}).Cert
+		} else {
+			cert = w.ca.Leaf(t, testpki.CertSpec{Now: probeNow, Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, "probe crl leaf")},
+				ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, CDP: cdp}).Cert
 		}
-		// The checker on a leaf whose only revocation source is this CRL agrees.
-		leaf := w.ca.Leaf(t, testpki.CertSpec{Now: probeNow, Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, "probe crl leaf")},
-			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, CDP: []testpki.DistributionPoint{{URIs: []string{probeCRLURL(c.path)}}}}).Cert
-		res, err := rc.Check(t.Context(), leaf, w.ca.Cert, w.policy)
+		res, err := rc.Check(t.Context(), cert, w.ca.Cert, w.policy)
 		if err != nil {
 			t.Fatalf("Check: %v", err)
 		}
@@ -426,7 +441,7 @@ func TestRunNothingVerifiedFails(t *testing.T) {
 		sum  Summary
 		want bool
 	}{
-		{Summary{}, false},
+		{Summary{}, true},
 		{Summary{OK: 1}, false},
 		{Summary{OK: 1, Warn: 5}, false},
 		{Summary{Warn: 1}, true},
@@ -435,6 +450,207 @@ func TestRunNothingVerifiedFails(t *testing.T) {
 		if got := c.sum.Failed(); got != c.want {
 			t.Errorf("%+v.Failed() = %v, want %v", c.sum, got, c.want)
 		}
+	}
+}
+
+// TestRunRejectsEmptyTargets: a run without targets verified nothing and
+// fails (U13-ASTRA-5).
+func TestRunRejectsEmptyTargets(t *testing.T) {
+	w := newProbeFakeWorld(t)
+	var out bytes.Buffer
+	sum, err := w.prober(nil).run(t.Context(), nil, &out)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if sum != (Summary{}) || !sum.Failed() {
+		t.Errorf("summary = %+v, Failed() = %v; want empty and failed", sum, sum.Failed())
+	}
+	if got, want := out.String(), "summary: 0 ok, 0 warn, 0 fail (no endpoint verified)\n"; got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
+// TestRunCanceledDuringLastTarget: a cancellation while the last target is
+// probed fails the run, as it does during any earlier target (U13-ASTRA-4).
+func TestRunCanceledDuringLastTarget(t *testing.T) {
+	w := newProbeFakeWorld(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	s := testpki.NewOCSPServer(w.ca, w.responder)
+	s.SetAnswer(probeOCSPHosts["ocsp-good.test"])
+	h := s.Handler(t)
+	w.net.Serve(t, "ocsp-cancel.test", http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		cancel() // SIGINT while the last target is probed
+		h.ServeHTTP(rw, r)
+	}))
+	policy := w.policy
+	policy.OCSPHosts = append(slices.Clone(policy.OCSPHosts), "ocsp-cancel.test")
+	var out bytes.Buffer
+	sum, err := w.prober(nil).run(ctx, []Target{
+		{Profile: "p-good", Kind: KindOCSP, URL: "http://ocsp-good.test/", Issuer: w.ca.Cert, Policy: policy},
+		{Profile: "p-cancel", Kind: KindOCSP, URL: "http://ocsp-cancel.test/", Issuer: w.ca.Cert, Policy: policy},
+	}, &out)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("run = %+v, %v; want context.Canceled\n%s", sum, err, out.String())
+	}
+	if strings.Contains(out.String(), "summary:") {
+		t.Errorf("a cancelled run printed a summary:\n%s", out.String())
+	}
+}
+
+// TestProbeUsesPerTargetClock: every OCSP and CRL target reads the clock
+// once, when it is probed, so evidence that expires during a long run is
+// judged at the time it is fetched (U13-ASTRA-3).
+func TestProbeUsesPerTargetClock(t *testing.T) {
+	w := newProbeFakeWorld(t)
+	crl := Target{Profile: "p-crl", Kind: KindCRL, URL: probeCRLURL("/fresh.crl"), Issuer: w.ca.Cert, Policy: w.policy}
+	ocsp := Target{Profile: "p-ocsp", Kind: KindOCSP, URL: "http://ocsp-good.test/", Issuer: w.ca.Cert, Policy: w.policy}
+	// fresh.crl is valid until probeNow+23h59m, the OCSP answer until probeNow+1h.
+	times := []time.Time{probeNow, probeNow.Add(24 * time.Hour), probeNow, probeNow.Add(2 * time.Hour)}
+	reads := 0
+	p := w.prober(nil)
+	p.now = func() time.Time {
+		reads++
+		return times[min(reads, len(times))-1]
+	}
+	var out bytes.Buffer
+	if _, err := p.run(t.Context(), []Target{crl, crl, ocsp, ocsp}, &out); err != nil {
+		t.Fatalf("run: %v\n%s", err, out.String())
+	}
+	lines := strings.Split(out.String(), "\n")
+	want := []struct {
+		verdict Verdict
+		part    string
+	}{
+		{VerdictOK, "outcome=good"},
+		{VerdictFail, "crl nextUpdate in the past"},
+		{VerdictOK, "outcome=good"},
+		{VerdictFail, "outcome=stale"},
+	}
+	for i, wl := range want {
+		if v, _, _ := strings.Cut(lines[i], " "); Verdict(v) != wl.verdict || !strings.Contains(lines[i], wl.part) {
+			t.Errorf("line %d = %q, want %s with %q", i, lines[i], wl.verdict, wl.part)
+		}
+	}
+	if reads != len(times) {
+		t.Errorf("clock read %d times, want %d (once per target)", reads, len(times))
+	}
+}
+
+// TestProbeCRLCostLimitMatchesChecker: the probe parses a CRL through the
+// checker's cost bound, so a CRL too dense for the checker's CRL cache is a
+// FAIL, as the checker refuses it (U13-ASTRA-2).
+func TestProbeCRLCostLimitMatchesChecker(t *testing.T) {
+	w := newProbeFakeWorld(t)
+	const small = 8 << 10 // fresh.crl (one entry) fits, dense.crl (64 entries) does not
+	entries := make([]testpki.CRLEntry, 64)
+	for i := range entries {
+		entries[i] = testpki.CRLEntry{Serial: big.NewInt(int64(1000 + i)), RevokedAt: probeNow.Add(-time.Hour)}
+	}
+	w.net.Serve(t, "dense.test", testpki.Bytes("application/pkix-crl", w.ca.CRL(t, testpki.CRLSpec{Now: probeNow, Number: 1, Entries: entries})))
+	policy := w.policy
+	policy.CRLHosts = []string{"crl.test", "dense.test"}
+	cases := []struct {
+		url     string
+		limit   int64
+		verdict Verdict
+		detail  string
+	}{
+		{probeCRLURL("/fresh.crl"), small, VerdictOK, "1 entries"},
+		{"http://dense.test/dense.crl", small, VerdictFail, "crl too large"},
+		{"http://dense.test/dense.crl", revocation.DefaultCRLCacheBytes, VerdictOK, "64 entries"},
+	}
+	for _, c := range cases {
+		p := w.prober(nil)
+		p.crlLimit = c.limit
+		var out bytes.Buffer
+		if _, err := p.run(t.Context(), []Target{{Profile: "p", Kind: KindCRL, URL: c.url, Issuer: w.ca.Cert, Policy: policy}}, &out); err != nil {
+			t.Fatalf("run: %v", err)
+		}
+		line, _, _ := strings.Cut(out.String(), "\n")
+		if v, _, _ := strings.Cut(line, " "); Verdict(v) != c.verdict || !strings.Contains(line, `detail="`+c.detail+`"`) {
+			t.Errorf("%s limit %d: line %q, want %s with detail %q", c.url, c.limit, line, c.verdict, c.detail)
+		}
+		// The checker with the same CRL cache limit agrees on a leaf whose
+		// only revocation source is this CRL.
+		rc, err := revocation.NewChecker(revocation.Options{DialContext: w.net.DialContext, CRLCacheBytes: c.limit,
+			Now: func() time.Time { return probeNow }, Logger: slog.New(slog.DiscardHandler)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf := w.ca.Leaf(t, testpki.CertSpec{Now: probeNow, Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, "probe crl leaf")},
+			ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, CDP: []testpki.DistributionPoint{{URIs: []string{c.url}}}}).Cert
+		res, err := rc.Check(t.Context(), leaf, w.ca.Cert, policy)
+		if err != nil {
+			t.Fatalf("Check: %v", err)
+		}
+		if ok := res.Status == revocation.StatusGood; ok != (c.verdict == VerdictOK) {
+			t.Errorf("%s limit %d: checker status %s (%s), probe verdict %s", c.url, c.limit, res.Status, res.Detail, c.verdict)
+		}
+	}
+}
+
+// TestProbeCRLRequiresIDPForDNIePartitions: a CRL row judged for a CA whose
+// DPs name several CRLs (AC DNIE 005 and 006) needs the CRL to name its DP
+// in an IDP, as the checker does; a CA with one DP (AC DNIE 004) does not
+// (U13-ASTRA-1).
+func TestProbeCRLRequiresIDPForDNIePartitions(t *testing.T) {
+	w := newProbeFakeWorld(t)
+	const unnamed = "crl without an idp name for a CA with several DPs"
+	cases := []struct {
+		name    string
+		oneDP   bool                          // the CA's only DP names ARL.crl
+		idp     func(string) *testpki.IDPSpec // the IDP of the CRL at a URL; nil: none
+		verdict Verdict
+		detail  string
+	}{
+		{"no idp", false, nil, VerdictFail, unnamed},
+		{"idp without a name", false, func(string) *testpki.IDPSpec { return &testpki.IDPSpec{OnlyCA: true} }, VerdictFail, unnamed},
+		{"idp naming its dp", false, func(u string) *testpki.IDPSpec { return &testpki.IDPSpec{URIs: []string{u}} }, VerdictOK, "0 entries"},
+		{"one dp, no idp", true, nil, VerdictOK, "0 entries"},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			host := "dnie" + strconv.Itoa(i) + ".test"
+			urls := []string{"http://" + host + "/CRL.crl", "http://" + host + "/ARL.crl"}
+			mux := http.NewServeMux()
+			for _, u := range urls {
+				spec := testpki.CRLSpec{Now: probeNow, Number: 1}
+				if c.idp != nil {
+					spec.IDP = c.idp(u)
+				}
+				mux.Handle(strings.TrimPrefix(u, "http://"+host), testpki.Bytes("application/pkix-crl", w.ca.CRL(t, spec)))
+			}
+			w.net.Serve(t, host, mux)
+			if c.oneDP {
+				urls = urls[1:]
+			}
+			var cdp []testpki.DistributionPoint
+			for _, u := range urls {
+				cdp = append(cdp, testpki.DistributionPoint{URIs: []string{u}})
+			}
+			ca := w.ca.Intermediate(t, "probe AC DNIE", testpki.CertSpec{Now: probeNow, CDP: cdp}).Cert
+			policy := w.policy
+			policy.CRLHosts = []string{host}
+			var targets []Target
+			for _, u := range urls {
+				targets = append(targets, Target{Profile: "p-dnie", Kind: KindCRL, URL: u, Issuer: w.ca.Cert, Policy: policy,
+					Scope: revocation.ScopeCA, Covers: []*x509.Certificate{ca}})
+			}
+			_, lines := w.runLines(t, targets)
+			for _, line := range lines[:len(targets)] {
+				if v, _, _ := strings.Cut(line, " "); Verdict(v) != c.verdict || !strings.Contains(line, c.detail) {
+					t.Errorf("line %q, want %s with %q", line, c.verdict, c.detail)
+				}
+			}
+			res, err := w.checker(t).Check(t.Context(), ca, w.ca.Cert, policy)
+			if err != nil {
+				t.Fatalf("Check: %v", err)
+			}
+			if ok := res.Status == revocation.StatusGood; ok != (c.verdict == VerdictOK) {
+				t.Errorf("checker status %s (%s), probe verdict %s", res.Status, res.Detail, c.verdict)
+			}
+		})
 	}
 }
 
@@ -539,6 +755,11 @@ func TestDefaultTargets(t *testing.T) {
 
 	// DNIe: OCSP per pinned intermediate, the root CRL and ARL against the
 	// root at CA scope (they cover the intermediates); every other CRL at leaf scope.
+	enabled, err := enabledProfiles()
+	if err != nil {
+		t.Fatal(err)
+	}
+	covered := 0
 	for _, tg := range targets {
 		wantScope := revocation.ScopeLeaf
 		if tg.Profile == "dnie-auth" {
@@ -547,6 +768,25 @@ func TestDefaultTargets(t *testing.T) {
 		if tg.Kind == KindCRL && tg.Scope != wantScope {
 			t.Errorf("%s %s: scope %d, want %d", tg.Profile, tg.URL, tg.Scope, wantScope)
 		}
+		// A CRL is judged for exactly the pinned intermediates of its issuer
+		// whose CDP names it, as the checker judges it for each of them.
+		var wantCovers []*x509.Certificate
+		for _, c := range enabled[tg.Profile].Intermediates {
+			dps, err := revocation.UsableDistributionPoints(c, tg.Issuer)
+			if err != nil {
+				t.Fatalf("%s: %v", c.Subject, err)
+			}
+			names := slices.ContainsFunc(dps, func(dp revocation.DistributionPoint) bool {
+				return slices.ContainsFunc(dp.FullName, func(gn revocation.GeneralName) bool { u, ok := gn.URI(); return ok && u == tg.URL })
+			})
+			if tg.Kind == KindCRL && names && bytes.Equal(c.RawIssuer, tg.Issuer.RawSubject) {
+				wantCovers = append(wantCovers, c)
+			}
+		}
+		if !slices.EqualFunc(tg.Covers, wantCovers, func(a, b *x509.Certificate) bool { return bytes.Equal(a.Raw, b.Raw) }) {
+			t.Errorf("%s %s %s: covers %d certificates, want the %d pinned intermediates naming it", tg.Profile, tg.Kind, tg.URL, len(tg.Covers), len(wantCovers))
+		}
+		covered += len(tg.Covers)
 		if tg.Profile != "dnie-auth" {
 			continue
 		}
@@ -554,6 +794,9 @@ func TestDefaultTargets(t *testing.T) {
 		if (tg.Kind == KindCRL) != selfSigned {
 			t.Errorf("dnie %s %s: issuer %q self-signed=%v, want the root only for the CRLs", tg.Kind, tg.URL, tg.Issuer.Subject, selfSigned)
 		}
+	}
+	if covered != 5 { // CRL.crl: AC DNIE 005 and 006; ARL.crl: AC DNIE 004, 005 and 006
+		t.Errorf("CRL targets cover %d certificates, want 5", covered)
 	}
 }
 
@@ -665,5 +908,45 @@ func TestLoadSpecimensBounded(t *testing.T) {
 	}
 	if len(fifo.opened) != 0 {
 		t.Errorf("opened %q, want the named pipe left unopened", fifo.opened)
+	}
+}
+
+// TestLoadSpecimensEntryLimit: LoadSpecimens considers at most
+// maxSpecimenEntries directory entries; a larger directory is an error
+// before any file is read (U13-ASTRA-6).
+func TestLoadSpecimensEntryLimit(t *testing.T) {
+	digitel, err := os.ReadFile("../../../testdata/specimens/digitel-ciudadanosw-99949996T.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := func(n int) *countingFS { // the DIGITEL specimen and n-1 other files
+		m := fstest.MapFS{"digitel.pem": {Data: digitel}}
+		for i := range n - 1 {
+			m["other-"+strconv.Itoa(i)+".txt"] = &fstest.MapFile{Data: []byte("x")}
+		}
+		return &countingFS{m: m}
+	}
+	if got, err := LoadSpecimens(dir(maxSpecimenEntries)); err != nil || len(got) != 1 {
+		t.Errorf("LoadSpecimens(%d entries) = %d targets, %v; want the specimen", maxSpecimenEntries, len(got), err)
+	}
+	over := dir(maxSpecimenEntries + 1)
+	if got, err := LoadSpecimens(over); err == nil {
+		t.Errorf("LoadSpecimens(%d entries) = %d targets, nil; want an error", maxSpecimenEntries+1, len(got))
+	}
+	if len(over.opened) != 0 {
+		t.Errorf("opened %q in a directory over the entry limit, want nothing", over.opened)
+	}
+}
+
+// TestLoadSpecimensDeduplicatesKnownCertificates: copies of a known specimen
+// under several names are one target (U13-ASTRA-6).
+func TestLoadSpecimensDeduplicatesKnownCertificates(t *testing.T) {
+	digitel, err := os.ReadFile("../../../testdata/specimens/digitel-ciudadanosw-99949996T.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadSpecimens(fstest.MapFS{"a.pem": {Data: digitel}, "b.pem": {Data: digitel}, "c.pem": {Data: digitel}})
+	if err != nil || len(got) != 1 {
+		t.Errorf("LoadSpecimens(3 copies) = %d targets, %v; want 1", len(got), err)
 	}
 }

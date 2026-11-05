@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -160,10 +161,11 @@ func Load(getenv func(string) string) (Config, error) {
 }
 
 // parsePublicURL accepts an https origin, or an http one for localhost and
-// 127.0.0.1 only. A trailing "/" is dropped; any other path, a query, a
-// fragment, userinfo or a port outside [1,65535] is rejected. The result is
-// in the form browsers send in Origin: lowercase host, canonical port, no
-// default port.
+// 127.0.0.1 only. The host is an IP literal, localhost or a DNS name (no
+// trailing dot, ASCII only). A trailing "/" is dropped; any other path, a
+// query, a fragment, userinfo or a port outside [1,65535] is rejected. The
+// result is in the form browsers send in Origin: lowercase host, canonical
+// IP and port, no default port.
 func parsePublicURL(raw string) (*url.URL, bool) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
@@ -173,6 +175,11 @@ func parsePublicURL(raw string) (*url.URL, bool) {
 		return nil, false
 	}
 	host := strings.ToLower(u.Hostname())
+	if ip, err := netip.ParseAddr(host); err == nil && ip.Zone() == "" {
+		host = ip.String()
+	} else if host != "localhost" && !dnsNameRe.MatchString(host) {
+		return nil, false // a typo here would make every browser Origin mismatch
+	}
 	local := host == "localhost" || host == "127.0.0.1"
 	if u.Scheme != "https" && (u.Scheme != "http" || !local) {
 		return nil, false

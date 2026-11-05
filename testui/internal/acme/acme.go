@@ -9,8 +9,10 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,8 @@ import (
 
 	"github.com/caddyserver/certmagic"
 	"github.com/libdns/cloudflare"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // Options configures the ACME manager.
@@ -29,6 +33,7 @@ type Options struct {
 	CloudflareToken string
 	OverrideDomain  string // optional DNS-01 CNAME delegation target
 	Logger          *slog.Logger
+	LogOutput       io.Writer // certmagic's JSON log lines, at the levels Logger enables (main: stdout); nil discards them
 }
 
 // Manager serves the auth certificate and reports readiness.
@@ -52,17 +57,24 @@ func NewACME(o Options) (*Manager, error) {
 	if o.AuthDomain == "" || o.DataDir == "" || o.Email == "" || o.CloudflareToken == "" {
 		return nil, errors.New("acme: AuthDomain, DataDir, Email and CloudflareToken are required")
 	}
+	storage := filepath.Join(o.DataDir, "certmagic")
+	if err := probeStorage(storage); err != nil {
+		return nil, err
+	}
 	m := &Manager{name: "*." + o.AuthDomain, log: o.Logger}
 	if m.log == nil {
 		m.log = slog.Default()
 	}
+	zl := zapLogger(o.LogOutput, m.log)
 	var cfg *certmagic.Config
 	cache := certmagic.NewCache(certmagic.CacheOptions{
 		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) { return cfg, nil },
+		Logger:           zl,
 	})
 	cfg = certmagic.New(cache, certmagic.Config{
-		Storage: &certmagic.FileStorage{Path: filepath.Join(o.DataDir, "certmagic")},
+		Storage: &certmagic.FileStorage{Path: storage},
 		OCSP:    certmagic.OCSPConfig{DisableStapling: true},
+		Logger:  zl,
 	})
 	ca := certmagic.LetsEncryptProductionCA
 	if o.Staging {
@@ -74,14 +86,52 @@ func NewACME(o Options) (*Manager, error) {
 		Agreed:                  true,
 		DisableHTTPChallenge:    true,
 		DisableTLSALPNChallenge: true,
+		Logger:                  zl, // also acmez's
 		DNS01Solver: &certmagic.DNS01Solver{DNSManager: certmagic.DNSManager{
 			DNSProvider:    &cloudflare.Provider{APIToken: o.CloudflareToken, HTTPClient: &http.Client{Timeout: cloudflareTimeout}},
 			OverrideDomain: o.OverrideDomain,
+			Logger:         zl,
 		}},
 	})
 	cfg.Issuers = []certmagic.Issuer{issuer}
 	m.cfg, m.cache, m.manage, m.backoff, m.attempt = cfg, cache, cfg.ManageSync, obtainBackoff, obtainAttemptTimeout
 	return m, nil
+}
+
+// zapLogger returns the logger for certmagic and acmez: JSON lines on w with
+// slog's keys and level names, at the levels log enables. Without it they
+// write console lines to stderr at Info, outside the app's stream and level.
+func zapLogger(w io.Writer, log *slog.Logger) *zap.Logger {
+	if w == nil {
+		return zap.NewNop()
+	}
+	enc := zap.NewProductionEncoderConfig()
+	enc.TimeKey, enc.EncodeTime, enc.EncodeLevel = "time", zapcore.RFC3339NanoTimeEncoder, zapcore.CapitalLevelEncoder
+	enabled := zap.LevelEnablerFunc(func(l zapcore.Level) bool {
+		return log.Enabled(context.Background(), slog.Level(4*int(l))) // zap Debug..Error (-1..2) are slog's -4..8
+	})
+	return zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(enc), zapcore.Lock(zapcore.AddSync(w)), enabled))
+}
+
+// probeStorage creates dir (0700) and writes and removes a file in it, so a
+// directory that cannot be created or written (read-only mount, a path
+// through a regular file, no permission) fails startup; certmagic checks its
+// storage only when it obtains, and Run would retry that hourly, not ready.
+// An unmounted volume is not detected: its mount point is then a writable
+// directory of the container's own filesystem.
+func probeStorage(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("acme: storage %s: %w", dir, err)
+	}
+	f, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return fmt.Errorf("acme: storage %s is not writable: %w", dir, err)
+	}
+	_, werr := f.Write([]byte("probe"))
+	if err := errors.Join(werr, f.Close(), os.Remove(f.Name())); err != nil {
+		return fmt.Errorf("acme: storage %s is not writable: %w", dir, err)
+	}
+	return nil
 }
 
 // NewStatic serves a fixed certificate (CERTCHECK_TLS_CERT_FILE/_KEY_FILE or tests).
@@ -128,6 +178,9 @@ func (m *Manager) Run(ctx context.Context) error {
 			m.ready.Store(true)
 			m.log.Info("auth certificate ready", "name", m.name)
 			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err() // stopped mid-attempt: not an issuance failure
 		}
 		wait := m.backoff[min(i, len(m.backoff)-1)]
 		m.log.Error("auth certificate not obtained; retrying", "name", m.name, "error", err.Error(), "retryIn", wait.String())

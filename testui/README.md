@@ -105,6 +105,12 @@ Browser notes:
   Accept it once for each provider host, for example `https://fnmt.auth.localtest.me:8443`.
 - TLS 1.2 is the default on the auth listener; set `CERTCHECK_AUTH_TLS13=true` to allow 1.3.
 - The UI can be checked offline against canned API responses with `cd testui && go run ./web/internal/devserver`.
+- `TestBrowser` loads the UI from the devserver in headless Chrome and checks the view each page ends on.
+  The cases are `#error=__proto__`, `constructor` and unknown codes, malformed replies, a browser
+  without `Object.hasOwn`, the fallback when the error view itself throws, and "Start again" on the
+  working view. It sits behind the `browser` build tag, so the default run and CI skip it. It needs
+  Chrome or Chromium; set `CHROME=/path/to/binary` when neither is on `PATH`:
+  `cd testui && go test -tags browser -count=1 -run TestBrowser ./web/internal/devserver`.
 
 ## 3. Configuration
 
@@ -114,11 +120,11 @@ a message that lists every problem and never prints a secret.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `8080` | Main listener port (Railway sets it) |
-| `CERTCHECK_PUBLIC_URL` | required | Fixed callback origin, e.g. `https://cert-check.vocdoni.dev`. https only, http for localhost and 127.0.0.1. No path other than `/`, no query, fragment or userinfo; the host is lowercased and a default port dropped |
+| `CERTCHECK_PUBLIC_URL` | required | Fixed callback origin, e.g. `https://cert-check.vocdoni.dev`. https only, http for localhost and 127.0.0.1. No path other than `/`, no query, fragment or userinfo. The host is a DNS name (no trailing dot, IDNs in punycode), an IP literal or `localhost`; it is lowercased and a default port dropped |
 | `CERTCHECK_AUTH_DOMAIN` | required | Lowercase DNS name whose wildcard hosts the providers, e.g. `auth.cert-check.vocdoni.dev` |
 | `CERTCHECK_AUTH_PUBLIC_PORT` | `$RAILWAY_TCP_PROXY_PORT` | External auth port used in `authUrl`. Required: set it when `RAILWAY_TCP_PROXY_PORT` is absent |
 | `CERTCHECK_AUTH_LISTEN` | `:8443` | Auth listener address, `host:port` with a numeric port between 1 and 65535 |
-| `CERTCHECK_DATA_DIR` | `/data` | ACME storage: `<dir>/certmagic` (the Railway volume) |
+| `CERTCHECK_DATA_DIR` | `/data` | ACME storage: `<dir>/certmagic` (the Railway volume), created 0700 if missing. Startup fails if it cannot be written |
 | `CERTCHECK_ACME_EMAIL` | required with ACME | ACME account contact (a mailbox the owner controls) |
 | `CERTCHECK_ACME_CA` | `production` | `production` or `staging` (Let's Encrypt) |
 | `CLOUDFLARE_API_TOKEN` | required with ACME | DNS-01 token (secret). Permissions: **Zone:Read + Zone.DNS:Edit** on `vocdoni.dev` |
@@ -126,7 +132,7 @@ a message that lists every problem and never prints a secret.
 | `CERTCHECK_TLS_CERT_FILE` / `CERTCHECK_TLS_KEY_FILE` | unset | Static certificate and key instead of ACME; mutually exclusive with the three ACME variables above |
 | `CERTCHECK_AUTH_TLS13` | `false` | Allow TLS 1.3 on the auth listener (see [Security notes](#6-security-notes)) |
 | `CERTCHECK_TRUSTED_PROXY_HOPS` | `1` | Trusted proxy hops, 0 to 10. The client IP is the entry that many places from the right of `X-Forwarded-For` |
-| `CERTCHECK_LOG_LEVEL` | `info` | slog level: `debug`, `info`, `warn`, `error` |
+| `CERTCHECK_LOG_LEVEL` | `info` | slog level: `debug`, `info`, `warn`, `error`. Also applies to the ACME (certmagic) lines, written as JSON to the same stdout stream |
 | `RAILWAY_RUN_UID` | set on the service: `0` | Platform setting, not read by the app. Railway mounts volumes as root, so the process must run as root to create `/data/certmagic` (accepted, see [Security notes](#6-security-notes)) |
 | `RAILWAY_GIT_COMMIT_SHA` | `dev` | Docker build argument, injected by Railway; becomes the reported `serverVersion` |
 
@@ -162,15 +168,24 @@ Production: Railway project `CertificateCheck`, environment `production`, servic
    present and valid.
 4. The runner group `Default` must admit the repository, otherwise the job queues forever:
    `gh api orgs/vocdoni/actions/runner-groups --jq '.runner_groups[]|{name,visibility,allows_public_repositories}'`.
-   A `pull_request` run executes the workflow file of the pull request's head on these runners, with
-   the Docker daemon (root on the host) and the Go caches that later `main` runs reuse, so nothing in
-   `ci.yml` can protect them. The protection is these settings, all required:
+   A `pull_request` run executes the workflow file of the pull request's head on these runners. It
+   reaches the Docker daemon (root on the host) and, on a host that outlives the job, the Go caches,
+   toolchain and images that later `main` runs reuse, so nothing in `ci.yml` can protect them. The
+   protection is these settings, all required:
    - runner group: `visibility` `selected`, listing this repository only, and
      `allows_public_repositories` `false`;
    - the repository stays private; in its Actions settings, running workflows from fork pull requests
      is disabled, and fork pull request workflows require approval for all outside collaborators;
-   - runners are registered with `--ephemeral`, so every job starts with fresh `GOMODCACHE` and
-     `GOCACHE` and no job can poison the caches of the next.
+   - every job runs in its own execution environment: a VM or container created from a clean image
+     for that job, with its own Docker daemon, and destroyed when the job ends. The runner inside it is
+     registered with `--ephemeral`. That flag is not the isolation: it only makes the runner take one
+     job and deregister. On a reused host the next job still finds the runner's home with `GOMODCACHE`
+     and `GOCACHE`, the tool cache with the Go that setup-go installed, the work directory with its
+     downloaded actions, and the Docker daemon with its images and build cache, so one job can poison
+     what the next one builds.
+     In a fresh environment the only Go cache that crosses jobs is setup-go's GitHub Actions cache
+     (`cache: true`), which GitHub scopes by branch: a pull request run can restore the cache of
+     `main`, but it saves to its own ref, which `main` runs never read.
 5. Branch protection (or a ruleset) on `main` requires the status check `ci`. Railway's wait-for-CI is
    the second gate, not a substitute: it never blocks a commit that has no `ci` run (step 2).
 
@@ -307,10 +322,12 @@ Staging has far higher limits and issues an untrusted certificate, so use it for
   unknown subdomain ends with the `internal error` alert.
 - No-certificate path: `POST /api/v1/transactions`, follow the `authUrl` without a client certificate
   (a `303` to `#code=...`), then redeem the code: the answer is `no_certificate` with diagnostics.
-- Client IP header: set `CERTCHECK_LOG_LEVEL=debug`, create one transaction, read the
-  `forwarded headers` log line (header names and the `xffEntries` count), then reset to `info`. If
-  `X-Forwarded-For` is absent or `xffEntries` is not 1 for a direct client, change the header or the
-  hop count before going live.
+- Client IP header: set `CERTCHECK_LOG_LEVEL=debug`, create one transaction from a client that uses
+  no proxy of its own, read the `forwarded headers` log line (header names and the `xffEntries`
+  count), then reset to `info`. Such a direct request arrives with two entries, the client and the
+  Railway hop (`<client>, <railway hop>`), which is what `CERTCHECK_TRUSTED_PROXY_HOPS=2` expects: the
+  client is the second entry from the right. If `X-Forwarded-For` is absent or `xffEntries` is not 2,
+  change the header or the hop count before going live.
 - Service goldens. `TestDeployedServiceGolden` compares the deployed service with the goldens in
   `testdata/golden` (repository root): the providers API body byte for byte, and for each of the 14
   provider hosts the ordered `certificate_authorities` list of the handshake. It runs after a deploy,
@@ -347,11 +364,15 @@ responder outage.
 network it runs in. It needs no configuration and starts no server. For each enabled profile it asks
 each responder about a never-issued serial, with a nonce only when the profile requires one, as the
 checker does. It fetches each CRL, checks its signature against the pinned CA and evaluates it with
-the checker's own rules: its dates and freshness, and its Issuing Distribution Point (the name must
-include the CRL's URL, and no scope flag the checker rejects). For DNIe that means the root's
-`CRL.crl` and `ARL.crl`, evaluated at CA scope because together they cover the pinned intermediates.
-Each `specimen-dir` argument is a directory of `*.pem` files (regular files of at most 64 KiB). The
-known live specimens found there get the full revocation check and must come back `good`; other
+the checker's own rules: the production cost limit (a CRL too large for the checker's cache is
+refused), its dates and freshness, and its Issuing Distribution Point (the name must include the
+CRL's URL, and no scope flag the checker rejects). The clock is read once per endpoint, when it is
+probed. For DNIe that means the root's `CRL.crl` and `ARL.crl`, evaluated at CA scope for each pinned
+intermediate whose CDP names them (AC DNIE 004 names `ARL.crl` only, 005 and 006 name both), with the
+checker's own rule (`revocation.EvaluateCRLFor`) that a CA whose DPs name several CRLs needs each CRL
+to name its DP in its IDP. Each `specimen-dir` argument is a directory of at most 1024 entries holding
+`*.pem` files (regular files of at most 64 KiB). The known live specimens found there get the full
+revocation check and must come back `good`, once each however many copies there are; other
 certificates are ignored, but a directory with no known live specimen is an error. The DIGITEL
 specimen is committed in `testdata/specimens` (repository root). The Bewor and Sectigo specimens are
 withheld and kept outside the repository.
@@ -371,10 +392,11 @@ when the profile requires a nonce, and `-` when none was sent. The last line is
   `stale`, `unsupported_method`), or a specimen that comes back `revoked` or `unknown`.
 
 Exit codes: `0` when no line is FAIL and at least one is OK. `1` when any line is FAIL, when no line
-is OK (every line WARN, for example without egress: nothing was verified), or when the probe cannot
-run (a specimen directory that cannot be read or holds no known live specimen, a `*.pem` file that is
-not a regular file, is larger than 64 KiB or holds no certificate, an interrupted run); the reason goes
-to stderr.
+is OK (every line WARN, for example without egress, or no target at all: nothing was verified), or
+when the probe cannot run (a specimen directory that cannot be read, has more than 1024 entries or
+holds no known live specimen, a `*.pem` file that is not a regular file, is larger than 64 KiB or holds
+no certificate, a run interrupted at any point, even during the last endpoint); the reason goes to
+stderr.
 
 Run it from the deployment network with a temporary service in the same project and repository. The
 image carries no specimens, so this run covers the endpoints only:

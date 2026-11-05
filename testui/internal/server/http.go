@@ -13,17 +13,16 @@ import (
 	"time"
 
 	"golang.org/x/time/rate"
+
+	"github.com/vocdoni/cert-check/testui/web"
 )
 
 // CookieName is the transaction cookie (host-only, Secure, HttpOnly).
 const CookieName = "__Host-certcheck_tx"
 
 const (
-	mainCSP = "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; font-src 'self'; " +
-		"connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
-	authCSP   = "default-src 'none'; frame-ancestors 'none'"
-	maxBody   = 1 << 10
-	hstsValue = "max-age=31536000"
+	authCSP = "default-src 'none'; frame-ancestors 'none'"
+	maxBody = 1 << 10
 )
 
 // setTxCookie sets the transaction cookie: Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=300.
@@ -46,19 +45,10 @@ func txCookie(r *http.Request) (Secret, bool) {
 	return Secret(c.Value), true
 }
 
-// mainHeaders sets the security headers on every main-listener response.
+// mainHeaders sets the security headers on every main-listener response. Package web defines
+// them, and the devserver serves through the same set.
 func mainHeaders(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h := w.Header()
-		h.Set("Content-Security-Policy", mainCSP)
-		h.Set("Referrer-Policy", "no-referrer")
-		h.Set("X-Content-Type-Options", "nosniff")
-		h.Set("Strict-Transport-Security", hstsValue)
-		if strings.HasPrefix(r.URL.Path, "/api/") {
-			h.Set("Cache-Control", "no-store")
-		}
-		next.ServeHTTP(w, r)
-	})
+	return web.SecurityHeaders(next)
 }
 
 // authHeaders sets the auth-listener headers (redirects and 404s alike). The
@@ -72,7 +62,7 @@ func authHeaders(w http.ResponseWriter) {
 	h.Set("Content-Security-Policy", authCSP)
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("X-Content-Type-Options", "nosniff")
-	h.Set("Strict-Transport-Security", hstsValue)
+	h.Set("Strict-Transport-Security", web.HSTS)
 	h.Set("Cache-Control", "no-store")
 	h.Set("Content-Type", "text/plain; charset=utf-8")
 }

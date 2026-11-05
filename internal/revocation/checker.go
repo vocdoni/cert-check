@@ -257,7 +257,6 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 		return StatusUnsupportedMethod
 	}
 	usable := usableDistributionPoints(dps, issuer)
-	needIDP := scope == ScopeCA && len(usable) > 1 && distinctCRLs(usable) > 1
 	last, tried, good, failed := StatusUnsupportedMethod, false, false, false
 	for _, dp := range usable {
 		fetched := false
@@ -271,7 +270,7 @@ func (c *Checker) checkCRL(ctx context.Context, cert, issuer *x509.Certificate, 
 				continue
 			}
 			tried, fetched = true, true
-			switch st := c.crlOnce(ctx, raw, cert, issuer, dp, p, scope, needIDP, now, res); st {
+			switch st := c.crlOnce(ctx, raw, cert, issuer, dp, usable, p, scope, now, res); st {
 			case StatusRevoked:
 				return st
 			case StatusGood:
@@ -319,7 +318,19 @@ func distinctCRLs(dps []DistributionPoint) int {
 	return len(paths) + other
 }
 
-func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Certificate, dp DistributionPoint, p Policy, scope Scope, needIDP bool, now time.Time, res *Result) Status {
+// EvaluateCRLFor is EvaluateCRL for a certificate whose usable distribution
+// points are dps, dp among them, with the rule checkCRL applies across them:
+// when a CA certificate's DPs name several CRLs, a CRL that does not name
+// its DP in an IDP is not used.
+func EvaluateCRLFor(p *ParsedCRL, cert *x509.Certificate, dp DistributionPoint, dps []DistributionPoint, scope Scope, now time.Time) (Status, CRLRecord, string) {
+	st, rec, detail := EvaluateCRL(p, cert, dp, scope, now)
+	if st == StatusGood && scope == ScopeCA && len(dps) > 1 && distinctCRLs(dps) > 1 && (p.IDP == nil || len(p.IDP.FullName) == 0) {
+		return StatusUnsupportedMethod, rec, "crl without an idp name for a CA with several DPs"
+	}
+	return st, rec, detail
+}
+
+func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Certificate, dp DistributionPoint, dps []DistributionPoint, p Policy, scope Scope, now time.Time, res *Result) Status {
 	key := issuerKey(issuer) + " " + u
 	load := c.crls.load(ctx, key, now, c.crlTO, func(fctx context.Context) crlLoad {
 		at := Attempt{Method: MethodCRL, URL: u}
@@ -352,10 +363,7 @@ func (c *Checker) crlOnce(ctx context.Context, u string, cert, issuer *x509.Cert
 		res.Detail = fmt.Sprintf("CRL %s: %s", u, at.Detail)
 		return load.status
 	}
-	st, rec, detail := EvaluateCRL(load.crl, cert, dp, scope, now)
-	if st == StatusGood && needIDP && (load.crl.IDP == nil || len(load.crl.IDP.FullName) == 0) {
-		st, detail = StatusUnsupportedMethod, "crl without an idp name for a CA with several DPs"
-	}
+	st, rec, detail := EvaluateCRLFor(load.crl, cert, dp, dps, scope, now)
 	at.Outcome, at.Detail = st, detail
 	at.ThisUpdate, at.NextUpdate = load.crl.ThisUpdate, load.crl.NextUpdate
 	res.Attempts = append(res.Attempts, at)

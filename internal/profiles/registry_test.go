@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -319,6 +320,54 @@ func TestRegistryErrors(t *testing.T) {
 	}
 }
 
+// TestRegistryRejectInvalidOIDArcs: under a first arc of 0 or 1 the second
+// arc is at most 39, so such an OID has no DER encoding and could never match.
+func TestRegistryRejectInvalidOIDArcs(t *testing.T) {
+	now := time.Now()
+	root := testpki.NewRoot(t, "root", testpki.CertSpec{Now: now})
+	for _, tc := range []struct {
+		oid   string
+		valid bool
+	}{
+		{"0.39", true}, {"0.40", false}, {"0.40.1", false},
+		{"1.39.3", true}, {"1.40", false}, {"1.40.3", false}, {"1.400.3.4", false},
+		{"2.40", true}, {"2.999.1.2", true},
+	} {
+		var arcs []int
+		for s := range strings.SplitSeq(tc.oid, ".") {
+			n, err := strconv.Atoi(s)
+			if err != nil {
+				t.Fatal(err)
+			}
+			arcs = append(arcs, n)
+		}
+		for _, field := range []struct {
+			name    string
+			set     func(*profiles.Profile)
+			wantErr string
+		}{
+			{"policy", func(p *profiles.Profile) { p.PolicyOIDs = []string{tc.oid} }, fmt.Sprintf("invalid OID %q", tc.oid)},
+			{"handled extension", func(p *profiles.Profile) { p.HandledCriticalExtensions = []string{tc.oid} }, fmt.Sprintf("invalid OID %q", tc.oid)},
+			{"marker", func(p *profiles.Profile) {
+				p.TestMarkers = []profiles.TestMarker{{Subject: []profiles.AttributeMatch{{OID: arcs, Value: "NOMDOS"}}, Source: "x"}}
+			}, "test marker attribute needs an OID and a value"},
+		} {
+			t.Run(field.name+" "+tc.oid, func(t *testing.T) {
+				p := regTProfile("p1", "prov", profiles.TestAnchor(root.Cert))
+				field.set(&p)
+				logger, _ := regTLogger()
+				_, err := profiles.New(profiles.Config{Providers: []profiles.Provider{regTProvider("prov", p)}, Now: now, Logger: logger})
+				switch {
+				case tc.valid && err != nil:
+					t.Errorf("New error = %v, want success", err)
+				case !tc.valid && (err == nil || !strings.Contains(err.Error(), field.wantErr)):
+					t.Errorf("New error = %v, want one containing %q", err, field.wantErr)
+				}
+			})
+		}
+	}
+}
+
 func TestValidityDisables(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	valid := testpki.CertSpec{Now: now, NotBefore: now.AddDate(-1, 0, 0), NotAfter: now.AddDate(5, 0, 0)}
@@ -330,6 +379,7 @@ func TestValidityDisables(t *testing.T) {
 	early := testpki.NewRoot(t, "future root", future)
 	deadInter := live.Intermediate(t, "expired inter", expired)
 	liveInter := live.Intermediate(t, "live inter", valid)
+	earlyInter := live.Intermediate(t, "future inter", future)
 	orphanInter := dead.Intermediate(t, "inter under expired root", valid)
 	anc := profiles.TestAnchor
 
@@ -351,6 +401,8 @@ func TestValidityDisables(t *testing.T) {
 		{name: "one of two anchors expired", anchors: []*testpki.CA{dead, live},
 			wantEnabled: true, wantAnchors: []*testpki.CA{live}, wantLog: []string{"anchor outside validity"}},
 		{name: "intermediates all expired", anchors: []*testpki.CA{live}, intermediates: []*testpki.CA{deadInter},
+			wantLog: []string{"intermediate outside validity", "profile disabled: no valid pinned intermediate", "provider hidden"}},
+		{name: "not-yet-valid-intermediate", anchors: []*testpki.CA{live}, intermediates: []*testpki.CA{earlyInter},
 			wantLog: []string{"intermediate outside validity", "profile disabled: no valid pinned intermediate", "provider hidden"}},
 		{name: "one of two intermediates expired", anchors: []*testpki.CA{live}, intermediates: []*testpki.CA{deadInter, liveInter},
 			wantEnabled: true, wantAnchors: []*testpki.CA{live}, wantInter: []*testpki.CA{liveInter}, wantLog: []string{"intermediate outside validity"}},
@@ -407,6 +459,106 @@ func TestValidityDisables(t *testing.T) {
 			}
 			if !e[0].Inter.Equal(regTPool(wantI...)) || len(e[0].Intermediates) != len(wantI) {
 				t.Errorf("Inter: got %d intermediates, want exactly the %d valid ones", len(e[0].Intermediates), len(wantI))
+			}
+		})
+	}
+}
+
+// TestValidityBoundaries: validity includes NotBefore and NotAfter, to the
+// second, for anchors and pinned intermediates alike.
+func TestValidityBoundaries(t *testing.T) {
+	notBefore := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	notAfter := notBefore.AddDate(1, 0, 0)
+	window := testpki.CertSpec{Now: notBefore, NotBefore: notBefore, NotAfter: notAfter}
+	root := testpki.NewRoot(t, "window root", window)
+	wideRoot := testpki.NewRoot(t, "wide root", testpki.CertSpec{Now: notBefore, NotBefore: notBefore.AddDate(-1, 0, 0), NotAfter: notAfter.AddDate(1, 0, 0)})
+	inter := wideRoot.Intermediate(t, "window inter", window)
+	viaInter := regTProfile("p1", "prov", profiles.TestAnchor(wideRoot.Cert))
+	viaInter.Intermediates = []profiles.Anchor{profiles.TestAnchor(inter.Cert)}
+	for _, at := range []struct {
+		name  string
+		now   time.Time
+		valid bool
+	}{
+		{"NotBefore-1s", notBefore.Add(-time.Second), false},
+		{"NotBefore", notBefore, true},
+		{"NotBefore+1s", notBefore.Add(time.Second), true},
+		{"NotAfter-1s", notAfter.Add(-time.Second), true},
+		{"NotAfter", notAfter, true},
+		{"NotAfter+1s", notAfter.Add(time.Second), false},
+	} {
+		for _, ca := range []struct {
+			name string
+			p    profiles.Profile
+		}{
+			{"anchor", regTProfile("p1", "prov", profiles.TestAnchor(root.Cert))},
+			{"intermediate", viaInter},
+		} {
+			t.Run(ca.name+" "+at.name, func(t *testing.T) {
+				logger, _ := regTLogger()
+				r, err := profiles.New(profiles.Config{Providers: []profiles.Provider{regTProvider("prov", ca.p)}, Now: at.now, Logger: logger})
+				if err != nil {
+					t.Fatalf("New: %v", err)
+				}
+				if got := len(r.Enabled("prov")) == 1; got != at.valid {
+					t.Errorf("profile enabled = %v at %v, want %v", got, at.now, at.valid)
+				}
+			})
+		}
+	}
+}
+
+// TestRegistryRejectsIntermediateIssuerMismatch: an anchor holding the key of
+// a pinned intermediate's issuer under another name does not issue it (path
+// building is name-based: no leaf would chain through it).
+func TestRegistryRejectsIntermediateIssuerMismatch(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	valid := testpki.CertSpec{Now: now, NotBefore: now.AddDate(-1, 0, 0), NotAfter: now.AddDate(5, 0, 0)}
+	expired := testpki.CertSpec{Now: now, NotBefore: now.AddDate(-3, 0, 0), NotAfter: now.AddDate(0, 0, -1)}
+	issuer := testpki.NewRoot(t, "issuer root", expired)
+	sameKey := valid
+	sameKey.KeyPair = issuer.Key
+	renamed := testpki.NewRoot(t, "renamed root", sameKey)
+	reissued := testpki.NewRoot(t, "issuer root", sameKey)
+	inter := issuer.Intermediate(t, "inter", valid)
+	anc := profiles.TestAnchor
+
+	tests := []struct {
+		name        string
+		anchors     []*testpki.CA
+		wantErr     string
+		wantEnabled bool
+		wantLog     string
+	}{
+		{name: "issuer key under another name", anchors: []*testpki.CA{renamed}, wantErr: "is not signed by a profile anchor"},
+		{name: "expired issuer, its key valid under another name", anchors: []*testpki.CA{issuer, renamed},
+			wantLog: "intermediate signer outside validity"},
+		{name: "issuer re-certified under its name", anchors: []*testpki.CA{issuer, reissued}, wantEnabled: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := regTProfile("p1", "prov")
+			for _, ca := range tc.anchors {
+				p.Anchors = append(p.Anchors, anc(ca.Cert))
+			}
+			p.Intermediates = []profiles.Anchor{anc(inter.Cert)}
+			logger, buf := regTLogger()
+			r, err := profiles.New(profiles.Config{Providers: []profiles.Provider{regTProvider("prov", p)}, Now: now, Logger: logger})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("New error = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if !strings.Contains(buf.String(), tc.wantLog) {
+				t.Errorf("log %q does not contain %q", buf.String(), tc.wantLog)
+			}
+			e := r.Enabled("prov")
+			if got := len(e) == 1 && len(e[0].Intermediates) == 1; got != tc.wantEnabled {
+				t.Errorf("profile enabled with the intermediate = %v (%d profiles), want %v", got, len(e), tc.wantEnabled)
 			}
 		})
 	}

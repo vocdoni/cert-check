@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,13 +9,19 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"maps"
 	"math/big"
 	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -200,6 +207,122 @@ func TestNewACMEConfig(t *testing.T) {
 	}
 }
 
+// TestNewACMEStorage: NewACME creates <DataDir>/certmagic (0700) and fails
+// when it cannot write there, instead of starting and retrying hourly while
+// not ready (U12-FABLE-2).
+func TestNewACMEStorage(t *testing.T) {
+	t.Run("created", func(t *testing.T) {
+		o := validOptions(t)
+		newTestACME(t, o)
+		dir := filepath.Join(o.DataDir, "certmagic")
+		st, err := os.Stat(dir)
+		if err != nil {
+			t.Fatalf("storage directory: %v", err)
+		}
+		if !st.IsDir() || st.Mode().Perm() != 0o700 {
+			t.Errorf("storage directory mode = %v, want a 0700 directory", st.Mode())
+		}
+		if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+			t.Errorf("storage directory entries = %v (%v), want the probe file removed", entries, err)
+		}
+	})
+
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readOnly := t.TempDir()
+	if err := os.Mkdir(filepath.Join(readOnly, "certmagic"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name, dataDir string
+		root          bool // the case holds for root too
+	}{
+		{"under a regular file", filepath.Join(file, "data"), true},
+		{"data dir is a regular file", file, true},
+		{"read-only storage directory", readOnly, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !tc.root && os.Geteuid() == 0 {
+				t.Skip("root writes to a 0500 directory")
+			}
+			o := validOptions(t)
+			o.DataDir = tc.dataDir
+			m, err := NewACME(o)
+			if err == nil {
+				m.Close()
+				t.Fatal("NewACME succeeded, want a storage error")
+			}
+			if m != nil {
+				t.Errorf("NewACME returned a manager with an error: %v", m)
+			}
+			if !strings.Contains(err.Error(), filepath.Join(tc.dataDir, "certmagic")) {
+				t.Errorf("error = %q, want it to name the storage directory", err)
+			}
+			if strings.Contains(err.Error(), testToken) {
+				t.Errorf("error = %q contains the token", err)
+			}
+		})
+	}
+}
+
+// TestNewACMELogs: certmagic and acmez write JSON lines to LogOutput at the
+// levels the app logger enables, instead of console lines on stderr at Info
+// (U12-FABLE-3).
+func TestNewACMELogs(t *testing.T) {
+	const started, stopped = "started background certificate maintenance", "stopped background certificate maintenance"
+	tests := []struct {
+		level slog.Level
+		want  map[string]string // msg -> level
+	}{
+		{slog.LevelDebug, map[string]string{"d": "DEBUG", "i": "INFO", "w": "WARN", "e": "ERROR", started: "INFO", stopped: "INFO"}},
+		{slog.LevelInfo, map[string]string{"i": "INFO", "w": "WARN", "e": "ERROR", started: "INFO", stopped: "INFO"}},
+		{slog.LevelWarn, map[string]string{"w": "WARN", "e": "ERROR"}},
+		{slog.LevelError, map[string]string{"e": "ERROR"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.level.String(), func(t *testing.T) {
+			var out bytes.Buffer
+			o := validOptions(t)
+			o.Logger = slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: tc.level}))
+			o.LogOutput = &out
+			m, err := NewACME(o)
+			if err != nil {
+				t.Fatalf("NewACME: %v", err)
+			}
+			issuer := m.cfg.Issuers[0].(*certmagic.ACMEIssuer)
+			if issuer.Logger != m.cfg.Logger || issuer.DNS01Solver.(*certmagic.DNS01Solver).Logger != m.cfg.Logger {
+				t.Error("the ACME issuer or the DNS-01 solver does not log through the config's logger")
+			}
+			m.cfg.Logger.Debug("d")
+			m.cfg.Logger.Info("i")
+			m.cfg.Logger.Warn("w")
+			m.cfg.Logger.Error("e")
+			m.Close() // the cache's maintenance goroutine has logged "started" and "stopped" and exited
+
+			got := map[string]string{}
+			for line := range strings.Lines(out.String()) {
+				var rec struct{ Time, Level, Msg, Logger string }
+				if err := json.Unmarshal([]byte(line), &rec); err != nil {
+					t.Fatalf("log line %q is not JSON: %v", line, err)
+				}
+				if _, err := time.Parse(time.RFC3339Nano, rec.Time); err != nil {
+					t.Errorf("log line %q: time is not RFC 3339: %v", line, err)
+				}
+				if (rec.Msg == started || rec.Msg == stopped) && rec.Logger != "maintenance" {
+					t.Errorf("log line %q: logger = %q, want maintenance", line, rec.Logger)
+				}
+				got[rec.Msg] = rec.Level
+			}
+			if !maps.Equal(got, tc.want) {
+				t.Errorf("logged %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestNewACMEKeepsGlobalsUntouched(t *testing.T) {
 	storage, issuers := certmagic.Default.Storage, certmagic.Default.Issuers
 	acmeCA := certmagic.DefaultACME.CA
@@ -315,6 +438,29 @@ func TestRunStopsOnCancel(t *testing.T) {
 	}
 	if m.Ready() {
 		t.Error("Ready() = true after a cancelled Run, want false")
+	}
+}
+
+// TestRunCancelledAttempt: an attempt ended by Run's context (a shutdown)
+// is not an issuance failure: no Error line, no "retrying" (U12-FABLE-5).
+func TestRunCancelledAttempt(t *testing.T) {
+	var logs bytes.Buffer
+	o := validOptions(t)
+	o.Logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	m := newTestACME(t, o)
+	m.backoff = []time.Duration{time.Millisecond}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	m.manage = func(attempt context.Context, _ []string) error {
+		cancel() // SIGTERM during the obtain
+		<-attempt.Done()
+		return fmt.Errorf("*.%s: obtaining certificate: %w", testDomain, attempt.Err())
+	}
+	if err := m.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("Run = %v, want context.Canceled", err)
+	}
+	if got := logs.String(); strings.Contains(got, `"level":"ERROR"`) || strings.Contains(got, "retrying") {
+		t.Errorf("logs = %s, want no Error line and no retry", got)
 	}
 }
 

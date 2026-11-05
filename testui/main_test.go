@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/vocdoni/cert-check/testui/internal/probe"
+	"github.com/vocdoni/cert-check/testui/internal/server"
 )
 
 func TestRunConfigError(t *testing.T) {
@@ -30,6 +33,38 @@ func TestRunConfigError(t *testing.T) {
 	}
 }
 
+// TestRunExitAfterStop: after SIGINT/SIGTERM, a drain cut short is a Warn
+// line and run returns nil (exit 0); any other Run error is returned (exit
+// 1) (U12-FABLE-4).
+func TestRunExitAfterStop(t *testing.T) {
+	cutShort := fmt.Errorf("%w after 15s: %w", server.ErrDrainCutShort, context.DeadlineExceeded)
+	accept := errors.New("accept tcp [::]:8080: use of closed network connection")
+	cases := []struct {
+		name     string
+		err      error
+		want     error
+		wantWarn bool
+	}{
+		{"clean stop", nil, nil, false},
+		{"drain cut short", cutShort, nil, true},
+		{"listener failure", accept, accept, false},
+		{"listener failure, then the drain expired", errors.Join(accept, context.DeadlineExceeded), accept, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var logs strings.Builder
+			got := exitErr(c.err, slog.New(slog.NewJSONHandler(&logs, nil)))
+			if (got == nil) != (c.want == nil) || (c.want != nil && !errors.Is(got, c.want)) {
+				t.Errorf("exitErr = %v, want %v", got, c.want)
+			}
+			if warn := strings.Contains(logs.String(), `"level":"WARN"`); warn != c.wantWarn ||
+				(warn && !strings.Contains(logs.String(), "drain cut short after 15s")) {
+				t.Errorf("logs = %q, want a Warn naming the drain: %v", logs.String(), c.wantWarn)
+			}
+		})
+	}
+}
+
 func TestProbeSubcommandDispatch(t *testing.T) {
 	errProbe := errors.New("probe broke")
 	cases := []struct {
@@ -46,6 +81,8 @@ func TestProbeSubcommandDispatch(t *testing.T) {
 		{"specimen directories", []string{"probe", "dir-a", "dir-b"}, probe.Summary{OK: 1}, nil, true, []string{"dir-a", "dir-b"}, 0, ""},
 		{"a FAIL line", []string{"probe"}, probe.Summary{OK: 2, Fail: 1}, nil, true, []string{}, 1, ""},
 		{"only WARN lines: nothing verified", []string{"probe"}, probe.Summary{Warn: 2}, nil, true, []string{}, 1, ""},
+		{"no target: nothing verified", []string{"probe"}, probe.Summary{}, nil, true, []string{}, 1, ""},
+		{"cancelled during the last target", []string{"probe"}, probe.Summary{OK: 2}, context.Canceled, true, []string{}, 1, "context canceled"},
 		{"probe error", []string{"probe"}, probe.Summary{}, errProbe, true, []string{}, 1, "probe broke"},
 		{"no subcommand serves (configuration error)", nil, probe.Summary{}, nil, false, nil, 1, "configuration"},
 	}
