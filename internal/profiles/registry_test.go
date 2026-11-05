@@ -412,6 +412,62 @@ func TestValidityDisables(t *testing.T) {
 	}
 }
 
+// TestRegistryRejectsIntermediateIssuerMismatch: an anchor holding the key of
+// a pinned intermediate's issuer under another name does not issue it (path
+// building is name-based: no leaf would chain through it).
+func TestRegistryRejectsIntermediateIssuerMismatch(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	valid := testpki.CertSpec{Now: now, NotBefore: now.AddDate(-1, 0, 0), NotAfter: now.AddDate(5, 0, 0)}
+	expired := testpki.CertSpec{Now: now, NotBefore: now.AddDate(-3, 0, 0), NotAfter: now.AddDate(0, 0, -1)}
+	issuer := testpki.NewRoot(t, "issuer root", expired)
+	sameKey := valid
+	sameKey.KeyPair = issuer.Key
+	renamed := testpki.NewRoot(t, "renamed root", sameKey)
+	reissued := testpki.NewRoot(t, "issuer root", sameKey)
+	inter := issuer.Intermediate(t, "inter", valid)
+	anc := profiles.TestAnchor
+
+	tests := []struct {
+		name        string
+		anchors     []*testpki.CA
+		wantErr     string
+		wantEnabled bool
+		wantLog     string
+	}{
+		{name: "issuer key under another name", anchors: []*testpki.CA{renamed}, wantErr: "is not signed by a profile anchor"},
+		{name: "expired issuer, its key valid under another name", anchors: []*testpki.CA{issuer, renamed},
+			wantLog: "intermediate signer outside validity"},
+		{name: "issuer re-certified under its name", anchors: []*testpki.CA{issuer, reissued}, wantEnabled: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := regTProfile("p1", "prov")
+			for _, ca := range tc.anchors {
+				p.Anchors = append(p.Anchors, anc(ca.Cert))
+			}
+			p.Intermediates = []profiles.Anchor{anc(inter.Cert)}
+			logger, buf := regTLogger()
+			r, err := profiles.New(profiles.Config{Providers: []profiles.Provider{regTProvider("prov", p)}, Now: now, Logger: logger})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("New error = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			if !strings.Contains(buf.String(), tc.wantLog) {
+				t.Errorf("log %q does not contain %q", buf.String(), tc.wantLog)
+			}
+			e := r.Enabled("prov")
+			if got := len(e) == 1 && len(e[0].Intermediates) == 1; got != tc.wantEnabled {
+				t.Errorf("profile enabled with the intermediate = %v (%d profiles), want %v", got, len(e), tc.wantEnabled)
+			}
+		})
+	}
+}
+
 // TestCheckAmbiguityAcrossProviders: the Handler's cross-provider check also
 // compares pinned intermediates (each provider loads on its own).
 func TestCheckAmbiguityAcrossProviders(t *testing.T) {

@@ -1,6 +1,7 @@
 package profiles
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
 	"embed"
@@ -161,13 +162,16 @@ func loadProfile(p Profile, files fs.FS, now time.Time, log *slog.Logger) (*Enab
 		e.Roots.AddCert(c)
 	}
 	// Intermediates are pinned and signature-checked even when no anchor is
-	// valid, so a misdeclared one fails whatever the load date.
+	// valid, so a misdeclared one fails whatever the load date. The issuer
+	// name must match too: path building is name-based.
 	for _, a := range p.Intermediates {
 		c, err := loadAnchor(a, files)
 		if err != nil {
 			return nil, fmt.Errorf("profiles: %s intermediate: %w", p.ID, err)
 		}
-		signed := func(root *x509.Certificate) bool { return c.CheckSignatureFrom(root) == nil }
+		signed := func(root *x509.Certificate) bool {
+			return bytes.Equal(c.RawIssuer, root.RawSubject) && c.CheckSignatureFrom(root) == nil
+		}
 		if !slices.ContainsFunc(declared, signed) {
 			return nil, fmt.Errorf("profiles: %s: intermediate %s is not signed by a profile anchor", p.ID, a.SHA256)
 		}
