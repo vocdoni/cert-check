@@ -105,7 +105,7 @@ func run(getenv func(string) string) error {
 	default:
 		certs, err = acme.NewACME(acme.Options{AuthDomain: cfg.AuthDomain, DataDir: cfg.DataDir, Email: cfg.ACMEEmail,
 			Staging: cfg.ACMECA == config.ACMEStaging, CloudflareToken: cfg.CloudflareToken.Reveal(),
-			OverrideDomain: cfg.ACMEDNSOverrideDomain, Logger: log})
+			OverrideDomain: cfg.ACMEDNSOverrideDomain, Logger: log, LogOutput: os.Stdout})
 	}
 	if err != nil {
 		return err

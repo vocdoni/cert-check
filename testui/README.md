@@ -126,7 +126,7 @@ a message that lists every problem and never prints a secret.
 | `CERTCHECK_TLS_CERT_FILE` / `CERTCHECK_TLS_KEY_FILE` | unset | Static certificate and key instead of ACME; mutually exclusive with the three ACME variables above |
 | `CERTCHECK_AUTH_TLS13` | `false` | Allow TLS 1.3 on the auth listener (see [Security notes](#6-security-notes)) |
 | `CERTCHECK_TRUSTED_PROXY_HOPS` | `1` | Trusted proxy hops, 0 to 10. The client IP is the entry that many places from the right of `X-Forwarded-For` |
-| `CERTCHECK_LOG_LEVEL` | `info` | slog level: `debug`, `info`, `warn`, `error` |
+| `CERTCHECK_LOG_LEVEL` | `info` | slog level: `debug`, `info`, `warn`, `error`. Also applies to the ACME (certmagic) lines, written as JSON to the same stdout stream |
 | `RAILWAY_RUN_UID` | set on the service: `0` | Platform setting, not read by the app. Railway mounts volumes as root, so the process must run as root to create `/data/certmagic` (accepted, see [Security notes](#6-security-notes)) |
 | `RAILWAY_GIT_COMMIT_SHA` | `dev` | Docker build argument, injected by Railway; becomes the reported `serverVersion` |
 

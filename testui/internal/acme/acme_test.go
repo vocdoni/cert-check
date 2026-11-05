@@ -9,10 +9,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"maps"
 	"math/big"
 	"net/http"
 	"os"
@@ -260,6 +263,61 @@ func TestNewACMEStorage(t *testing.T) {
 			}
 			if strings.Contains(err.Error(), testToken) {
 				t.Errorf("error = %q contains the token", err)
+			}
+		})
+	}
+}
+
+// TestNewACMELogs: certmagic and acmez write JSON lines to LogOutput at the
+// levels the app logger enables, instead of console lines on stderr at Info
+// (U12-FABLE-3).
+func TestNewACMELogs(t *testing.T) {
+	const started, stopped = "started background certificate maintenance", "stopped background certificate maintenance"
+	tests := []struct {
+		level slog.Level
+		want  map[string]string // msg -> level
+	}{
+		{slog.LevelDebug, map[string]string{"d": "DEBUG", "i": "INFO", "w": "WARN", "e": "ERROR", started: "INFO", stopped: "INFO"}},
+		{slog.LevelInfo, map[string]string{"i": "INFO", "w": "WARN", "e": "ERROR", started: "INFO", stopped: "INFO"}},
+		{slog.LevelWarn, map[string]string{"w": "WARN", "e": "ERROR"}},
+		{slog.LevelError, map[string]string{"e": "ERROR"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.level.String(), func(t *testing.T) {
+			var out bytes.Buffer
+			o := validOptions(t)
+			o.Logger = slog.New(slog.NewJSONHandler(io.Discard, &slog.HandlerOptions{Level: tc.level}))
+			o.LogOutput = &out
+			m, err := NewACME(o)
+			if err != nil {
+				t.Fatalf("NewACME: %v", err)
+			}
+			issuer := m.cfg.Issuers[0].(*certmagic.ACMEIssuer)
+			if issuer.Logger != m.cfg.Logger || issuer.DNS01Solver.(*certmagic.DNS01Solver).Logger != m.cfg.Logger {
+				t.Error("the ACME issuer or the DNS-01 solver does not log through the config's logger")
+			}
+			m.cfg.Logger.Debug("d")
+			m.cfg.Logger.Info("i")
+			m.cfg.Logger.Warn("w")
+			m.cfg.Logger.Error("e")
+			m.Close() // the cache's maintenance goroutine has logged "started" and "stopped" and exited
+
+			got := map[string]string{}
+			for line := range strings.Lines(out.String()) {
+				var rec struct{ Time, Level, Msg, Logger string }
+				if err := json.Unmarshal([]byte(line), &rec); err != nil {
+					t.Fatalf("log line %q is not JSON: %v", line, err)
+				}
+				if _, err := time.Parse(time.RFC3339Nano, rec.Time); err != nil {
+					t.Errorf("log line %q: time is not RFC 3339: %v", line, err)
+				}
+				if (rec.Msg == started || rec.Msg == stopped) && rec.Logger != "maintenance" {
+					t.Errorf("log line %q: logger = %q, want maintenance", line, rec.Logger)
+				}
+				got[rec.Msg] = rec.Level
+			}
+			if !maps.Equal(got, tc.want) {
+				t.Errorf("logged %v, want %v", got, tc.want)
 			}
 		})
 	}
