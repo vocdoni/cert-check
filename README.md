@@ -337,7 +337,7 @@ for tables keyed by code such as user messages or metrics.
 | `invalid_chain` | `bounds`, `path`, `purpose` | The chain is over 10 certificates, a certificate is over 16 KiB, an intermediate or anchor is outside its validity, or a critical extension is unhandled or malformed | no |
 | `expired` | `path` | The leaf's validity has ended | no |
 | `not_yet_valid` | `path` | The leaf's validity has not started | no |
-| `unsupported_profile` | `profile` | The leaf chains to a pinned CA but asserts no policy OID of an enabled profile, for example another product of the same CA, such as a Sectigo employee certificate | no |
+| `unsupported_profile` | `profile` | The leaf chains to a pinned CA but asserts no policy OID of an enabled profile, for example another product of the same CA, such as a Sectigo employee certificate. Also a leaf that matches more than one profile: two profiles share a key under distinct OIDs and the leaf asserts both | no |
 | `unsupported_purpose` | `path`, `purpose` | Key usage or extended key usage does not allow client authentication | no |
 | `weak_algorithm` | `algorithms` | An RSA key under 2048 bits (a profile may require more), an ECDSA curve other than P-256, P-384 and P-521, or a signature weaker than SHA-256 | no |
 | `test_certificate` | `test_marker` | A published specimen or a reserved test identity (see [Security notes](#security-notes)) | no |

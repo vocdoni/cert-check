@@ -1,6 +1,7 @@
 package profiles
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/x509"
 	"embed"
@@ -161,13 +162,16 @@ func loadProfile(p Profile, files fs.FS, now time.Time, log *slog.Logger) (*Enab
 		e.Roots.AddCert(c)
 	}
 	// Intermediates are pinned and signature-checked even when no anchor is
-	// valid, so a misdeclared one fails whatever the load date.
+	// valid, so a misdeclared one fails whatever the load date. The issuer
+	// name must match too: path building is name-based.
 	for _, a := range p.Intermediates {
 		c, err := loadAnchor(a, files)
 		if err != nil {
 			return nil, fmt.Errorf("profiles: %s intermediate: %w", p.ID, err)
 		}
-		signed := func(root *x509.Certificate) bool { return c.CheckSignatureFrom(root) == nil }
+		signed := func(root *x509.Certificate) bool {
+			return bytes.Equal(c.RawIssuer, root.RawSubject) && c.CheckSignatureFrom(root) == nil
+		}
 		if !slices.ContainsFunc(declared, signed) {
 			return nil, fmt.Errorf("profiles: %s: intermediate %s is not signed by a profile anchor", p.ID, a.SHA256)
 		}
@@ -207,7 +211,7 @@ func validateProfile(p Profile) error {
 		errs = append(errs, errors.New("anchors and policy OIDs are required"))
 	}
 	for _, o := range append(slices.Clone(p.PolicyOIDs), p.HandledCriticalExtensions...) {
-		if !oidRe.MatchString(o) {
+		if !validOID(o) {
 			errs = append(errs, fmt.Errorf("invalid OID %q", o))
 		}
 	}
@@ -228,7 +232,7 @@ func validateProfile(p Profile) error {
 			errs = append(errs, errors.New("test marker needs exactly one of SHA256 or Subject"))
 		}
 		for _, am := range m.Subject {
-			if !oidRe.MatchString(am.OID.String()) || strings.TrimSpace(am.Value) == "" {
+			if !validOID(am.OID.String()) || strings.TrimSpace(am.Value) == "" {
 				errs = append(errs, errors.New("test marker attribute needs an OID and a value"))
 			}
 		}
@@ -240,6 +244,16 @@ func validateProfile(p Profile) error {
 		return fmt.Errorf("profiles: %s: %w", p.ID, err)
 	}
 	return nil
+}
+
+// validOID reports whether o is canonical dotted text of an encodable OID
+// (x509.ParseOID bounds the second arc under a first arc of 0 or 1).
+func validOID(o string) bool {
+	if !oidRe.MatchString(o) {
+		return false
+	}
+	_, err := x509.ParseOID(o)
+	return err == nil
 }
 
 func loadAnchor(a Anchor, files fs.FS) (*x509.Certificate, error) {

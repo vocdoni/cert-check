@@ -222,6 +222,8 @@ func (c *Provider) Verify(ctx context.Context, chain []*x509.Certificate) (*Resu
 	}
 
 	// 4. Profile: exactly one verified profile whose exact OID the leaf asserts.
+	// Profiles may share a key under distinct OIDs (the registry rejects only a
+	// shared OID), so a leaf asserting both can match twice.
 	var leafPolicies []string
 	for _, p := range leaf.Policies {
 		leafPolicies = append(leafPolicies, p.String())
@@ -241,7 +243,7 @@ func (c *Provider) Verify(ctx context.Context, chain []*x509.Certificate) (*Resu
 		return nil, r.fail(StepProfile, CodeUnsupportedProfile, fmt.Sprintf("policy OIDs present %v; expected one of %v", leafPolicies, want))
 	case 1:
 	default:
-		return nil, r.fail(StepProfile, CodeInternal, "more than one profile matches (registry bug)")
+		return nil, r.fail(StepProfile, CodeUnsupportedProfile, "certificate matches more than one profile")
 	}
 	m := matched[0]
 	prof := m.e.Profile
