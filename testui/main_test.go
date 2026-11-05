@@ -81,6 +81,8 @@ func TestProbeSubcommandDispatch(t *testing.T) {
 		{"specimen directories", []string{"probe", "dir-a", "dir-b"}, probe.Summary{OK: 1}, nil, true, []string{"dir-a", "dir-b"}, 0, ""},
 		{"a FAIL line", []string{"probe"}, probe.Summary{OK: 2, Fail: 1}, nil, true, []string{}, 1, ""},
 		{"only WARN lines: nothing verified", []string{"probe"}, probe.Summary{Warn: 2}, nil, true, []string{}, 1, ""},
+		{"no target: nothing verified", []string{"probe"}, probe.Summary{}, nil, true, []string{}, 1, ""},
+		{"cancelled during the last target", []string{"probe"}, probe.Summary{OK: 2}, context.Canceled, true, []string{}, 1, "context canceled"},
 		{"probe error", []string{"probe"}, probe.Summary{}, errProbe, true, []string{}, 1, "probe broke"},
 		{"no subcommand serves (configuration error)", nil, probe.Summary{}, nil, false, nil, 1, "configuration"},
 	}

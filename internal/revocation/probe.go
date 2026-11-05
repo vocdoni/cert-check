@@ -1,6 +1,7 @@
 package revocation
 
 import (
+	"crypto/x509"
 	"fmt"
 
 	"golang.org/x/crypto/cryptobyte"
@@ -18,4 +19,21 @@ func URIDistributionPoint(uri string) (DistributionPoint, error) {
 		return DistributionPoint{}, fmt.Errorf("distribution point: %w", err)
 	}
 	return DistributionPoint{FullName: []GeneralName{name}}, nil
+}
+
+// UsableDistributionPoints returns the distribution points of cert's CDP
+// that the checker uses when issuer issued cert, for EvaluateCRLFor.
+func UsableDistributionPoints(cert, issuer *x509.Certificate) ([]DistributionPoint, error) {
+	dps, err := ParseCRLDistributionPoints(cert)
+	if err != nil {
+		return nil, err
+	}
+	return usableDistributionPoints(dps, issuer), nil
+}
+
+// ParseCRLLimit is ParseCRL with the checker's bound: a CRL whose cache
+// cost would exceed maxCost (the CRL cache limit, DefaultCRLCacheBytes by
+// default) is refused before the full parse.
+func ParseCRLLimit(der []byte, issuer *x509.Certificate, maxCost int64) (*ParsedCRL, Status, error) {
+	return parseCRL(der, issuer, maxCost)
 }

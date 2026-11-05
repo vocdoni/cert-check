@@ -80,7 +80,7 @@ func runProbe(ctx context.Context, specimenDirs []string, w io.Writer) (probe.Su
 	if err != nil {
 		return probe.Summary{}, err
 	}
-	return probe.Run(ctx, rc, targets, time.Now(), w)
+	return probe.Run(ctx, rc, targets, time.Now, w)
 }
 
 // run wires and serves the service until SIGINT/SIGTERM.
