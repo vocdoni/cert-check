@@ -30,7 +30,8 @@ const (
 	// KindOCSP sends one request for a random serial under Issuer.
 	KindOCSP Kind = "ocsp"
 	// KindCRL fetches a CRL, checks its signature against Issuer and
-	// evaluates it as the checker does (freshness, IDP name and scope).
+	// evaluates it as the checker does (cost bound, freshness, IDP name and
+	// scope, and the IDP name a CA with several CRLs requires).
 	KindCRL Kind = "crl"
 	// KindSpecimen runs the full revocation check of a live specimen.
 	KindSpecimen Kind = "specimen"
@@ -50,6 +51,10 @@ type Target struct {
 	Specimen *x509.Certificate // KindSpecimen only: a live certificate expected to be good
 	Policy   revocation.Policy // the profile's policy: host allowlists and nonce
 	Scope    revocation.Scope  // KindCRL: what the CRL is evaluated for; zero means ScopeLeaf
+	// Covers (KindCRL) are the certificates the CRL is judged for, each with
+	// the distribution points of its own CDP, as the checker reads them (the
+	// DNIe intermediates). nil is a certificate whose only DP names URL.
+	Covers []*x509.Certificate
 }
 
 func (t Target) validate(rc *revocation.Checker) error {
@@ -67,7 +72,14 @@ func (t Target) validate(rc *revocation.Checker) error {
 	case t.Kind == KindSpecimen && rc == nil:
 		return errors.New("specimen target without a revocation checker")
 	}
-	return t.Policy.Validate()
+	if err := t.Policy.Validate(); err != nil {
+		return err
+	}
+	if t.Kind == KindCRL {
+		_, err := crlContexts(t)
+		return err
+	}
+	return nil
 }
 
 // Verdict classifies one probe line.
@@ -87,10 +99,10 @@ type Summary struct {
 }
 
 // Failed reports whether any target failed, or whether nothing was verified
-// (no OK line and at least one WARN); the probe then exits non-zero.
+// (no OK line, also when there was no target); the probe then exits non-zero.
 func (s Summary) Failed() bool { return s.Fail > 0 || s.nothingVerified() }
 
-func (s Summary) nothingVerified() bool { return s.OK == 0 && s.Warn > 0 }
+func (s Summary) nothingVerified() bool { return s.OK == 0 }
 
 func (s *Summary) add(v Verdict) {
 	switch v {
@@ -115,17 +127,28 @@ var oidOCSPNonce = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 2}
 // Run probes targets in order, writing one line per target and a summary
 // line to w. OCSP and CRL targets are fetched through a revocation.Fetcher
 // with the production address checks; specimen targets go through rc
-// (which may be nil when there are none). now is the freshness reference.
+// (which may be nil when there are none). now is the clock, read once per
+// OCSP or CRL target as the checker reads it once per check.
 // The error reports an invalid target, a cancelled ctx or a write failure;
 // endpoint failures are verdicts, counted in the Summary.
-func Run(ctx context.Context, rc *revocation.Checker, targets []Target, now time.Time, w io.Writer) (Summary, error) {
-	return run(ctx, rc, revocation.NewFetcher(revocation.FetcherOptions{UserAgent: userAgent}), targets, now, w)
+func Run(ctx context.Context, rc *revocation.Checker, targets []Target, now func() time.Time, w io.Writer) (Summary, error) {
+	p := prober{rc: rc, fetcher: revocation.NewFetcher(revocation.FetcherOptions{UserAgent: userAgent}),
+		now: now, crlLimit: revocation.DefaultCRLCacheBytes}
+	return p.run(ctx, targets, w)
 }
 
-// run is Run with an injected fetcher (tests dial a fake network).
-func run(ctx context.Context, rc *revocation.Checker, f *revocation.Fetcher, targets []Target, now time.Time, w io.Writer) (Summary, error) {
+// prober is what a run uses; tests dial a fake network, set the clock and
+// shrink the CRL cost limit.
+type prober struct {
+	rc       *revocation.Checker // specimen targets; nil when there are none
+	fetcher  *revocation.Fetcher // OCSP and CRL targets
+	now      func() time.Time
+	crlLimit int64 // the checker's CRL cache limit: it refuses a CRL it could not keep
+}
+
+func (p prober) run(ctx context.Context, targets []Target, w io.Writer) (Summary, error) {
 	for i, t := range targets {
-		if err := t.validate(rc); err != nil {
+		if err := t.validate(p.rc); err != nil {
 			return Summary{}, fmt.Errorf("probe: target %d (%s %s): %w", i, t.Profile, t.Kind, err)
 		}
 	}
@@ -137,16 +160,19 @@ func run(ctx context.Context, rc *revocation.Checker, f *revocation.Fetcher, tar
 		var l line
 		switch t.Kind {
 		case KindOCSP:
-			l = probeOCSP(ctx, f, t, now)
+			l = probeOCSP(ctx, p.fetcher, t, p.now())
 		case KindCRL:
-			l = probeCRL(ctx, f, t, now)
+			l = probeCRL(ctx, p.fetcher, t, p.now(), p.crlLimit)
 		case KindSpecimen:
-			l = probeSpecimen(ctx, rc, t)
+			l = probeSpecimen(ctx, p.rc, t)
 		}
 		sum.add(l.verdict)
 		if _, err := io.WriteString(w, l.String()+"\n"); err != nil {
 			return sum, err
 		}
+	}
+	if err := ctx.Err(); err != nil { // cancelled during the last target
+		return sum, err
 	}
 	note := ""
 	if sum.nothingVerified() {
@@ -269,9 +295,10 @@ func nonceState(resp *revocation.Response, sent []byte) string {
 }
 
 // probeCRL fetches t.URL, checks the signature and issuer against t.Issuer
-// (ParseCRL) and evaluates the CRL with revocation.EvaluateCRL for a random
-// serial of a certificate whose CDP names t.URL, at t.Scope.
-func probeCRL(ctx context.Context, f *revocation.Fetcher, t Target, now time.Time) line {
+// and the checker's cost bound limit (ParseCRLLimit), and evaluates the CRL
+// with revocation.EvaluateCRLFor, at t.Scope, for a random serial of each
+// certificate it covers (crlContexts).
+func probeCRL(ctx context.Context, f *revocation.Fetcher, t Target, now time.Time, limit int64) line {
 	l := line{profile: t.Profile, kind: t.Kind, where: hostPath(t.URL), signerKey: "issuer", nonce: "-"}
 	fr, err := f.Fetch(ctx, revocation.FetchRequest{URL: t.URL, MaxBytes: revocation.MaxCRLResponse,
 		Timeout: revocation.CRLTimeout, AllowedHosts: t.Policy.AllHosts()})
@@ -279,19 +306,19 @@ func probeCRL(ctx context.Context, f *revocation.Fetcher, t Target, now time.Tim
 	if err != nil {
 		return l.finish(revocation.StatusUnavailable, err.Error())
 	}
-	parsed, st, err := revocation.ParseCRL(fr.Body, t.Issuer)
+	parsed, st, err := revocation.ParseCRLLimit(fr.Body, t.Issuer, limit)
 	if err != nil {
 		if st == "" || st == revocation.StatusGood {
 			st = revocation.StatusInvalidEvidence
 		}
 		return l.finish(st, err.Error())
 	}
-	l.signer, l.thisUpdate, l.nextUpdate = t.Issuer.Subject.String(), parsed.ThisUpdate, parsed.NextUpdate // ParseCRL checked the issuer name
+	l.signer, l.thisUpdate, l.nextUpdate = t.Issuer.Subject.String(), parsed.ThisUpdate, parsed.NextUpdate // ParseCRLLimit checked the issuer name
 	serial, err := randomSerial()
 	if err != nil {
 		return l.finish(revocation.StatusUnavailable, err.Error())
 	}
-	dp, err := revocation.URIDistributionPoint(t.URL)
+	contexts, err := crlContexts(t)
 	if err != nil {
 		return l.finish(revocation.StatusInvalidEvidence, err.Error())
 	}
@@ -300,11 +327,56 @@ func probeCRL(ctx context.Context, f *revocation.Fetcher, t Target, now time.Tim
 		scope = revocation.ScopeLeaf
 	}
 	// Any listing of the random serial counts: the CRL applies and is fresh.
-	st, _, detail := revocation.EvaluateCRL(parsed, &x509.Certificate{SerialNumber: serial}, dp, scope, now)
-	if st == revocation.StatusGood || st == revocation.StatusRevoked {
-		detail = fmt.Sprintf("%d entries", len(parsed.Listed))
+	for _, c := range contexts {
+		var detail string
+		st, _, detail = revocation.EvaluateCRLFor(parsed, &x509.Certificate{SerialNumber: serial}, c.dp, c.dps, scope, now)
+		if st != revocation.StatusGood && st != revocation.StatusRevoked {
+			return l.finish(st, c.name+detail)
+		}
 	}
-	return l.finish(st, detail, revocation.StatusGood, revocation.StatusRevoked)
+	return l.finish(st, fmt.Sprintf("%d entries", len(parsed.Listed)), revocation.StatusGood, revocation.StatusRevoked)
+}
+
+// crlContext is a certificate a CRL is judged for: the distribution point
+// the CRL was fetched from and all its usable ones, as the checker reads them.
+type crlContext struct {
+	name string // "<covered CA>: " for the detail; empty without Covers
+	dp   revocation.DistributionPoint
+	dps  []revocation.DistributionPoint
+}
+
+// crlContexts returns a context per usable DP naming t.URL of each covered
+// certificate (the checker fetches the URL for each) or, without Covers,
+// that of a certificate whose only DP names t.URL. A covered certificate
+// that t.Issuer did not issue, or that names no such DP, is an error.
+func crlContexts(t Target) ([]crlContext, error) {
+	if len(t.Covers) == 0 {
+		dp, err := revocation.URIDistributionPoint(t.URL)
+		if err != nil {
+			return nil, err
+		}
+		return []crlContext{{dp: dp, dps: []revocation.DistributionPoint{dp}}}, nil
+	}
+	var out []crlContext
+	for _, c := range t.Covers {
+		if c == nil || !bytes.Equal(c.RawIssuer, t.Issuer.RawSubject) {
+			return nil, errors.New("covered certificate not issued by the CRL issuer")
+		}
+		dps, err := revocation.UsableDistributionPoints(c, t.Issuer)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", c.Subject.CommonName, err)
+		}
+		n := len(out)
+		for _, dp := range dps {
+			if slices.ContainsFunc(dp.FullName, func(gn revocation.GeneralName) bool { u, ok := gn.URI(); return ok && u == t.URL }) {
+				out = append(out, crlContext{name: c.Subject.CommonName + ": ", dp: dp, dps: dps})
+			}
+		}
+		if len(out) == n {
+			return nil, fmt.Errorf("%s: no usable distribution point names %s", c.Subject.CommonName, t.URL)
+		}
+	}
+	return out, nil
 }
 
 // probeSpecimen runs rc.Check on a live specimen and expects good. The line

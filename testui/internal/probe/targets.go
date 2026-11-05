@@ -59,6 +59,7 @@ type endpoint struct {
 	url     string
 	issuer  string // pinned CA: issues the certificates (OCSP) or signs the CRL
 	scope   revocation.Scope
+	covers  []string // pinned intermediates the CRL is judged for (Target.Covers)
 }
 
 func ocsp(profile, url string, issuers ...string) []endpoint {
@@ -73,15 +74,17 @@ func crl(profile, url, issuer string) []endpoint {
 	return []endpoint{{profile: profile, kind: KindCRL, url: url, issuer: issuer, scope: revocation.ScopeLeaf}}
 }
 
-// caCRL is a CRL row evaluated at CA scope: it covers pinned intermediates.
-func caCRL(profile, url, issuer string) []endpoint {
-	return []endpoint{{profile: profile, kind: KindCRL, url: url, issuer: issuer, scope: revocation.ScopeCA}}
+// caCRL is a CRL row evaluated at CA scope for the pinned intermediates it
+// covers, those whose CDP names url.
+func caCRL(profile, url, issuer string, covers ...string) []endpoint {
+	return []endpoint{{profile: profile, kind: KindCRL, url: url, issuer: issuer, scope: revocation.ScopeCA, covers: covers}}
 }
 
 // endpoints is the Task 12 URL table: one OCSP row per (responder, issuing
 // CA) and one row per CRL. The DNIe root CRL and ARL are signed by the root
 // and cover the pinned intermediates (a CA-scope check consults both), so
-// they are evaluated at CA scope.
+// they are evaluated at CA scope for each intermediate whose CDP names them:
+// AC DNIE 004 names ARL.crl only, AC DNIE 005 and 006 name both.
 var endpoints = slices.Concat(
 	ocsp("fnmt-citizen-rsa", "http://ocspusu.cert.fnmt.es/ocspusu/OcspResponder", caFNMTUsuarios),
 	crl("fnmt-citizen-rsa", "http://www.cert.fnmt.es/crlsacusu/CRLU1.crl", caFNMTUsuarios),
@@ -118,8 +121,8 @@ var endpoints = slices.Concat(
 	crl("signe-personal-otros-dispositivos", "https://www.signe.es/signe-ac/crl/signe2020.crl", caSIGNE2020),
 	crl("lleidanet-natural-person-sw", "http://crl1.esigna.es/sub/indenova_pki_003.crl", caInDenova003),
 	ocsp("dnie-auth", "http://ocsp.dnie.es", caDNIe004, caDNIe005, caDNIe006),
-	caCRL("dnie-auth", "http://pki.policia.es/dnie/crls/CRL.crl", caDNIeRoot2),
-	caCRL("dnie-auth", "http://pki.policia.es/dnie/crls/ARL.crl", caDNIeRoot2),
+	caCRL("dnie-auth", "http://pki.policia.es/dnie/crls/CRL.crl", caDNIeRoot2, caDNIe005, caDNIe006),
+	caCRL("dnie-auth", "http://pki.policia.es/dnie/crls/ARL.crl", caDNIeRoot2, caDNIe004, caDNIe005, caDNIe006),
 )
 
 // specimens are live CA-published test certificates whose revocation status
@@ -148,9 +151,9 @@ func enabledProfiles() (map[string]*profiles.Enabled, error) {
 }
 
 // DefaultTargets returns the OCSP and CRL targets of every enabled
-// production profile, with the issuers taken from the pinned anchors and
-// intermediates of profiles.All. A row naming an unknown
-// profile or a CA the profile does not pin is an error.
+// production profile, with the issuers (and the intermediates a CRL covers)
+// taken from the pinned anchors and intermediates of profiles.All. A row
+// naming an unknown profile or a CA the profile does not pin is an error.
 func DefaultTargets() ([]Target, error) {
 	enabled, err := enabledProfiles()
 	if err != nil {
@@ -175,7 +178,15 @@ func DefaultTargets() ([]Target, error) {
 		if issuer == nil {
 			return nil, fmt.Errorf("probe: profile %s does not pin CA %s", e.profile, e.issuer)
 		}
-		out = append(out, Target{Profile: e.profile, Kind: e.kind, URL: e.url, Issuer: issuer, Policy: p.Profile.Revocation, Scope: e.scope})
+		var covers []*x509.Certificate
+		for _, sha := range e.covers {
+			c := pinnedCA(p, sha)
+			if c == nil {
+				return nil, fmt.Errorf("probe: profile %s does not pin CA %s", e.profile, sha)
+			}
+			covers = append(covers, c)
+		}
+		out = append(out, Target{Profile: e.profile, Kind: e.kind, URL: e.url, Issuer: issuer, Policy: p.Profile.Revocation, Scope: e.scope, Covers: covers})
 	}
 	return out, nil
 }
@@ -193,23 +204,26 @@ func pinnedCA(p *profiles.Enabled, sha string) *x509.Certificate {
 // maxSpecimenBytes caps the read of one specimen file (a PEM certificate is a few KiB).
 const maxSpecimenBytes = 64 << 10
 
+// maxSpecimenEntries caps the entries of a specimen directory.
+const maxSpecimenEntries = 1024
+
 // LoadSpecimens reads the *.pem files of fsys (one certificate each) and
 // returns a KindSpecimen target for every known live specimen among them,
-// with the issuing anchor of its profile. Other certificates are ignored.
-// A directory that cannot be read, a *.pem that is not a regular file or
-// is larger than maxSpecimenBytes is an error.
+// once each, with the issuing anchor of its profile. Other certificates are
+// ignored. A directory that cannot be read or has more than
+// maxSpecimenEntries entries, a *.pem that is not a regular file or is
+// larger than maxSpecimenBytes is an error.
 func LoadSpecimens(fsys fs.FS) ([]Target, error) {
 	enabled, err := enabledProfiles()
 	if err != nil {
 		return nil, err
 	}
-	// fs.ReadDir, not fs.Glob: Glob ignores I/O errors, so an unreadable
-	// directory would look empty.
-	entries, err := fs.ReadDir(fsys, ".")
+	entries, err := readSpecimenDir(fsys)
 	if err != nil {
 		return nil, fmt.Errorf("probe: specimen directory: %w", err)
 	}
 	var out []Target
+	seen := map[string]bool{}
 	for _, e := range entries {
 		name := e.Name()
 		if !strings.HasSuffix(name, ".pem") {
@@ -223,10 +237,12 @@ func LoadSpecimens(fsys fs.FS) ([]Target, error) {
 		if blk == nil || blk.Type != "CERTIFICATE" {
 			return nil, fmt.Errorf("probe: %s: no PEM certificate", name)
 		}
-		profile, ok := specimens[sha256Hex(blk.Bytes)]
-		if !ok {
+		sha := sha256Hex(blk.Bytes)
+		profile, ok := specimens[sha]
+		if !ok || seen[sha] {
 			continue
 		}
+		seen[sha] = true
 		p, ok := enabled[profile]
 		if !ok {
 			return nil, fmt.Errorf("probe: %s: profile %s is not enabled", name, profile)
@@ -242,6 +258,36 @@ func LoadSpecimens(fsys fs.FS) ([]Target, error) {
 		out = append(out, Target{Profile: profile, Kind: KindSpecimen, Issuer: issuer, Specimen: cert, Policy: p.Profile.Revocation})
 	}
 	return out, nil
+}
+
+// readSpecimenDir returns the entries of fsys's root, sorted by name, and
+// stops with an error past maxSpecimenEntries. It reads the directory
+// itself, not with fs.Glob, which ignores I/O errors (an unreadable
+// directory would look empty), nor fs.ReadDir, which reads it whole.
+func readSpecimenDir(fsys fs.FS) ([]fs.DirEntry, error) {
+	f, err := fsys.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }() // read-only; the read error is what matters
+	d, ok := f.(fs.ReadDirFile)
+	if !ok {
+		return nil, errors.New("not a directory")
+	}
+	var entries []fs.DirEntry
+	for {
+		batch, err := d.ReadDir(maxSpecimenEntries + 1 - len(entries))
+		entries = append(entries, batch...)
+		switch {
+		case len(entries) > maxSpecimenEntries:
+			return nil, fmt.Errorf("more than %d entries, not a specimen directory", maxSpecimenEntries)
+		case errors.Is(err, io.EOF):
+			slices.SortFunc(entries, func(a, b fs.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+			return entries, nil
+		case err != nil:
+			return nil, err
+		}
+	}
 }
 
 // readSpecimen reads name, a regular file of at most maxSpecimenBytes. It

@@ -47,7 +47,7 @@ func TestLiveProbe(t *testing.T) {
 		t.Fatalf("revocation.NewChecker: %v", err)
 	}
 	var out strings.Builder
-	sum, err := Run(t.Context(), rc, targets, time.Now(), &out)
+	sum, err := Run(t.Context(), rc, targets, time.Now, &out)
 	t.Logf("probe report (%d targets):\n%s", len(targets), out.String())
 	if err != nil {
 		t.Fatalf("Run: %v", err)
