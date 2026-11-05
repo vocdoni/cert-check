@@ -358,11 +358,15 @@ responder outage.
 network it runs in. It needs no configuration and starts no server. For each enabled profile it asks
 each responder about a never-issued serial, with a nonce only when the profile requires one, as the
 checker does. It fetches each CRL, checks its signature against the pinned CA and evaluates it with
-the checker's own rules: its dates and freshness, and its Issuing Distribution Point (the name must
-include the CRL's URL, and no scope flag the checker rejects). For DNIe that means the root's
-`CRL.crl` and `ARL.crl`, evaluated at CA scope because together they cover the pinned intermediates.
-Each `specimen-dir` argument is a directory of `*.pem` files (regular files of at most 64 KiB). The
-known live specimens found there get the full revocation check and must come back `good`; other
+the checker's own rules: the production cost limit (a CRL too large for the checker's cache is
+refused), its dates and freshness, and its Issuing Distribution Point (the name must include the
+CRL's URL, and no scope flag the checker rejects). The clock is read once per endpoint, when it is
+probed. For DNIe that means the root's `CRL.crl` and `ARL.crl`, evaluated at CA scope for each pinned
+intermediate whose CDP names them (AC DNIE 004 names `ARL.crl` only, 005 and 006 name both), with the
+checker's own rule (`revocation.EvaluateCRLFor`) that a CA whose DPs name several CRLs needs each CRL
+to name its DP in its IDP. Each `specimen-dir` argument is a directory of at most 1024 entries holding
+`*.pem` files (regular files of at most 64 KiB). The known live specimens found there get the full
+revocation check and must come back `good`, once each however many copies there are; other
 certificates are ignored, but a directory with no known live specimen is an error. The DIGITEL
 specimen is committed in `testdata/specimens` (repository root). The Bewor and Sectigo specimens are
 withheld and kept outside the repository.
@@ -382,10 +386,11 @@ when the profile requires a nonce, and `-` when none was sent. The last line is
   `stale`, `unsupported_method`), or a specimen that comes back `revoked` or `unknown`.
 
 Exit codes: `0` when no line is FAIL and at least one is OK. `1` when any line is FAIL, when no line
-is OK (every line WARN, for example without egress: nothing was verified), or when the probe cannot
-run (a specimen directory that cannot be read or holds no known live specimen, a `*.pem` file that is
-not a regular file, is larger than 64 KiB or holds no certificate, an interrupted run); the reason goes
-to stderr.
+is OK (every line WARN, for example without egress, or no target at all: nothing was verified), or
+when the probe cannot run (a specimen directory that cannot be read, has more than 1024 entries or
+holds no known live specimen, a `*.pem` file that is not a regular file, is larger than 64 KiB or holds
+no certificate, a run interrupted at any point, even during the last endpoint); the reason goes to
+stderr.
 
 Run it from the deployment network with a temporary service in the same project and repository. The
 image carries no specimens, so this run covers the endpoints only:
