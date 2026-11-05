@@ -105,6 +105,12 @@ Browser notes:
   Accept it once for each provider host, for example `https://fnmt.auth.localtest.me:8443`.
 - TLS 1.2 is the default on the auth listener; set `CERTCHECK_AUTH_TLS13=true` to allow 1.3.
 - The UI can be checked offline against canned API responses with `cd testui && go run ./web/internal/devserver`.
+- `TestBrowser` loads the UI from the devserver in headless Chrome and checks the view each page ends on.
+  The cases are `#error=__proto__`, `constructor` and unknown codes, malformed replies, a browser
+  without `Object.hasOwn`, the fallback when the error view itself throws, and "Start again" on the
+  working view. It sits behind the `browser` build tag, so the default run and CI skip it. It needs
+  Chrome or Chromium; set `CHROME=/path/to/binary` when neither is on `PATH`:
+  `cd testui && go test -tags browser -count=1 -run TestBrowser ./web/internal/devserver`.
 
 ## 3. Configuration
 

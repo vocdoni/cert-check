@@ -32,6 +32,7 @@ import (
 	"github.com/vocdoni/cert-check/internal/testpki"
 	"github.com/vocdoni/cert-check/providers"
 	"github.com/vocdoni/cert-check/testui/internal/config"
+	"github.com/vocdoni/cert-check/testui/web"
 )
 
 // The test world of api_test.go, auth_test.go and app_test.go: providers
@@ -365,7 +366,7 @@ func checkHeaders(t *testing.T, h http.Header, want map[string]string) {
 }
 
 var mainAPIHeaders = map[string]string{
-	"Content-Security-Policy":   mainCSP,
+	"Content-Security-Policy":   web.CSP,
 	"Referrer-Policy":           "no-referrer",
 	"X-Content-Type-Options":    "nosniff",
 	"Strict-Transport-Security": "max-age=31536000",
@@ -916,7 +917,7 @@ func TestStaticUI(t *testing.T) {
 				t.Errorf("Content-Type = %q, want prefix %q", got, c.ctype)
 			}
 			checkHeaders(t, rec.Header(), map[string]string{
-				"Content-Security-Policy":   mainCSP,
+				"Content-Security-Policy":   web.CSP,
 				"Referrer-Policy":           "no-referrer",
 				"X-Content-Type-Options":    "nosniff",
 				"Strict-Transport-Security": "max-age=31536000",
