@@ -162,15 +162,24 @@ Production: Railway project `CertificateCheck`, environment `production`, servic
    present and valid.
 4. The runner group `Default` must admit the repository, otherwise the job queues forever:
    `gh api orgs/vocdoni/actions/runner-groups --jq '.runner_groups[]|{name,visibility,allows_public_repositories}'`.
-   A `pull_request` run executes the workflow file of the pull request's head on these runners, with
-   the Docker daemon (root on the host) and the Go caches that later `main` runs reuse, so nothing in
-   `ci.yml` can protect them. The protection is these settings, all required:
+   A `pull_request` run executes the workflow file of the pull request's head on these runners. It
+   reaches the Docker daemon (root on the host) and, on a host that outlives the job, the Go caches,
+   toolchain and images that later `main` runs reuse, so nothing in `ci.yml` can protect them. The
+   protection is these settings, all required:
    - runner group: `visibility` `selected`, listing this repository only, and
      `allows_public_repositories` `false`;
    - the repository stays private; in its Actions settings, running workflows from fork pull requests
      is disabled, and fork pull request workflows require approval for all outside collaborators;
-   - runners are registered with `--ephemeral`, so every job starts with fresh `GOMODCACHE` and
-     `GOCACHE` and no job can poison the caches of the next.
+   - every job runs in its own execution environment: a VM or container created from a clean image
+     for that job, with its own Docker daemon, and destroyed when the job ends. The runner inside it is
+     registered with `--ephemeral`. That flag is not the isolation: it only makes the runner take one
+     job and deregister. On a reused host the next job still finds the runner's home with `GOMODCACHE`
+     and `GOCACHE`, the tool cache with the Go that setup-go installed, the work directory with its
+     downloaded actions, and the Docker daemon with its images and build cache, so one job can poison
+     what the next one builds.
+     In a fresh environment the only Go cache that crosses jobs is setup-go's GitHub Actions cache
+     (`cache: true`), which GitHub scopes by branch: a pull request run can restore the cache of
+     `main`, but it saves to its own ref, which `main` runs never read.
 5. Branch protection (or a ruleset) on `main` requires the status check `ci`. Railway's wait-for-CI is
    the second gate, not a substitute: it never blocks a commit that has no `ci` run (step 2).
 
@@ -307,10 +316,12 @@ Staging has far higher limits and issues an untrusted certificate, so use it for
   unknown subdomain ends with the `internal error` alert.
 - No-certificate path: `POST /api/v1/transactions`, follow the `authUrl` without a client certificate
   (a `303` to `#code=...`), then redeem the code: the answer is `no_certificate` with diagnostics.
-- Client IP header: set `CERTCHECK_LOG_LEVEL=debug`, create one transaction, read the
-  `forwarded headers` log line (header names and the `xffEntries` count), then reset to `info`. If
-  `X-Forwarded-For` is absent or `xffEntries` is not 1 for a direct client, change the header or the
-  hop count before going live.
+- Client IP header: set `CERTCHECK_LOG_LEVEL=debug`, create one transaction from a client that uses
+  no proxy of its own, read the `forwarded headers` log line (header names and the `xffEntries`
+  count), then reset to `info`. Such a direct request arrives with two entries, the client and the
+  Railway hop (`<client>, <railway hop>`), which is what `CERTCHECK_TRUSTED_PROXY_HOPS=2` expects: the
+  client is the second entry from the right. If `X-Forwarded-For` is absent or `xffEntries` is not 2,
+  change the header or the hop count before going live.
 - Service goldens. `TestDeployedServiceGolden` compares the deployed service with the goldens in
   `testdata/golden` (repository root): the providers API body byte for byte, and for each of the 14
   provider hosts the ordered `certificate_authorities` list of the handshake. It runs after a deploy,
