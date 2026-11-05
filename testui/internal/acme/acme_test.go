@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -195,6 +196,67 @@ func TestNewACMEConfig(t *testing.T) {
 			}
 			if !m.cfg.OCSP.DisableStapling {
 				t.Error("OCSP.DisableStapling = false, want true")
+			}
+		})
+	}
+}
+
+// TestNewACMEStorage: NewACME creates <DataDir>/certmagic (0700) and fails
+// when it cannot write there, instead of starting and retrying hourly while
+// not ready (U12-FABLE-2).
+func TestNewACMEStorage(t *testing.T) {
+	t.Run("created", func(t *testing.T) {
+		o := validOptions(t)
+		newTestACME(t, o)
+		dir := filepath.Join(o.DataDir, "certmagic")
+		st, err := os.Stat(dir)
+		if err != nil {
+			t.Fatalf("storage directory: %v", err)
+		}
+		if !st.IsDir() || st.Mode().Perm() != 0o700 {
+			t.Errorf("storage directory mode = %v, want a 0700 directory", st.Mode())
+		}
+		if entries, err := os.ReadDir(dir); err != nil || len(entries) != 0 {
+			t.Errorf("storage directory entries = %v (%v), want the probe file removed", entries, err)
+		}
+	})
+
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readOnly := t.TempDir()
+	if err := os.Mkdir(filepath.Join(readOnly, "certmagic"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name, dataDir string
+		root          bool // the case holds for root too
+	}{
+		{"under a regular file", filepath.Join(file, "data"), true},
+		{"data dir is a regular file", file, true},
+		{"read-only storage directory", readOnly, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !tc.root && os.Geteuid() == 0 {
+				t.Skip("root writes to a 0500 directory")
+			}
+			o := validOptions(t)
+			o.DataDir = tc.dataDir
+			m, err := NewACME(o)
+			if err == nil {
+				m.Close()
+				t.Fatal("NewACME succeeded, want a storage error")
+			}
+			if m != nil {
+				t.Errorf("NewACME returned a manager with an error: %v", m)
+			}
+			if !strings.Contains(err.Error(), filepath.Join(tc.dataDir, "certmagic")) {
+				t.Errorf("error = %q, want it to name the storage directory", err)
+			}
+			if strings.Contains(err.Error(), testToken) {
+				t.Errorf("error = %q contains the token", err)
 			}
 		})
 	}

@@ -118,7 +118,7 @@ a message that lists every problem and never prints a secret.
 | `CERTCHECK_AUTH_DOMAIN` | required | Lowercase DNS name whose wildcard hosts the providers, e.g. `auth.cert-check.vocdoni.dev` |
 | `CERTCHECK_AUTH_PUBLIC_PORT` | `$RAILWAY_TCP_PROXY_PORT` | External auth port used in `authUrl`. Required: set it when `RAILWAY_TCP_PROXY_PORT` is absent |
 | `CERTCHECK_AUTH_LISTEN` | `:8443` | Auth listener address, `host:port` with a numeric port between 1 and 65535 |
-| `CERTCHECK_DATA_DIR` | `/data` | ACME storage: `<dir>/certmagic` (the Railway volume) |
+| `CERTCHECK_DATA_DIR` | `/data` | ACME storage: `<dir>/certmagic` (the Railway volume), created 0700 if missing. Startup fails if it cannot be written |
 | `CERTCHECK_ACME_EMAIL` | required with ACME | ACME account contact (a mailbox the owner controls) |
 | `CERTCHECK_ACME_CA` | `production` | `production` or `staging` (Let's Encrypt) |
 | `CLOUDFLARE_API_TOKEN` | required with ACME | DNS-01 token (secret). Permissions: **Zone:Read + Zone.DNS:Edit** on `vocdoni.dev` |

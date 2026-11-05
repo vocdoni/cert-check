@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,10 @@ func NewACME(o Options) (*Manager, error) {
 	if o.AuthDomain == "" || o.DataDir == "" || o.Email == "" || o.CloudflareToken == "" {
 		return nil, errors.New("acme: AuthDomain, DataDir, Email and CloudflareToken are required")
 	}
+	storage := filepath.Join(o.DataDir, "certmagic")
+	if err := probeStorage(storage); err != nil {
+		return nil, err
+	}
 	m := &Manager{name: "*." + o.AuthDomain, log: o.Logger}
 	if m.log == nil {
 		m.log = slog.Default()
@@ -61,7 +66,7 @@ func NewACME(o Options) (*Manager, error) {
 		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) { return cfg, nil },
 	})
 	cfg = certmagic.New(cache, certmagic.Config{
-		Storage: &certmagic.FileStorage{Path: filepath.Join(o.DataDir, "certmagic")},
+		Storage: &certmagic.FileStorage{Path: storage},
 		OCSP:    certmagic.OCSPConfig{DisableStapling: true},
 	})
 	ca := certmagic.LetsEncryptProductionCA
@@ -82,6 +87,24 @@ func NewACME(o Options) (*Manager, error) {
 	cfg.Issuers = []certmagic.Issuer{issuer}
 	m.cfg, m.cache, m.manage, m.backoff, m.attempt = cfg, cache, cfg.ManageSync, obtainBackoff, obtainAttemptTimeout
 	return m, nil
+}
+
+// probeStorage creates dir (0700) and writes and removes a file in it, so a
+// missing, read-only or misplaced volume fails startup; certmagic checks its
+// storage only when it obtains, and Run would retry that hourly, not ready.
+func probeStorage(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("acme: storage %s: %w", dir, err)
+	}
+	f, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return fmt.Errorf("acme: storage %s is not writable: %w", dir, err)
+	}
+	_, werr := f.Write([]byte("probe"))
+	if err := errors.Join(werr, f.Close(), os.Remove(f.Name())); err != nil {
+		return fmt.Errorf("acme: storage %s is not writable: %w", dir, err)
+	}
+	return nil
 }
 
 // NewStatic serves a fixed certificate (CERTCHECK_TLS_CERT_FILE/_KEY_FILE or tests).
