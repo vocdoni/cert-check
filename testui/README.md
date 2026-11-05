@@ -114,7 +114,7 @@ a message that lists every problem and never prints a secret.
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | `8080` | Main listener port (Railway sets it) |
-| `CERTCHECK_PUBLIC_URL` | required | Fixed callback origin, e.g. `https://cert-check.vocdoni.dev`. https only, http for localhost and 127.0.0.1. No path other than `/`, no query, fragment or userinfo; the host is lowercased and a default port dropped |
+| `CERTCHECK_PUBLIC_URL` | required | Fixed callback origin, e.g. `https://cert-check.vocdoni.dev`. https only, http for localhost and 127.0.0.1. No path other than `/`, no query, fragment or userinfo. The host is a DNS name (no trailing dot, IDNs in punycode), an IP literal or `localhost`; it is lowercased and a default port dropped |
 | `CERTCHECK_AUTH_DOMAIN` | required | Lowercase DNS name whose wildcard hosts the providers, e.g. `auth.cert-check.vocdoni.dev` |
 | `CERTCHECK_AUTH_PUBLIC_PORT` | `$RAILWAY_TCP_PROXY_PORT` | External auth port used in `authUrl`. Required: set it when `RAILWAY_TCP_PROXY_PORT` is absent |
 | `CERTCHECK_AUTH_LISTEN` | `:8443` | Auth listener address, `host:port` with a numeric port between 1 and 65535 |
