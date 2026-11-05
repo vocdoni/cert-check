@@ -3,13 +3,16 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 
 	"github.com/vocdoni/cert-check/testui/internal/probe"
+	"github.com/vocdoni/cert-check/testui/internal/server"
 )
 
 func TestRunConfigError(t *testing.T) {
@@ -27,6 +30,38 @@ func TestRunConfigError(t *testing.T) {
 	}
 	if strings.Contains(msg, token) || strings.Contains(msg, "SECRET") {
 		t.Errorf("error %q contains the token", msg)
+	}
+}
+
+// TestRunExitAfterStop: after SIGINT/SIGTERM, a drain cut short is a Warn
+// line and run returns nil (exit 0); any other Run error is returned (exit
+// 1) (U12-FABLE-4).
+func TestRunExitAfterStop(t *testing.T) {
+	cutShort := fmt.Errorf("%w after 15s: %w", server.ErrDrainCutShort, context.DeadlineExceeded)
+	accept := errors.New("accept tcp [::]:8080: use of closed network connection")
+	cases := []struct {
+		name     string
+		err      error
+		want     error
+		wantWarn bool
+	}{
+		{"clean stop", nil, nil, false},
+		{"drain cut short", cutShort, nil, true},
+		{"listener failure", accept, accept, false},
+		{"listener failure, then the drain expired", errors.Join(accept, context.DeadlineExceeded), accept, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var logs strings.Builder
+			got := exitErr(c.err, slog.New(slog.NewJSONHandler(&logs, nil)))
+			if (got == nil) != (c.want == nil) || (c.want != nil && !errors.Is(got, c.want)) {
+				t.Errorf("exitErr = %v, want %v", got, c.want)
+			}
+			if warn := strings.Contains(logs.String(), `"level":"WARN"`); warn != c.wantWarn ||
+				(warn && !strings.Contains(logs.String(), "drain cut short after 15s")) {
+				t.Errorf("logs = %q, want a Warn naming the drain: %v", logs.String(), c.wantWarn)
+			}
+		})
 	}
 }
 

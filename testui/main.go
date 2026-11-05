@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -136,5 +137,16 @@ func run(getenv func(string) string) error {
 	err = app.Run(ctx, mainLn, authLn)
 	stop() // ends certs.Run when Run returned on a listener error
 	wg.Wait()
+	return exitErr(err, log)
+}
+
+// exitErr is run's result for app.Run's err: after SIGINT/SIGTERM, a drain
+// cut short (the slowest requests closed at the deadline, as designed) is a
+// warning, not a failure; any other error fails the process.
+func exitErr(err error, log *slog.Logger) error {
+	if errors.Is(err, server.ErrDrainCutShort) {
+		log.Warn("stopped with requests cut short", "error", err.Error())
+		return nil
+	}
 	return err
 }

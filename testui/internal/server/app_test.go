@@ -149,29 +149,15 @@ func TestRunShutdownSlowRequests(t *testing.T) {
 		const drain = 500 * time.Millisecond
 		w.app.shutdownWait = drain
 		cancel, done, mainAddr, auth, cookie := running(t, w)
-
-		// Slow main request: the handler waits for a body that never comes.
-		slow, err := net.DialTimeout("tcp", mainAddr, time.Second)
-		if err != nil {
-			t.Fatalf("dial main: %v", err)
-		}
-		defer func() { _ = slow.Close() }() // test teardown
-		if _, err := io.WriteString(slow, "POST /api/v1/transactions HTTP/1.1\r\nHost: check.test\r\n"+
-			"Content-Type: application/json\r\nContent-Length: 64\r\n\r\n{"); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		waitFor(t, "the main request", func() bool {
-			w.app.createLimiter.mu.Lock()
-			defer w.app.createLimiter.mu.Unlock()
-			return len(w.app.createLimiter.entries) == 2 // createTx's client and this one
-		})
+		slow := slowCreate(t, w, mainAddr)
 
 		start := time.Now()
 		cancel()
 		select {
 		case err := <-done:
-			if !errors.Is(err, context.DeadlineExceeded) {
-				t.Errorf("Run = %v, want the drain deadline exceeded", err)
+			// A stop whose drain expired is ErrDrainCutShort: main exits 0 (U12-FABLE-4).
+			if !errors.Is(err, ErrDrainCutShort) || !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("Run = %v, want ErrDrainCutShort with the drain deadline exceeded", err)
 			}
 			if d := time.Since(start); d > drain+time.Second {
 				t.Errorf("Run returned %v after cancel, want about the %v drain", d, drain)
@@ -198,6 +184,57 @@ func TestRunShutdownSlowRequests(t *testing.T) {
 			t.Errorf("the validation ended %v after cancel, want it cancelled at the %v deadline", d, drain)
 		}
 	})
+}
+
+// TestRunListenerFailureWithSlowRequest: a listener failure stays Run's
+// error, and is not ErrDrainCutShort, even when the drain after it expires
+// (U12-FABLE-4).
+func TestRunListenerFailureWithSlowRequest(t *testing.T) {
+	w := newSrvWorld(t, srvOptions{})
+	const drain = 200 * time.Millisecond
+	w.app.shutdownWait = drain
+	mainLn, authLn := srvListen(t), srvListen(t)
+	done := make(chan error, 1)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	wg.Go(func() { done <- w.app.Run(t.Context(), mainLn, authLn) })
+	slowCreate(t, w, mainLn.Addr().String())
+
+	_ = mainLn.Close() // the main listener dies under Serve
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) || errors.Is(err, ErrDrainCutShort) {
+			t.Errorf("Run = %v, want the accept error and not ErrDrainCutShort", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Run = %v, want the expired drain reported too", err)
+		}
+	case <-time.After(drain + 5*time.Second):
+		t.Fatal("Run did not return after the main listener closed")
+	}
+}
+
+// slowCreate opens a main connection whose create request waits for a body
+// that never comes, and returns once the handler holds it.
+func slowCreate(t *testing.T, w *srvWorld, mainAddr string) net.Conn {
+	t.Helper()
+	entries := func() int {
+		w.app.createLimiter.mu.Lock()
+		defer w.app.createLimiter.mu.Unlock()
+		return len(w.app.createLimiter.entries)
+	}
+	before := entries()
+	slow, err := net.DialTimeout("tcp", mainAddr, time.Second)
+	if err != nil {
+		t.Fatalf("dial main: %v", err)
+	}
+	t.Cleanup(func() { _ = slow.Close() }) // test teardown
+	if _, err := io.WriteString(slow, "POST /api/v1/transactions HTTP/1.1\r\nHost: check.test\r\n"+
+		"Content-Type: application/json\r\nContent-Length: 64\r\n\r\n{"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	waitFor(t, "the main request", func() bool { return entries() > before })
+	return slow
 }
 
 // waitFor polls cond every 10ms and fails the test after 5s.
