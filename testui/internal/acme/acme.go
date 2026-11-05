@@ -152,6 +152,9 @@ func (m *Manager) Run(ctx context.Context) error {
 			m.log.Info("auth certificate ready", "name", m.name)
 			return nil
 		}
+		if ctx.Err() != nil {
+			return ctx.Err() // stopped mid-attempt: not an issuance failure
+		}
 		wait := m.backoff[min(i, len(m.backoff)-1)]
 		m.log.Error("auth certificate not obtained; retrying", "name", m.name, "error", err.Error(), "retryIn", wait.String())
 		select {

@@ -1,6 +1,7 @@
 package acme
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -10,6 +11,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"os"
@@ -377,6 +380,29 @@ func TestRunStopsOnCancel(t *testing.T) {
 	}
 	if m.Ready() {
 		t.Error("Ready() = true after a cancelled Run, want false")
+	}
+}
+
+// TestRunCancelledAttempt: an attempt ended by Run's context (a shutdown)
+// is not an issuance failure: no Error line, no "retrying" (U12-FABLE-5).
+func TestRunCancelledAttempt(t *testing.T) {
+	var logs bytes.Buffer
+	o := validOptions(t)
+	o.Logger = slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	m := newTestACME(t, o)
+	m.backoff = []time.Duration{time.Millisecond}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	m.manage = func(attempt context.Context, _ []string) error {
+		cancel() // SIGTERM during the obtain
+		<-attempt.Done()
+		return fmt.Errorf("*.%s: obtaining certificate: %w", testDomain, attempt.Err())
+	}
+	if err := m.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Errorf("Run = %v, want context.Canceled", err)
+	}
+	if got := logs.String(); strings.Contains(got, `"level":"ERROR"`) || strings.Contains(got, "retrying") {
+		t.Errorf("logs = %s, want no Error line and no retry", got)
 	}
 }
 
