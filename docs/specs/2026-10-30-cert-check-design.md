@@ -360,8 +360,8 @@ Order matters. Each step fails closed with a typed error.
      exception mechanism runs before `Verify`, so this only fires for unlisted OIDs);
    - anything else → `invalid_chain`.
 4. **Profile.** The leaf asserts at least one OID of exactly one candidate profile, read from
-   `leaf.Policies`. Zero profiles → `unsupported_profile`. More than one profile → `internal`
-   (a registry bug, tested against).
+   `leaf.Policies`. Zero profiles → `unsupported_profile`. More than one profile (two profiles
+   sharing a key under distinct OIDs, both asserted) → `unsupported_profile` as well.
 5. **Purpose.**
    - KeyUsage must include `digitalSignature` when the extension is present. An absent KU is
      allowed only if the profile says so.

@@ -583,7 +583,7 @@ func TestNewCheckerOptions(t *testing.T) {
 	// A cross-certificate of root (same subject and key, issued by crossRoot)
 	// pinned as an intermediate of a second profile with the same policy OID:
 	// a leaf issued by root would match both profiles. The registry rejects
-	// the declaration, so step 4's "more than one profile" branch stays unreachable.
+	// the declaration (TestVerifySharedIssuerMultiplePolicies: distinct OIDs).
 	crossRoot := testpki.NewRoot(t, "Options Cross Root", testpki.CertSpec{Now: now, KeyPair: tKey(t, "opt-cross", testpki.ECDSAP256)})
 	cross := crossRoot.Intermediate(t, "Options Root", testpki.CertSpec{Now: now, KeyPair: root.Key})
 	viaCross := prof
@@ -631,6 +631,51 @@ func TestNewCheckerOptions(t *testing.T) {
 			}
 			if cas := c.CAs(); len(cas) != 1 || !cas[0].Equal(root.Cert) {
 				t.Errorf("CAs() = %d certificates, want the anchor", len(cas))
+			}
+		})
+	}
+}
+
+// TestVerifySharedIssuerMultiplePolicies: two profiles trust one issuer key
+// under distinct policy OIDs (the registry accepts it), directly or through a
+// pinned cross-certificate. A leaf asserting both policies is a profile
+// failure, not a retryable internal error.
+func TestVerifySharedIssuerMultiplePolicies(t *testing.T) {
+	t.Parallel()
+	now := tNow()
+	root := testpki.NewRoot(t, "Shared Root", testpki.CertSpec{Now: now, KeyPair: tKey(t, "shared-root", testpki.ECDSAP256)})
+	crossRoot := testpki.NewRoot(t, "Shared Cross Root", testpki.CertSpec{Now: now, KeyPair: tKey(t, "shared-cross", testpki.ECDSAP256)})
+	cross := crossRoot.Intermediate(t, "Shared Root", testpki.CertSpec{Now: now, KeyPair: root.Key})
+	viaCross := inertProfile("shared-b", "shared", crossRoot, cwPolicyB)
+	viaCross.Intermediates = []profiles.Anchor{profiles.TestAnchor(cross.Cert)}
+	leaf := root.Leaf(t, testpki.CertSpec{Now: now, Subject: tPerson("IDCES-"+cwDNI, cwGiven, cwSurnames),
+		KeyPair: tKey(t, "leaf", testpki.ECDSAP256), ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		Policies: []asn1.ObjectIdentifier{tOID(t, cwPolicyA), tOID(t, cwPolicyB)}}).Cert
+	rc := tRevocation(t, testpki.NewNet(), now)
+	for _, tc := range []struct {
+		name   string
+		second profiles.Profile
+	}{
+		{"same anchor", inertProfile("shared-b", "shared", root, cwPolicyB)},
+		{"cross-signed pinned intermediate", viaCross},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			decl := profiles.Provider{ID: "shared", Name: "Shared", Profiles: []profiles.Profile{inertProfile("shared-a", "shared", root, cwPolicyA), tc.second}}
+			p, err := New(Config{Provider: decl, Revocation: rc, Now: func() time.Time { return now }, Logger: tDiscard})
+			if err != nil {
+				t.Fatalf("New error = %v, want the declaration accepted (distinct OIDs)", err)
+			}
+			res, err := p.Verify(t.Context(), []*x509.Certificate{leaf})
+			e := tErr(t, err)
+			if res != nil || e.Code != CodeUnsupportedProfile || e.Retryable || e.Diagnostics.FailedStep != StepProfile {
+				t.Errorf("got (%v, %s at %s, retryable %v), want (nil, %s at %s, false)", res, e.Code, e.Diagnostics.FailedStep, e.Retryable,
+					CodeUnsupportedProfile, StepProfile)
+			}
+			if got, want := e.Detail, "certificate matches more than one profile"; got != want {
+				t.Errorf("detail = %q, want %q", got, want)
+			}
+			if got := e.Diagnostics.ProfileCandidates; len(got) != 2 || got[0].Result != "path ok" || got[1].Result != "path ok" {
+				t.Errorf("ProfileCandidates = %+v, want both paths ok", got)
 			}
 		})
 	}
