@@ -95,8 +95,9 @@
 
   // Own-property lookup for the code tables. A code comes from the URL fragment or the API, so a
   // plain table[code] would answer "__proto__" or "constructor" with Object.prototype or Object.
+  // The prototype method, not the static one from ES2022: Safari before 15.4 lacks that.
   function lookup(table, key) {
-    return Object.hasOwn(table, key) ? table[key] : undefined;
+    return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
   }
 
   function list(values) {
@@ -186,7 +187,13 @@
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(body);
     }
-    const timer = setTimeout(() => deadline.abort(new DOMException('API deadline exceeded', 'TimeoutError')), API_TIMEOUT_MS);
+    // A plain abort() and a flag of our own: browsers older than abort(reason) (Chrome 98,
+    // Firefox 97, Safari 15.4) ignore the reason and reject with an AbortError.
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      deadline.abort();
+    }, API_TIMEOUT_MS);
     try {
       const res = await fetch(path, init);
       // A stalled or failed body read rejects here, under the same deadline.
@@ -198,6 +205,8 @@
         // The body is not JSON; callers treat a null body as a bad reply.
       }
       return { status: res.status, body: json };
+    } catch (e) {
+      throw timedOut ? new DOMException('API deadline exceeded', 'TimeoutError') : e;
     } finally {
       clearTimeout(timer);
     }
@@ -253,15 +262,51 @@
   }
 
   // Runs an async entry point. Whatever it throws ends in the bad_response view, so a reply that
-  // breaks a renderer cannot leave the page on a view that never resolves.
+  // breaks a renderer cannot leave the page on a view that never resolves. When that view throws
+  // as well (a helper it shares is what failed), showFatal takes over.
   function guard(fn) {
     return async (...args) => {
       try {
         await fn(...args);
       } catch (e) {
-        showClientError({ code: 'bad_response' });
+        try {
+          showClientError({ code: 'bad_response' });
+        } catch (e2) {
+          showFatal();
+        }
       }
     };
+  }
+
+  // The last resort: a fixed message and a reload button in place of the views, written with plain
+  // DOM calls and none of the helpers, tables or views above.
+  function showFatal() {
+    try {
+      const panel = document.createElement('section');
+      panel.id = 'view-fatal';
+      panel.className = 'panel';
+      const heading = document.createElement('h1');
+      heading.id = 'error-heading'; // the error view's heading style; that view is removed below
+      heading.tabIndex = -1;
+      heading.textContent = 'We could not authenticate this certificate';
+      const message = document.createElement('p');
+      message.className = 'lede';
+      message.textContent = CLIENT_MESSAGES.bad_response;
+      const reload = document.createElement('button');
+      reload.className = 'pill primary';
+      reload.type = 'button';
+      reload.textContent = 'Start again';
+      reload.addEventListener('click', () => location.reload());
+      panel.appendChild(heading);
+      panel.appendChild(message);
+      panel.appendChild(reload);
+      const main = document.getElementById('main');
+      main.textContent = '';
+      main.appendChild(panel);
+      heading.focus();
+    } catch (e) {
+      // Without a working DOM there is nothing left to show.
+    }
   }
 
   // ---------- views ----------
