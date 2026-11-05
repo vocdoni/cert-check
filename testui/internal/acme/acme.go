@@ -114,8 +114,11 @@ func zapLogger(w io.Writer, log *slog.Logger) *zap.Logger {
 }
 
 // probeStorage creates dir (0700) and writes and removes a file in it, so a
-// missing, read-only or misplaced volume fails startup; certmagic checks its
+// directory that cannot be created or written (read-only mount, a path
+// through a regular file, no permission) fails startup; certmagic checks its
 // storage only when it obtains, and Run would retry that hourly, not ready.
+// An unmounted volume is not detected: its mount point is then a writable
+// directory of the container's own filesystem.
 func probeStorage(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("acme: storage %s: %w", dir, err)
