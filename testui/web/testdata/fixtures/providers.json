@@ -12,5 +12,5 @@
   {"id": "uanataca", "name": "Uanataca", "description": "Certificado cualificado de Persona Física Ciudadano en software", "beta": true},
   {"id": "signe", "name": "SIGNE", "description": "Certificado personal de Persona Física en otros dispositivos", "beta": true},
   {"id": "lleidanet", "name": "Lleidanet / inDenova", "description": "Certificado cualificado de persona física en software", "beta": true},
-  {"id": "dnie", "name": "DNIe (requires card reader)", "description": "Certificado de autenticación del DNI electrónico (tarjeta y lector)", "beta": true}
+  {"id": "dnie", "name": "DNIe (requires card reader)", "description": "Certificado de Autenticación del DNI electrónico; the browser must already be able to use the card", "beta": true}
 ]

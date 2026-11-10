@@ -2,7 +2,7 @@
   "status": "success",
   "result": {
     "provider": {"id": "dnie", "name": "DNIe (requires card reader)"},
-    "profile": {"id": "dnie-auth", "name": "DNIe authentication", "holderRole": "natural_person"},
+    "profile": {"id": "dnie-auth", "name": "DNIe Autenticación", "holderRole": "natural_person"},
     "identity": {
       "document": {"type": "DNI", "country": "ES", "number": "12345679S", "raw": "12345679S", "source": "subject.2.5.4.5"},
       "givenNames": "JUAN",

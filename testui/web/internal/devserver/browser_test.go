@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"html"
 	"io"
 	"io/fs"
@@ -149,29 +150,34 @@ func TestBrowser(t *testing.T) {
 		caStart   = `data-i18n="title">Comprovador d'autenticació amb certificat</h1>`
 		esRevoked = "El certificado ha sido revocado o suspendido."
 		caRevoked = "El certificat ha estat revocat o suspès."
+		// The DNIe option as the library serves it, with its English parts in the page language.
+		dnieOption = `<option value="dnie" title="Certificado de Autenticación del DNI electrónico; %s">DNIe (%s)</option>`
 	)
+	esDNIe := fmt.Sprintf(dnieOption, "el navegador ya debe poder usar la tarjeta", "requiere lector de tarjetas")
+	caDNIe := fmt.Sprintf(dnieOption, "el navegador ja ha de poder fer servir la targeta", "cal un lector de targetes")
+	enDNIe := fmt.Sprintf(dnieOption, "the browser must already be able to use the card", "requires card reader")
 	langCases := []struct {
 		name, accept, path string // accept: the browser's preferred languages
 		view, lang         string // the only visible view, and <html lang>
 		contains           []string
 	}{
-		{"es-ES start", "es-ES", "/", "start", "es", []string{esStart, "DNIe (requiere lector de tarjetas)", `>Autenticarse</button>`}},
+		{"es-ES start", "es-ES", "/", "start", "es", []string{esStart, esDNIe, `>Autenticarse</button>`}},
 		{"es-ES invalid_state", "es-ES", "/#error=invalid_state&diag=" + diagInvalidState, "error", "es",
 			[]string{"Este enlace de autenticación ya no es válido. Vuelva a empezar.", "El enlace ha caducado. Vuelva a empezar.", diagInvalidState}},
-		{"es-ES success dnie", "es-ES", "/#code=success-dnie", "success", "es", []string{"Fecha de nacimiento", "DNIe (requiere lector de tarjetas)"}},
-		{"ca-ES start", "ca-ES", "/", "start", "ca", []string{caStart, "DNIe (cal un lector de targetes)", `>Autenticar-se</button>`}},
+		{"es-ES success dnie", "es-ES", "/#code=success-dnie", "success", "es", []string{"Fecha de nacimiento", "DNIe (requiere lector de tarjetas)", "DNIe Autenticación"}},
+		{"ca-ES start", "ca-ES", "/", "start", "ca", []string{caStart, caDNIe, `>Autenticar-se</button>`}},
 		{"ca-ES revoked", "ca-ES", "/#code=error-revoked", "error", "ca", []string{caRevoked, "Posi's en contacte amb l'entitat que el va emetre.", revokedReport}},
 		{"ca-ES success", "ca-ES", "/#code=success", "success", "ca", []string{"Nom complet", "JUAN GARCÍA LÓPEZ"}},
 		{"fr-FR falls back to Spanish", "fr-FR", "/", "start", "es", []string{esStart}},
 		{"fr-FR revoked in Spanish", "fr-FR", "/#code=error-revoked", "error", "es", []string{esRevoked, revokedReport}},
 		{"first match wins: fr, ca", "fr-FR,ca-ES,es-ES", "/", "start", "ca", []string{caStart}},
-		{"first match wins: de, en", "de-DE,en-GB,es-ES", "/", "start", "en", []string{authenticate}},
+		{"first match wins: de, en", "de-DE,en-GB,es-ES", "/", "start", "en", []string{authenticate, enDNIe}},
 		{"galician reads Spanish", "gl-ES,en-US", "/", "start", "es", []string{esStart}},
 		{"saved choice beats the browser", "es-ES", "/__test/saved-ca.html", "start", "ca", []string{caStart}},
 		{"bad saved value is ignored", "en-US", "/__test/saved-bad.html", "start", "en", []string{authenticate}},
 		{"switch on the error view", "es-ES", "/__test/switch-ca.html#code=error-revoked", "error", "ca", []string{caRevoked, revokedReport}},
 		{"switch on the success view", "en-US", "/__test/switch-ca.html#code=success", "success", "ca", []string{"Nom complet", "JUAN GARCÍA LÓPEZ"}},
-		{"switch on the start view", "en-US", "/__test/switch-ca.html", "start", "ca", []string{caStart, "DNIe (cal un lector de targetes)"}},
+		{"switch on the start view", "en-US", "/__test/switch-ca.html", "start", "ca", []string{caStart, caDNIe}},
 		// A renderer that throws during the switch leaves the shown result in place.
 		{"switch that throws keeps the result", "en-US", "/__test/switch-ca-broken.html#code=success", "success", "ca", []string{"JUAN GARCÍA LÓPEZ", "Full name"}},
 	}
@@ -318,12 +324,18 @@ func serveTestPage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// chromeSlots caps the headless Chromes running at once: the parallel cases otherwise start one
+// each, and on a loaded machine a Chrome could miss its deadline (gate F5).
+var chromeSlots = make(chan struct{}, 6)
+
 // dumpDOM loads url in a fresh headless profile whose preferred languages are accept (a
 // comma-separated list) and returns the DOM once 10 s of virtual time have passed (virtual time
 // stands still while a request is open). Headless Chrome takes navigator.languages from
 // --accept-lang and ignores --lang, which sets the language of a headed browser.
 func dumpDOM(t *testing.T, chrome, url, accept string) string {
 	t.Helper()
+	chromeSlots <- struct{}{}
+	defer func() { <-chromeSlots }()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	first, _, _ := strings.Cut(accept, ",")
