@@ -1,15 +1,25 @@
 'use strict';
 
 // Certificate Authentication Checker UI. Plain JavaScript, no build step. Every string that
-// comes from the API or from the URL is inserted with textContent or a text node only.
+// comes from the API or from the URL is inserted with textContent or a text node only, and so is
+// every text from i18n.js.
 (function () {
   const PENDING_KEY = 'certcheck.pending';
   const VERSION_KEY = 'certcheck.serverVersion';
+  const LANG_KEY = 'certcheck.lang';
   const PENDING_MAX_AGE_MS = 5 * 60 * 1000;
   // One deadline for an API call, request and body read together. The server's write timeout is 30 s.
   const API_TIMEOUT_MS = 20 * 1000;
+  // The report stays in English whatever the page language: it goes to Vocdoni support.
   const REPORT_TITLE = 'Vocdoni Certificate Authentication Checker - diagnostic report';
   const NEVER_REACHED_RESULT = 'Result: authentication step never reached the server';
+
+  // The UI texts by language (i18n.js). With no saved choice, the browser's first language that
+  // matches picks one; the other languages of Spain read Spanish, and Spanish is the fallback.
+  const STRINGS = CERTCHECK_STRINGS;
+  const LANGS = ['en', 'es', 'ca'];
+  const FALLBACK_LANG = 'es';
+  const SPANISH_TOO = ['gl', 'eu', 'ast', 'an', 'oc'];
 
   const VIEWS = ['start', 'working', 'success', 'error'];
   const HEADINGS = {
@@ -19,62 +29,59 @@
     error: 'error-heading',
   };
 
-  // Messages for failures that are produced here and not by the server.
-  const CLIENT_MESSAGES = {
-    invalid_state: 'This authentication link is no longer valid. Please start again.',
-    invalid_or_expired: 'This authentication link is no longer valid. Please start again.',
-    never_reached: 'The authentication step never reached our server.',
-    network_error: 'We could not reach the server. Check your connection and try again.',
-    timeout: 'The server took too long to answer.',
-    bad_response: 'The server sent a reply this page could not understand.',
-    generic: 'Something went wrong.',
-  };
+  // The failure codes produced here and not by the server. The report gives their English message
+  // where a server error gives the server's own.
+  const CLIENT_CODES = ['invalid_state', 'invalid_or_expired', 'never_reached', 'network_error', 'timeout', 'bad_response', 'generic'];
 
-  const TEMPORARY = ['This looks temporary. Try again in a few minutes.'];
-  const NOT_SUPPORTED = ['This type of certificate is not supported. Try another certificate.'];
-  const LINK_EXPIRED = ['The link has expired. Start again.'];
-  const CHOOSE_CERTIFICATE = [
-    'When your browser asks, choose a certificate.',
-    'Browsers only list certificates that are still valid and were issued by the selected provider. If no list appeared, check the expiry date of your certificate in the browser certificate manager.',
-    'Browsers may remember an earlier choice. Close all browser windows and try again.',
-  ];
+  // The DNIe entry's English qualifier and clause, as the API serves them. They are shown in the
+  // page language; the rest of every provider entry is official text and is shown as served.
+  const DNIE_QUALIFIER = 'requires card reader';
+  const DNIE_CLAUSE = 'the browser must already be able to use the card';
 
-  // Recovery guidance per error code. A function receives the auth port (or '').
+  // Recovery guidance per error code: the i18n.js guidance to show, in order.
+  const TEMPORARY = ['temporary'];
+  const NOT_SUPPORTED = ['not_supported'];
+  const LINK_EXPIRED = ['link_expired'];
+  const CHOOSE_CERTIFICATE = ['choose_certificate'];
   const GUIDANCE = {
     no_certificate: CHOOSE_CERTIFICATE,
-    never_reached: (port) => CHOOSE_CERTIFICATE.concat([
-      'The certificate selection may have been cancelled.',
-      'The network may block port ' + (port || 'unknown') + '. Try another network.',
-      'The browser may not have been able to use the certificate key.',
-    ]),
-    provider_mismatch: ['Select the provider that issued your certificate and try again.'],
+    never_reached: CHOOSE_CERTIFICATE.concat(['never_reached']),
+    provider_mismatch: ['provider_mismatch'],
     untrusted_issuer: NOT_SUPPORTED,
     invalid_chain: NOT_SUPPORTED,
     unsupported_profile: NOT_SUPPORTED,
     unsupported_purpose: NOT_SUPPORTED,
     weak_algorithm: NOT_SUPPORTED,
-    expired: ['Renew the certificate, or check that the date and time on this device are correct.'],
-    not_yet_valid: ['Renew the certificate, or check that the date and time on this device are correct.'],
-    revoked: ['The certificate is revoked or suspended. Contact the organization that issued it.'],
+    expired: ['check_dates'],
+    not_yet_valid: ['check_dates'],
+    revoked: ['revoked'],
     revocation_unavailable: TEMPORARY,
     internal: TEMPORARY,
     rate_limited: TEMPORARY,
     store_full: TEMPORARY,
     network_error: TEMPORARY,
     timeout: TEMPORARY,
-    revocation_unknown: ['The issuer does not recognise this certificate. Contact the organization that issued it.'],
-    identity_invalid: ['The identity data in this certificate could not be read in a supported form. Try another certificate.'],
-    identity_unsupported_document: ['This certificate identifies its holder with a document other than a Spanish DNI or NIE. Try another certificate.'],
-    test_certificate: ['This is a test or specimen certificate. Try a real personal certificate.'],
+    revocation_unknown: ['revocation_unknown'],
+    identity_invalid: ['identity_invalid'],
+    identity_unsupported_document: ['identity_unsupported_document'],
+    test_certificate: ['test_certificate'],
     invalid_or_expired: LINK_EXPIRED,
     invalid_state: LINK_EXPIRED,
   };
-  const DEFAULT_GUIDANCE = ['Try again. If the problem continues, send the diagnostic report to Vocdoni support.'];
+  const DEFAULT_GUIDANCE = ['default'];
 
   const $ = (id) => document.getElementById(id);
 
   let providersState = 'idle'; // idle, loading, ready, failed
+  let providers = []; // the validated provider list, once ready
   let lastServerVersion = '';
+  // The active dictionary, and what each view shows, so a language switch can re-render in place.
+  let strings = STRINGS.es;
+  let workingKey = 'working_preparing';
+  let shownResult = null;
+  let shownError = null; // { code, serverMessage, port }
+  let copyNote = '';
+  let fatal = false;
 
   // ---------- small helpers ----------
 
@@ -98,6 +105,20 @@
   // The prototype method, not the static one from ES2022: Safari before 15.4 lacks that.
   function lookup(table, key) {
     return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+  }
+
+  // The page text for key in the active language.
+  function t(key) {
+    return str(lookup(strings.text, key));
+  }
+
+  // text with each {name} replaced by values[name].
+  function fill(text, values) {
+    return text.replace(/\{([a-z]+)\}/g, (match, name) => str(lookup(values, name)));
+  }
+
+  function format(key, values) {
+    return fill(t(key), values);
   }
 
   function list(values) {
@@ -167,6 +188,94 @@
 
   function clearPending() {
     removeStorage(PENDING_KEY);
+  }
+
+  // ---------- language ----------
+
+  // The language choice outlives the session, so it lives in localStorage.
+  function readSavedLanguage() {
+    try {
+      return localStorage.getItem(LANG_KEY);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveLanguage(code) {
+    try {
+      localStorage.setItem(LANG_KEY, code);
+    } catch (e) {
+      // See writeStorage.
+    }
+  }
+
+  function isLanguage(code) {
+    return LANGS.indexOf(code) !== -1;
+  }
+
+  // The UI language for a browser language tag, by its primary subtag, or ''.
+  function languageOf(tag) {
+    const primary = str(tag).toLowerCase().split(/[-_]/)[0];
+    if (isLanguage(primary)) {
+      return primary;
+    }
+    return SPANISH_TOO.indexOf(primary) !== -1 ? 'es' : '';
+  }
+
+  // The saved choice, else the first of the browser's languages that matches, else Spanish.
+  function detectLanguage() {
+    const saved = readSavedLanguage();
+    if (isLanguage(saved)) {
+      return saved;
+    }
+    const preferred = navigator.languages && navigator.languages.length > 0 ? navigator.languages : [navigator.language];
+    for (const tag of preferred) {
+      const code = languageOf(tag);
+      if (code) {
+        return code;
+      }
+    }
+    return FALLBACK_LANG;
+  }
+
+  // Makes code the active language and writes the page's fixed texts (data-i18n in index.html).
+  function useLanguage(code) {
+    strings = lookup(STRINGS, code);
+    document.documentElement.lang = code;
+    document.title = t('title');
+    $('language').value = code;
+    for (const node of document.querySelectorAll('[data-i18n]')) {
+      node.textContent = t(node.getAttribute('data-i18n'));
+    }
+  }
+
+  // The selector: saves the choice and re-renders every view in place, keeping what it shows.
+  function changeLanguage() {
+    const code = $('language').value;
+    if (!isLanguage(code)) {
+      return;
+    }
+    saveLanguage(code);
+    try {
+      useLanguage(code);
+      if (fatal) {
+        showFatal();
+        $('language').focus();
+        return;
+      }
+      renderProviders();
+      $('working-text').textContent = t(workingKey);
+      if (shownResult) {
+        renderSuccess();
+      }
+      if (shownError) {
+        renderErrorText();
+      }
+      $('copy-feedback').textContent = copyNote ? t(copyNote) : '';
+      $('status').textContent = '';
+    } catch (e) {
+      showFatal();
+    }
   }
 
   function rememberVersion(diagnostics) {
@@ -279,23 +388,25 @@
   }
 
   // The last resort: a fixed message and a reload button in place of the views, written with plain
-  // DOM calls and none of the helpers, tables or views above.
+  // DOM calls and none of the helpers, tables or views above. The texts are plain reads from the
+  // active dictionary; a language switch builds the panel again.
   function showFatal() {
     try {
+      fatal = true;
       const panel = document.createElement('section');
       panel.id = 'view-fatal';
       panel.className = 'panel';
       const heading = document.createElement('h1');
       heading.id = 'error-heading'; // the error view's heading style; that view is removed below
       heading.tabIndex = -1;
-      heading.textContent = 'We could not authenticate this certificate';
+      heading.textContent = strings.text.error_heading;
       const message = document.createElement('p');
       message.className = 'lede';
-      message.textContent = CLIENT_MESSAGES.bad_response;
+      message.textContent = strings.messages.bad_response;
       const reload = document.createElement('button');
       reload.className = 'pill primary';
       reload.type = 'button';
-      reload.textContent = 'Start again';
+      reload.textContent = strings.text.start_again;
       reload.addEventListener('click', () => location.reload());
       panel.appendChild(heading);
       panel.appendChild(message);
@@ -319,9 +430,10 @@
     $(HEADINGS[name]).focus();
   }
 
-  function showWorking(text) {
-    $('working-text').textContent = text;
-    showView('working', text);
+  function showWorking(key) {
+    workingKey = key;
+    $('working-text').textContent = t(key);
+    showView('working', t(key));
   }
 
   // ---------- start view ----------
@@ -330,16 +442,24 @@
     $('provider-hint').hidden = $('provider').value !== 'dnie';
   }
 
+  // A provider's name or description as served, but for the DNIe entry's English part, which is
+  // replaced by its text in the page language.
+  function providerText(id, text, english, local) {
+    return id === 'dnie' ? str(text).split(english).join(local) : str(text);
+  }
+
   function providerOption(p) {
-    const option = new Option(str(p.name), str(p.id));
+    const option = new Option(providerText(p.id, p.name, DNIE_QUALIFIER, t('dnie_qualifier')), str(p.id));
     if (p.description) {
-      option.title = str(p.description);
+      option.title = providerText(p.id, p.description, DNIE_CLAUSE, t('dnie_clause'));
     }
     return option;
   }
 
-  function fillProviders(providers) {
+  // Fills the provider select in the active language, keeping the current choice.
+  function fillProviders() {
     const select = $('provider');
+    const chosen = select.value;
     select.replaceChildren();
     for (const p of providers.filter((x) => !x.beta)) {
       select.append(providerOption(p));
@@ -347,13 +467,27 @@
     const beta = providers.filter((x) => x.beta);
     if (beta.length > 0) {
       const group = document.createElement('optgroup');
-      group.label = 'Beta';
+      group.label = t('beta');
       for (const p of beta) {
         group.append(providerOption(p));
       }
       select.append(group);
     }
+    if (chosen) {
+      select.value = chosen;
+    }
     updateHint();
+  }
+
+  // The provider select and the start message for the current providersState.
+  function renderProviders() {
+    const failed = providersState === 'failed';
+    startMessage(failed ? t('providers_failed') : '');
+    if (providersState === 'ready') {
+      fillProviders();
+    } else if (providersState !== 'idle') {
+      $('provider').replaceChildren(new Option(failed ? t('providers_unavailable') : t('providers_loading'), ''));
+    }
   }
 
   function startMessage(text) {
@@ -367,9 +501,8 @@
       return;
     }
     providersState = 'loading';
-    startMessage('');
+    renderProviders();
     const select = $('provider');
-    select.replaceChildren(new Option('Loading providers…', ''));
     select.disabled = true;
     $('authenticate').disabled = true;
     try {
@@ -377,16 +510,15 @@
       if (reply.status !== 200 || !isProviderList(reply.body)) {
         throw new Error('bad providers reply');
       }
-      fillProviders(reply.body);
+      providers = reply.body;
+      fillProviders();
       providersState = 'ready';
       select.disabled = false;
       $('authenticate').disabled = false;
     } catch (e) {
       providersState = 'failed';
-      select.replaceChildren(new Option('Providers unavailable', ''));
-      const text = 'We could not load the list of certificate providers. Reload the page to try again.';
-      startMessage(text);
-      $('status').textContent = text;
+      renderProviders();
+      $('status').textContent = t('providers_failed');
     }
   }
 
@@ -419,7 +551,7 @@
     }
     const providerName = select.selectedOptions.length > 0 ? select.selectedOptions[0].text : provider;
     $('authenticate').disabled = true;
-    showWorking('Preparing…');
+    showWorking('working_preparing');
 
     let reply;
     try {
@@ -468,15 +600,23 @@
 
   function organizationLabel(role) {
     if (role === 'representative') {
-      return 'Represents';
+      return t('row_represents');
     }
     if (role === 'public_employee') {
-      return 'Employer';
+      return t('row_employer');
     }
-    return 'Organization';
+    return t('row_organization');
   }
 
   function showSuccess(result) {
+    shownResult = result;
+    renderSuccess();
+    showView('success', t('success_status'));
+  }
+
+  // The success rows of shownResult in the active language.
+  function renderSuccess() {
+    const result = shownResult;
     const dl = $('result-list');
     dl.replaceChildren();
     const id = result.identity || {};
@@ -484,27 +624,29 @@
     const profile = result.profile || {};
     const cert = result.certificate || {};
     const rev = result.revocation || {};
+    const provider = result.provider || {};
 
-    addRow(dl, 'Full name', id.fullName);
-    addRow(dl, 'Given name(s)', id.givenNames);
-    addRow(dl, 'Surname(s)', id.surnames);
-    addRow(dl, 'First surname', id.firstSurname);
-    addRow(dl, 'Second surname', id.secondSurname);
-    addRow(dl, 'Document', [doc.type, doc.number].filter(Boolean).join(' '));
-    addRow(dl, 'Birth date', id.birthDate || 'Not included in this certificate');
+    addRow(dl, t('row_full_name'), id.fullName);
+    addRow(dl, t('row_given_names'), id.givenNames);
+    addRow(dl, t('row_surnames'), id.surnames);
+    addRow(dl, t('row_first_surname'), id.firstSurname);
+    addRow(dl, t('row_second_surname'), id.secondSurname);
+    addRow(dl, t('row_document'), [doc.type, doc.number].filter(Boolean).join(' '));
+    addRow(dl, t('row_birth_date'), id.birthDate || t('birth_date_missing'));
     if (result.organization) {
       const org = result.organization;
       const text = org.identifier ? str(org.name) + ' (' + str(org.identifier) + ')' : str(org.name);
       addRow(dl, organizationLabel(profile.holderRole), text);
     }
-    addRow(dl, 'Certificate provider', (result.provider || {}).name);
-    addRow(dl, 'Profile', profile.name);
-    addRow(dl, 'Issuer', cert.issuer);
-    addRow(dl, 'Valid until', localDate(cert.notAfter));
-    addRow(dl, 'Revocation check',
-      str(rev.method).toUpperCase() + ', checked ' + localDateTime(rev.checkedAt) + ', source ' + str(rev.source));
-
-    showView('success', 'Success. Your certificate was accepted.');
+    addRow(dl, t('provider_label'), providerText(provider.id, provider.name, DNIE_QUALIFIER, t('dnie_qualifier')));
+    addRow(dl, t('row_profile'), profile.name);
+    addRow(dl, t('row_issuer'), cert.issuer);
+    addRow(dl, t('row_valid_until'), localDate(cert.notAfter));
+    addRow(dl, t('row_revocation'), format('revocation_value', {
+      method: str(rev.method).toUpperCase(),
+      time: localDateTime(rev.checkedAt),
+      source: str(rev.source),
+    }));
   }
 
   // ---------- error view and report ----------
@@ -602,31 +744,53 @@
     return lines;
   }
 
+  // view: { code, serverMessage, port, report }. The report is English and set once; the message
+  // and guidance follow the language.
   function renderError(view) {
-    $('error-message').textContent = view.message;
-    const guidance = $('error-guidance');
-    guidance.replaceChildren();
-    for (const line of view.guidance) {
-      guidance.append(el('li', '', line));
-    }
+    shownError = view;
+    renderErrorText();
     $('report').textContent = view.report.join('\n') + '\n';
     $('tech').open = false;
+    copyNote = '';
     $('copy-feedback').textContent = '';
-    showView('error', view.message);
+    showView('error', $('error-message').textContent);
+  }
+
+  function renderErrorText() {
+    $('error-message').textContent = displayMessage(shownError.code, shownError.serverMessage);
+    const guidance = $('error-guidance');
+    guidance.replaceChildren();
+    for (const line of guidanceFor(shownError.code, shownError.port)) {
+      guidance.append(el('li', '', line));
+    }
+  }
+
+  // The page's own message for a known code; else the server's English message; else the generic one.
+  function displayMessage(code, serverMessage) {
+    return lookup(strings.messages, code) || serverMessage || strings.messages.generic;
+  }
+
+  // The report's message: the server's own; else the English message of a client code; else the
+  // English generic one.
+  function reportMessage(code, serverMessage) {
+    const english = STRINGS.en.messages;
+    return serverMessage || (CLIENT_CODES.indexOf(code) !== -1 && lookup(english, code)) || english.generic;
   }
 
   function guidanceFor(code, port) {
-    const g = lookup(GUIDANCE, code);
-    if (typeof g === 'function') {
-      return g(port);
+    const lines = [];
+    for (const name of lookup(GUIDANCE, code) || DEFAULT_GUIDANCE) {
+      for (const line of lookup(strings.guidance, name) || []) {
+        lines.push(fill(line, { port: port || t('unknown_port') }));
+      }
     }
-    return g || DEFAULT_GUIDANCE;
+    return lines;
   }
 
   // An error the server reported. Full diagnostics, when present, drive the report.
   function showServerError(error, diagnostics, entry) {
     const code = str(error.code) || 'generic';
-    const message = str(error.message) || lookup(CLIENT_MESSAGES, code) || CLIENT_MESSAGES.generic;
+    const message = reportMessage(code, str(error.message));
     rememberVersion(diagnostics);
     let report;
     if (diagnostics) {
@@ -636,14 +800,14 @@
       report = reportHeader('', new Date().toISOString(), '')
         .concat(['Result: error ' + code + ' - ' + message], attemptLines(entry));
     }
-    renderError({ message, guidance: guidanceFor(code, entry ? entry.authPort : ''), report });
+    renderError({ code, serverMessage: str(error.message), port: entry ? entry.authPort : '', report });
   }
 
   // An error this page produced: create failed, bad reply, expired link, never reached.
   function showClientError(opts) {
     const code = opts.code;
     const entry = opts.entry || null;
-    const message = opts.message || lookup(CLIENT_MESSAGES, code) || CLIENT_MESSAGES.generic;
+    const message = reportMessage(code, opts.message);
     let attempt = [];
     if (entry) {
       attempt = attemptLines(entry);
@@ -652,15 +816,14 @@
     }
     const result = code === 'never_reached' ? NEVER_REACHED_RESULT : 'Result: error ' + code + ' - ' + message;
     const report = reportHeader(opts.diagnosticId || '', new Date().toISOString(), '').concat([result], attempt);
-    renderError({ message, guidance: guidanceFor(code, entry ? entry.authPort : ''), report });
+    renderError({ code, serverMessage: str(opts.message), port: entry ? entry.authPort : '', report });
   }
 
   async function copyReport() {
     const text = $('report').textContent;
-    let note;
     try {
       await navigator.clipboard.writeText(text);
-      note = 'Report copied to the clipboard.';
+      copyNote = 'copied';
     } catch (e) {
       const pre = $('report');
       $('tech').open = true;
@@ -670,10 +833,10 @@
       selection.removeAllRanges();
       selection.addRange(range);
       pre.focus();
-      note = 'Press Ctrl+C to copy';
+      copyNote = 'copy_manually';
     }
-    $('copy-feedback').textContent = note;
-    $('status').textContent = note;
+    $('copy-feedback').textContent = t(copyNote);
+    $('status').textContent = t(copyNote);
   }
 
   // ---------- page load ----------
@@ -688,7 +851,7 @@
   }
 
   async function redeem(code, entry) {
-    showWorking('Checking your certificate…');
+    showWorking('working_redeem');
     let reply;
     try {
       reply = await api('POST', '/api/v1/transactions/redeem', { code });
@@ -719,7 +882,7 @@
   }
 
   async function detectPending(entry) {
-    showWorking('Checking your last attempt…');
+    showWorking('working_pending');
     let current = null;
     try {
       const reply = await api('GET', '/api/v1/transactions/current');
@@ -749,6 +912,7 @@
   async function init() {
     const params = new URLSearchParams(location.hash.slice(1));
     history.replaceState(null, '', '/');
+    useLanguage(detectLanguage());
     lastServerVersion = readStorage(VERSION_KEY) || lastServerVersion;
 
     const entry = readPending();
@@ -775,6 +939,7 @@
   $('retry').addEventListener('click', showStart);
   $('cancel').addEventListener('click', startOver);
   $('copy-report').addEventListener('click', copyReport);
+  $('language').addEventListener('change', changeLanguage);
 
   const guardedInit = guard(init);
 
