@@ -74,8 +74,9 @@ var testPages = map[string]struct {
 	"never-start-again":  {false, neverJS + "function next() { document.getElementById('cancel').click(); }\n"},
 	"saved-ca":           {true, "localStorage.setItem('certcheck.lang', 'ca');\n"},
 	"saved-bad":          {true, "localStorage.setItem('certcheck.lang', '__proto__');\n"},
-	"switch-ca":          {false, switchJS},
-	"no-strings":         {false, ""}, // serves index.html with i18n.js swapped for a 404
+	"switch-ca":          {false, switchJS("")},
+	"switch-ca-broken":   {false, switchJS("delete Element.prototype.replaceChildren;")}, // the renderers throw
+	"no-strings":         {false, ""},                                                    // serves index.html with i18n.js swapped for a 404
 }
 
 // stringsTag loads the dictionaries; the no-strings page points it at a missing file instead, as a
@@ -83,18 +84,21 @@ var testPages = map[string]struct {
 const stringsTag = `<script src="/i18n.js" defer></script>`
 
 // switchJS chooses Catalan in the language selector, as a user would, once the page shows a view
-// other than the working one.
-const switchJS = `const poll = setInterval(() => {
+// other than the working one. prepare runs just before the switch.
+func switchJS(prepare string) string {
+	return `const poll = setInterval(() => {
   const shown = document.querySelector('section[id^="view-"]:not([hidden])');
   if (!shown || shown.id === 'view-working') {
     return;
   }
   clearInterval(poll);
+  ` + prepare + `
   const select = document.getElementById('language');
   select.value = 'ca';
   select.dispatchEvent(new Event('change'));
 }, 50);
 `
+}
 
 // TestBrowser covers U14-FABLE-4: headless Chrome loads the UI from the devserver and the test
 // checks the view the page settles on. The cases are fragment codes that name Object.prototype
@@ -168,6 +172,8 @@ func TestBrowser(t *testing.T) {
 		{"switch on the error view", "es-ES", "/__test/switch-ca.html#code=error-revoked", "error", "ca", []string{caRevoked, revokedReport}},
 		{"switch on the success view", "en-US", "/__test/switch-ca.html#code=success", "success", "ca", []string{"Nom complet", "JUAN GARCÍA LÓPEZ"}},
 		{"switch on the start view", "en-US", "/__test/switch-ca.html", "start", "ca", []string{caStart, "DNIe (cal un lector de targetes)"}},
+		// A renderer that throws during the switch leaves the shown result in place.
+		{"switch that throws keeps the result", "en-US", "/__test/switch-ca-broken.html#code=success", "success", "ca", []string{"JUAN GARCÍA LÓPEZ", "Full name"}},
 	}
 	for _, c := range langCases {
 		t.Run(c.name, func(t *testing.T) {

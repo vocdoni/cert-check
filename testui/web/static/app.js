@@ -280,7 +280,10 @@
       $('copy-feedback').textContent = copyNote ? t(copyNote) : '';
       $('status').textContent = '';
     } catch (e) {
-      showFatal();
+      // A shown result stays as it is: its code is single use, so the panel would lose it for good.
+      if (!shownResult) {
+        showFatal();
+      }
     }
   }
 

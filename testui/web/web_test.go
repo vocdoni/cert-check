@@ -968,7 +968,8 @@ func TestAppJSLanguage(t *testing.T) {
 	inOrder("readSavedLanguage", "try {", "localStorage.getItem(LANG_KEY)", "} catch (")
 	inOrder("saveLanguage", "try {", "localStorage.setItem(LANG_KEY", "} catch (")
 	inOrder("useLanguage", "lookup(STRINGS, code)", "document.documentElement.lang = code;", "document.title = t('title');", ".textContent = t(")
-	inOrder("changeLanguage", "isLanguage(code)", "saveLanguage(code)", "useLanguage(code)", "renderProviders()", "} catch (", "showFatal()")
+	// A throw during a switch never replaces a shown result (the code is single use): gate F6.
+	inOrder("changeLanguage", "isLanguage(code)", "saveLanguage(code)", "useLanguage(code)", "renderProviders()", "} catch (", "if (!shownResult) {", "showFatal()")
 	inOrder("init", "history.replaceState(null, '', '/');", "useLanguage(detectLanguage());",
 		"$('language').closest('.language').hidden = false;", "await ")
 	if strings.Contains(jsFunc(t, js, "changeLanguage"), "reload") {
