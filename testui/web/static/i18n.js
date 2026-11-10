@@ -152,16 +152,16 @@ const CERTCHECK_STRINGS = {
       "row_issuer": "Emisor",
       "row_valid_until": "Válido hasta",
       "row_revocation": "Comprobación de revocación",
-      "revocation_value": "{method}, consultado el {time} en {source}",
+      "revocation_value": "{method}, consulta del {time} en {source}",
       "check_another": "Comprobar otro certificado",
       "eyebrow_problem": "Problema",
       "error_heading": "No hemos podido autenticar este certificado",
       "technical_details": "Detalles técnicos",
-      "report_language": "El informe de diagnóstico está en inglés para que el soporte de Vocdoni pueda leerlo.",
-      "copy_report": "Copiar el informe de diagnóstico",
-      "copied": "Informe copiado en el portapapeles.",
+      "report_language": "El informe de diagnóstico está en inglés para que el equipo de soporte de Vocdoni pueda leerlo.",
+      "copy_report": "Copiar informe de diagnóstico",
+      "copied": "Informe copiado al portapapeles.",
       "copy_manually": "Pulse Ctrl+C para copiar",
-      "report_notice": "Este informe contiene los datos de su certificado (nombre y número de identificación). Compártalo solo con el soporte de Vocdoni.",
+      "report_notice": "Este informe contiene los datos de su certificado (nombre y número de identificación). Compártalo solo con el equipo de soporte de Vocdoni.",
       "unknown_port": "desconocido"
     },
     "messages": {
@@ -185,11 +185,11 @@ const CERTCHECK_STRINGS = {
       "unknown_provider": "Proveedor de certificados desconocido.",
       "unsupported_media_type": "Formato de solicitud no admitido.",
       "rate_limited": "Demasiados intentos. Espere un momento.",
-      "store_full": "El servicio está ocupado. Vuelva a intentarlo en breve.",
+      "store_full": "El servicio está saturado. Vuelva a intentarlo en unos instantes.",
       "forbidden": "Solicitud no permitida.",
       "bad_request": "Solicitud mal formada.",
       "invalid_state": "Este enlace de autenticación ya no es válido. Vuelva a empezar.",
-      "never_reached": "El paso de autenticación no llegó a nuestro servidor.",
+      "never_reached": "El paso de autenticación no ha llegado a nuestro servidor.",
       "network_error": "No hemos podido conectar con el servidor. Compruebe su conexión y vuelva a intentarlo.",
       "timeout": "El servidor ha tardado demasiado en responder.",
       "bad_response": "El servidor ha enviado una respuesta que esta página no ha podido interpretar.",
@@ -216,7 +216,7 @@ const CERTCHECK_STRINGS = {
       "identity_unsupported_document": ["Este certificado identifica a su titular con un documento distinto del DNI o NIE español. Pruebe con otro certificado."],
       "test_certificate": ["Este es un certificado de prueba o de muestra. Pruebe con un certificado personal real."],
       "link_expired": ["El enlace ha caducado. Vuelva a empezar."],
-      "default": ["Vuelva a intentarlo. Si el problema persiste, envíe el informe de diagnóstico al soporte de Vocdoni."]
+      "default": ["Vuelva a intentarlo. Si el problema persiste, envíe el informe de diagnóstico al equipo de soporte de Vocdoni."]
     }
   },
   "ca": {
@@ -258,16 +258,16 @@ const CERTCHECK_STRINGS = {
       "row_issuer": "Emissor",
       "row_valid_until": "Vàlid fins a",
       "row_revocation": "Comprovació de revocació",
-      "revocation_value": "{method}, consultat el {time} a {source}",
+      "revocation_value": "{method}, consulta del {time} a {source}",
       "check_another": "Comprovar un altre certificat",
       "eyebrow_problem": "Problema",
       "error_heading": "No hem pogut autenticar aquest certificat",
       "technical_details": "Detalls tècnics",
-      "report_language": "L'informe de diagnòstic és en anglès perquè el suport de Vocdoni el pugui llegir.",
+      "report_language": "L'informe de diagnòstic és en anglès perquè l'equip de suport de Vocdoni el pugui llegir.",
       "copy_report": "Copiar l'informe de diagnòstic",
       "copied": "Informe copiat al porta-retalls.",
       "copy_manually": "Premi Ctrl+C per copiar",
-      "report_notice": "Aquest informe conté les dades del seu certificat (nom i número d'identificació). Comparteixi'l només amb el suport de Vocdoni.",
+      "report_notice": "Aquest informe conté les dades del seu certificat (nom i número d'identificació). Comparteixi'l només amb l'equip de suport de Vocdoni.",
       "unknown_port": "desconegut"
     },
     "messages": {
@@ -291,11 +291,11 @@ const CERTCHECK_STRINGS = {
       "unknown_provider": "Proveïdor de certificats desconegut.",
       "unsupported_media_type": "Format de sol·licitud no admès.",
       "rate_limited": "Massa intents. Esperi un moment.",
-      "store_full": "El servei està ocupat. Torni-ho a provar d'aquí a poc.",
+      "store_full": "El servei està saturat. Torni-ho a provar d'aquí a uns instants.",
       "forbidden": "Sol·licitud no permesa.",
       "bad_request": "Sol·licitud mal formada.",
       "invalid_state": "Aquest enllaç d'autenticació ja no és vàlid. Torni a començar.",
-      "never_reached": "El pas d'autenticació no va arribar al nostre servidor.",
+      "never_reached": "El pas d'autenticació no ha arribat al nostre servidor.",
       "network_error": "No hem pogut connectar amb el servidor. Comprovi la seva connexió i torni-ho a provar.",
       "timeout": "El servidor ha trigat massa a respondre.",
       "bad_response": "El servidor ha enviat una resposta que aquesta pàgina no ha pogut interpretar.",
@@ -322,7 +322,7 @@ const CERTCHECK_STRINGS = {
       "identity_unsupported_document": ["Aquest certificat identifica el titular amb un document diferent del DNI o NIE espanyol. Provi amb un altre certificat."],
       "test_certificate": ["Aquest és un certificat de prova o de mostra. Provi amb un certificat personal real."],
       "link_expired": ["L'enllaç ha caducat. Torni a començar."],
-      "default": ["Torni-ho a provar. Si el problema persisteix, enviï l'informe de diagnòstic al suport de Vocdoni."]
+      "default": ["Torni-ho a provar. Si el problema persisteix, enviï l'informe de diagnòstic a l'equip de suport de Vocdoni."]
     }
   }
 };
