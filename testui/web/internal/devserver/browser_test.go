@@ -75,7 +75,12 @@ var testPages = map[string]struct {
 	"saved-ca":           {true, "localStorage.setItem('certcheck.lang', 'ca');\n"},
 	"saved-bad":          {true, "localStorage.setItem('certcheck.lang', '__proto__');\n"},
 	"switch-ca":          {false, switchJS},
+	"no-strings":         {false, ""}, // serves index.html with i18n.js swapped for a 404
 }
+
+// stringsTag loads the dictionaries; the no-strings page points it at a missing file instead, as a
+// dropped request would leave the page.
+const stringsTag = `<script src="/i18n.js" defer></script>`
 
 // switchJS chooses Catalan in the language selector, as a user would, once the page shows a view
 // other than the working one.
@@ -170,6 +175,30 @@ func TestBrowser(t *testing.T) {
 			checkView(t, dumpDOM(t, chrome, base+c.path, c.accept), c.view, c.lang, c.contains)
 		})
 	}
+
+	// Without i18n.js app.js says so in the three languages, offers a reload and runs nothing
+	// else: the selector stays hidden.
+	t.Run("strings missing", func(t *testing.T) {
+		t.Parallel()
+		dom := dumpDOM(t, chrome, base+"/__test/no-strings.html#code=success", "es-ES")
+		views := visibleViews(dom)
+		if len(views) != 1 || views[0].name != "unloaded" {
+			t.Fatalf("visible views = %v, want only the unloaded panel:\n%s", views, dom)
+		}
+		for _, want := range []string{
+			`<p class="lede" lang="en">This page did not load completely.</p>`,
+			`<p class="lede" lang="es">Esta página no se ha cargado por completo.</p>`,
+			`<p class="lede" lang="ca">Aquesta pàgina no s'ha carregat del tot.</p>`,
+			`<button class="pill primary" type="button">Reload / Recargar / Recarregar</button>`,
+		} {
+			if !strings.Contains(views[0].body, want) {
+				t.Errorf("unloaded panel lacks %q:\n%s", want, views[0].body)
+			}
+		}
+		if !strings.Contains(dom, `<div class="language" hidden`) {
+			t.Error("the language selector is shown, but nothing can switch it")
+		}
+	})
 }
 
 var titles = map[string]string{
@@ -272,6 +301,9 @@ func serveTestPage(w http.ResponseWriter, r *http.Request) {
 		extra := app + `<script src="/__test/` + name + `.js" defer></script>`
 		if page.before {
 			extra = `<script src="/__test/` + name + `.js"></script>` + app
+		}
+		if name == "no-strings" {
+			index = bytes.Replace(index, []byte(stringsTag), []byte(`<script src="/__test/missing.js" defer></script>`), 1)
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(bytes.Replace(index, []byte(app), []byte(extra), 1))

@@ -380,6 +380,37 @@ func TestAppJSFatalFallback(t *testing.T) {
 	}
 }
 
+// TestAppJSMissingStrings covers gate F4. When i18n.js did not load, app.js stops before it reads
+// the dictionaries and says so in the three languages with a reload button, written with plain DOM
+// calls inside one try.
+func TestAppJSMissingStrings(t *testing.T) {
+	js := readStatic(t, "app.js")
+	guard := regexp.MustCompile(`(?s)^'use strict';\n\n(?:// [^\n]*\n)*\(function \(\) \{\n(?:  // [^\n]*\n)*  if \(typeof CERTCHECK_STRINGS === 'undefined'\) \{\n    showUnloaded\(\);\n    return;\n  \}\n`)
+	if !guard.MatchString(js) {
+		t.Error("app.js does not start by calling showUnloaded() and returning when CERTCHECK_STRINGS is undefined")
+	}
+	unloaded := jsFunc(t, js, "showUnloaded")
+	body := strings.TrimSpace(unloaded[strings.Index(unloaded, "{")+1 : strings.LastIndex(unloaded, "}")])
+	if !strings.HasPrefix(body, "try {") || !strings.HasSuffix(body, "}") || !strings.Contains(body, "} catch (") {
+		t.Errorf("showUnloaded() body is not one try statement:\n%s", body)
+	}
+	if m := regexp.MustCompile(`(?:^|[^\w$.])(\$|el|str|lookup|t|fill|format|showView|showFatal|renderError)\(|CERTCHECK_STRINGS|strings\.`).FindString(unloaded); m != "" {
+		t.Errorf("showUnloaded() uses %q, which needs the code or the strings it stands in for", m)
+	}
+	for _, want := range []string{
+		"['en', 'This page did not load completely.']",
+		"['es', 'Esta página no se ha cargado por completo.']",
+		"['ca', 'Aquesta pàgina no s\\'ha carregat del tot.']",
+		".lang = lang;",
+		"'Reload / Recargar / Recarregar'",
+		"location.reload()",
+	} {
+		if !strings.Contains(unloaded, want) {
+			t.Errorf("showUnloaded() lacks %q", want)
+		}
+	}
+}
+
 // TestWorkingViewExit covers U14-FABLE-2. The working view has a "Start again" pill that forgets the
 // attempt and reloads the page. The reload cannot redeem a code again: init() replaces the URL with
 // / before its first await.

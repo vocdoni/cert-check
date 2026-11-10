@@ -65,7 +65,8 @@ them with `textContent` only. The page picks its language in this order:
 The selector in the site header lists the languages by their own names (English, Español, Català).
 Choosing one re-renders the current view in place, with no reload, so a shown result, error or report
 stays on screen. It sets `<html lang>` and the page title and saves the choice under `certcheck.lang`.
-A browser that refuses storage still switches, and only forgets the choice on the next load.
+A browser that refuses storage still switches, and only forgets the choice on the next load. If
+`i18n.js` does not load, the page shows one sentence in each language and a reload button instead.
 
 Not translated:
 
