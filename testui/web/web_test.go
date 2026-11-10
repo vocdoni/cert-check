@@ -442,6 +442,8 @@ func TestRequiredText(t *testing.T) {
 		`aria-live="polite"`,
 		`alt="Vocdoni"`,
 		// The language selector (AC3), its accessible label and the languages by their own names.
+		// It starts hidden: without JavaScript it would do nothing (app.js init shows it).
+		`<div class="language" hidden>`,
 		`<label for="language" class="sr-only" data-i18n="language_label">Language</label>`,
 		`<select id="language">`,
 		`<option value="en" lang="en">English</option>`,
@@ -929,7 +931,8 @@ func TestAppJSLanguage(t *testing.T) {
 	inOrder("saveLanguage", "try {", "localStorage.setItem(LANG_KEY", "} catch (")
 	inOrder("useLanguage", "lookup(STRINGS, code)", "document.documentElement.lang = code;", "document.title = t('title');", ".textContent = t(")
 	inOrder("changeLanguage", "isLanguage(code)", "saveLanguage(code)", "useLanguage(code)", "renderProviders()", "} catch (", "showFatal()")
-	inOrder("init", "history.replaceState(null, '', '/');", "useLanguage(detectLanguage());", "await ")
+	inOrder("init", "history.replaceState(null, '', '/');", "useLanguage(detectLanguage());",
+		"$('language').closest('.language').hidden = false;", "await ")
 	if strings.Contains(jsFunc(t, js, "changeLanguage"), "reload") {
 		t.Error("changeLanguage() reloads; a switch re-renders in place")
 	}

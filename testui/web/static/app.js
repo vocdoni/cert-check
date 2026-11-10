@@ -913,6 +913,8 @@
     const params = new URLSearchParams(location.hash.slice(1));
     history.replaceState(null, '', '/');
     useLanguage(detectLanguage());
+    // The selector starts hidden: without JavaScript it would do nothing.
+    $('language').closest('.language').hidden = false;
     lastServerVersion = readStorage(VERSION_KEY) || lastServerVersion;
 
     const entry = readPending();

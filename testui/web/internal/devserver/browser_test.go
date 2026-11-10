@@ -178,8 +178,8 @@ var titles = map[string]string{
 	"ca": "Comprovador d'autenticació amb certificat",
 }
 
-// checkView checks that view is the only visible one and holds every text of contains, and that the
-// page is in lang: <html lang> and the title.
+// checkView checks that view is the only visible one and holds every text of contains, that the
+// language selector is shown, and that the page is in lang: <html lang> and the title.
 func checkView(t *testing.T, dom, view, lang string, contains []string) {
 	t.Helper()
 	views := visibleViews(dom)
@@ -194,6 +194,9 @@ func checkView(t *testing.T, dom, view, lang string, contains []string) {
 		if !strings.Contains(views[0].body, want) {
 			t.Errorf("view %s lacks %q:\n%s", view, want, views[0].body)
 		}
+	}
+	if !strings.Contains(dom, `<div class="language">`) {
+		t.Error("the language selector is still hidden")
 	}
 	if want := `<html lang="` + lang + `">`; !strings.Contains(dom, want) {
 		t.Errorf("page lacks %s", want)
