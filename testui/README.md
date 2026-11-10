@@ -49,6 +49,39 @@ public employee, Firmaprofesional, ANF, Uanataca, SIGNE, Lleidanet, DNIe). `GET 
 lists what the running service enables. The revocation quirks of the CRL-only providers (Lleidanet and
 SIGNE) are described under [Supported providers](../README.md#supported-providers) in the root README.
 
+### Languages
+
+The UI speaks English, Spanish and Catalan. Spanish and Catalan address the user formally (*usted*,
+*vostè*). The texts live in `web/static/i18n.js`, one dictionary per language, and `app.js` inserts
+them with `textContent` only. The page picks its language in this order:
+
+1. the user's saved choice, `certcheck.lang` in `localStorage` (a value other than `en`, `es` or `ca`
+   is ignored);
+2. the browser's preferred languages (`navigator.languages`, else `navigator.language`), in order,
+   matched on the primary subtag. The first match wins: `ca` is Catalan, `es` Spanish, `en` English,
+   and the other languages of Spain (`gl`, `eu`, `ast`, `an`, `oc`) read Spanish;
+3. Spanish when nothing matches.
+
+The selector in the site header lists the languages by their own names (English, Español, Català).
+Choosing one re-renders the current view in place, with no reload, so a shown result, error or report
+stays on screen. It sets `<html lang>` and the page title and saves the choice under `certcheck.lang`.
+A browser that refuses storage still switches, and only forgets the choice on the next load. If
+`i18n.js` does not load, the page shows one sentence in each language and a reload button instead.
+
+Not translated:
+
+- provider names and descriptions, which are official names shown as served. The exception is the
+  DNIe entry's English qualifier ("requires card reader", and the English clause of its description),
+  which the UI shows in the page language;
+- the profile name and the other values of a result, which the API serves;
+- the diagnostic report, which stays in English because it goes to Vocdoni support. A note next to it
+  says so.
+
+The UI shows its own message for every error code the API or the library can return. The server's
+English `message` is shown only for a code the UI does not know. `TestI18nDictionaries` and
+`TestI18nErrorCodes` (`web/web_test.go`) check that the three dictionaries hold the same texts, none
+empty, and that every server, library and client code has a message in each language.
+
 ## 2. Local run with a static certificate
 
 Locally there is no ACME: give the auth listener a static wildcard certificate for
@@ -108,7 +141,11 @@ Browser notes:
 - `TestBrowser` loads the UI from the devserver in headless Chrome and checks the view each page ends on.
   The cases are `#error=__proto__`, `constructor` and unknown codes, malformed replies, a browser
   without `Object.hasOwn`, the fallback when the error view itself throws, and "Start again" on the
-  working view. It sits behind the `browser` build tag, so the default run and CI skip it. It needs
+  working view; they run in English. The language cases run Chrome with `es-ES`, `ca-ES`, `fr-FR`
+  (which must show Spanish) and lists of languages, a saved choice, and a switch in the selector on
+  the start, error and success views. Headless Chrome takes its languages from `--accept-lang`, so
+  the test passes it along with `--lang`. It sits behind the `browser` build tag, so the default run
+  and CI skip it. It needs
   Chrome or Chromium; set `CHROME=/path/to/binary` when neither is on `PATH`:
   `cd testui && go test -tags browser -count=1 -run TestBrowser ./web/internal/devserver`.
 

@@ -93,8 +93,27 @@ body {
 }
 
 .site-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem 1rem;
   padding-top: 1.5rem;
   color: var(--foreground);
+}
+
+/* The language selector: the provider select, scaled down for the header. */
+.language select {
+  width: auto;
+  min-height: 2.5rem;
+  padding: 0 2.25rem 0 0.875rem;
+  font-size: 0.875rem;
+}
+
+.language .select-wrap::after {
+  right: 0.9375rem;
+  width: 0.4375rem;
+  height: 0.4375rem;
 }
 
 .logo {
@@ -397,6 +416,10 @@ summary {
 
 details[open] summary {
   padding-bottom: 0.625rem;
+}
+
+details .hint {
+  margin: 0 0 0.625rem;
 }
 
 pre {

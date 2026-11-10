@@ -7,7 +7,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io/fs"
+	"maps"
 	"net/url"
 	"os"
 	"path"
@@ -27,6 +31,7 @@ import (
 var requiredStatic = []string{
 	"index.html",
 	"app.js",
+	"i18n.js",
 	"styles.css",
 	"favicon.ico",
 	"img/vocdoni-logo.svg",
@@ -100,7 +105,7 @@ func TestNoExternalReferences(t *testing.T) {
 	// Any scheme-qualified or protocol-relative URL. Comments in app.js
 	// therefore keep a space after the slashes.
 	external := regexp.MustCompile(`(?i)(?:https?:)?//[a-z0-9]`)
-	for _, name := range []string{"index.html", "app.js", "styles.css"} {
+	for _, name := range []string{"index.html", "app.js", "i18n.js", "styles.css"} {
 		src := readStatic(t, name)
 		if loc := external.FindStringIndex(src); loc != nil {
 			t.Errorf("%s: external reference near %q", name, src[loc[0]:min(len(src), loc[0]+40)])
@@ -110,7 +115,7 @@ func TestNoExternalReferences(t *testing.T) {
 		}
 	}
 	// Data URIs are allowed only in CSS (icons).
-	for _, name := range []string{"index.html", "app.js"} {
+	for _, name := range []string{"index.html", "app.js", "i18n.js"} {
 		if strings.Contains(readStatic(t, name), "data:") {
 			t.Errorf("%s: data: URI is only allowed in CSS", name)
 		}
@@ -118,10 +123,12 @@ func TestNoExternalReferences(t *testing.T) {
 }
 
 func TestNoUnsafeDOM(t *testing.T) {
-	js := readStatic(t, "app.js")
-	for _, banned := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "Function(", "srcdoc"} {
-		if strings.Contains(js, banned) {
-			t.Errorf("app.js contains %q", banned)
+	for _, name := range []string{"app.js", "i18n.js"} {
+		js := readStatic(t, name)
+		for _, banned := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "Function(", "srcdoc"} {
+			if strings.Contains(js, banned) {
+				t.Errorf("%s contains %q", name, banned)
+			}
 		}
 	}
 }
@@ -129,17 +136,21 @@ func TestNoUnsafeDOM(t *testing.T) {
 func TestCSPCompatible(t *testing.T) {
 	html := readStatic(t, "index.html")
 
+	// The strings, then the app: deferred scripts run in document order.
 	scripts := regexp.MustCompile(`(?is)<script\b([^>]*)>(.*?)</script>`).FindAllStringSubmatch(html, -1)
-	if len(scripts) != 1 {
-		t.Fatalf("index.html has %d script elements, want 1", len(scripts))
+	wantSrc := []string{`src="/i18n.js"`, `src="/app.js"`}
+	if len(scripts) != len(wantSrc) {
+		t.Fatalf("index.html has %d script elements, want %d", len(scripts), len(wantSrc))
 	}
-	attrs, body := scripts[0][1], scripts[0][2]
-	if strings.TrimSpace(body) != "" {
-		t.Errorf("inline script body %q, want none", body)
-	}
-	for _, want := range []string{`src="/app.js"`, "defer"} {
-		if !strings.Contains(attrs, want) {
-			t.Errorf("script attributes %q lack %q", attrs, want)
+	for i, script := range scripts {
+		attrs, body := script[1], script[2]
+		if strings.TrimSpace(body) != "" {
+			t.Errorf("inline script body %q, want none", body)
+		}
+		for _, want := range []string{wantSrc[i], "defer"} {
+			if !strings.Contains(attrs, want) {
+				t.Errorf("script %d attributes %q lack %q", i, attrs, want)
+			}
 		}
 	}
 
@@ -168,10 +179,12 @@ func TestCSPCompatible(t *testing.T) {
 	}
 
 	// Styling stays in the stylesheet: the CSP has style-src 'self'.
-	js := readStatic(t, "app.js")
-	for _, banned := range []string{".style.", ".style[", "cssText", "'style'", `"style"`, "javascript:"} {
-		if strings.Contains(js, banned) {
-			t.Errorf("app.js contains %q", banned)
+	for _, name := range []string{"app.js", "i18n.js"} {
+		js := readStatic(t, name)
+		for _, banned := range []string{".style.", ".style[", "cssText", "'style'", `"style"`, "javascript:"} {
+			if strings.Contains(js, banned) {
+				t.Errorf("%s contains %q", name, banned)
+			}
 		}
 	}
 }
@@ -189,16 +202,17 @@ func jsFunc(t *testing.T, js, name string) string {
 // TestAppJSCodeTables covers U14-ASTRA-1. An error code from the URL fragment or from the API must
 // never index a plain object: "__proto__" would return Object.prototype and "constructor" would
 // return Object, and the error view would then fail to render. The table lookups are own-property
-// only, so an unknown code falls back to the generic message and guidance.
+// only, so an unknown code falls back to the generic message and guidance. The same holds for the
+// language dictionaries (AC7): a language code or a text key never indexes them directly.
 func TestAppJSCodeTables(t *testing.T) {
 	js := readStatic(t, "app.js")
-	if loc := regexp.MustCompile(`\b(?:GUIDANCE|CLIENT_MESSAGES)\s*\[`).FindStringIndex(js); loc != nil {
+	if loc := regexp.MustCompile(`\b(?:GUIDANCE|STRINGS|strings|text|messages|guidance)\s*\[`).FindStringIndex(js); loc != nil {
 		t.Errorf("app.js indexes a code table directly near %q, want the own-property lookup", js[loc[0]:min(len(js), loc[0]+40)])
 	}
 	if lookup := jsFunc(t, js, "lookup"); !strings.Contains(lookup, "Object.prototype.hasOwnProperty.call(") {
 		t.Errorf("lookup() = %q, want an Object.prototype.hasOwnProperty own-property check", lookup)
 	}
-	for _, fn := range []string{"guidanceFor", "showServerError", "showClientError"} {
+	for _, fn := range []string{"t", "guidanceFor", "displayMessage", "reportMessage", "useLanguage"} {
 		if src := jsFunc(t, js, fn); !strings.Contains(src, "lookup(") {
 			t.Errorf("%s() does not use lookup() for its code table", fn)
 		}
@@ -238,9 +252,14 @@ func TestAppJSAPIDeadline(t *testing.T) {
 	}
 
 	// A timeout is a recoverable error with its own message and guidance.
-	for _, want := range []string{"    timeout: '", "    timeout: TEMPORARY,", "'TimeoutError'"} {
+	for _, want := range []string{"    timeout: TEMPORARY,", "'TimeoutError'"} {
 		if !strings.Contains(js, want) {
 			t.Errorf("app.js lacks %q for the timeout error", want)
+		}
+	}
+	for lang, d := range readDictionaries(t) {
+		if d.Messages["timeout"] == "" {
+			t.Errorf("i18n.js %s has no timeout message", lang)
 		}
 	}
 	for _, fn := range []string{"authenticate", "redeem"} {
@@ -314,8 +333,14 @@ func TestAppJSRepliesAreValidated(t *testing.T) {
 // deadline is a plain abort() and a flag of our own.
 func TestAppJSOlderBrowsers(t *testing.T) {
 	js := readStatic(t, "app.js")
-	if strings.Contains(js, "Object.hasOwn") {
-		t.Error("app.js uses Object.hasOwn, which Safari before 15.4 lacks")
+	// Newer than the Safari 15, Chrome 90 and Firefox 90 baseline (R14.1).
+	for _, name := range []string{"app.js", "i18n.js"} {
+		src := readStatic(t, name)
+		for _, banned := range []string{"Object.hasOwn", ".at(", ".findLast", "structuredClone(", "Object.groupBy"} {
+			if strings.Contains(src, banned) {
+				t.Errorf("%s uses %s, which a browser of the baseline lacks", name, banned)
+			}
+		}
 	}
 	if loc := regexp.MustCompile(`\.abort\(\s*[^)\s]`).FindStringIndex(js); loc != nil {
 		t.Errorf("app.js passes a reason to abort() near %q; older browsers ignore it", js[loc[0]:min(len(js), loc[0]+40)])
@@ -338,7 +363,7 @@ func TestAppJSFatalFallback(t *testing.T) {
 	if !strings.HasPrefix(body, "try {") || !strings.HasSuffix(body, "}") || !strings.Contains(body, "} catch (") {
 		t.Errorf("showFatal() body is not one try statement:\n%s", body)
 	}
-	helper := regexp.MustCompile(`(?:^|[^\w$.])(\$|el|str|lookup|showView|showWorking|renderError|showClientError|showServerError|guidanceFor|reportHeader|attemptLines)\(`)
+	helper := regexp.MustCompile(`(?:^|[^\w$.])(\$|el|str|lookup|t|fill|format|showView|showWorking|renderError|showClientError|showServerError|guidanceFor|reportHeader|attemptLines)\(`)
 	if m := helper.FindStringSubmatch(fatal); m != nil {
 		t.Errorf("showFatal() calls %s(), one of the helpers it stands in for", m[1])
 	}
@@ -347,9 +372,41 @@ func TestAppJSFatalFallback(t *testing.T) {
 			t.Errorf("showFatal() uses %q", banned)
 		}
 	}
-	for _, want := range []string{"CLIENT_MESSAGES.bad_response", "'Start again'", "location.reload()"} {
+	// Its texts are plain reads from the active dictionary, so it speaks the chosen language.
+	for _, want := range []string{"strings.text.error_heading", "strings.messages.bad_response", "strings.text.start_again", "location.reload()"} {
 		if !strings.Contains(fatal, want) {
 			t.Errorf("showFatal() lacks %q", want)
+		}
+	}
+}
+
+// TestAppJSMissingStrings covers gate F4. When i18n.js did not load, app.js stops before it reads
+// the dictionaries and says so in the three languages with a reload button, written with plain DOM
+// calls inside one try.
+func TestAppJSMissingStrings(t *testing.T) {
+	js := readStatic(t, "app.js")
+	guard := regexp.MustCompile(`(?s)^'use strict';\n\n(?:// [^\n]*\n)*\(function \(\) \{\n(?:  // [^\n]*\n)*  if \(typeof CERTCHECK_STRINGS === 'undefined'\) \{\n    showUnloaded\(\);\n    return;\n  \}\n`)
+	if !guard.MatchString(js) {
+		t.Error("app.js does not start by calling showUnloaded() and returning when CERTCHECK_STRINGS is undefined")
+	}
+	unloaded := jsFunc(t, js, "showUnloaded")
+	body := strings.TrimSpace(unloaded[strings.Index(unloaded, "{")+1 : strings.LastIndex(unloaded, "}")])
+	if !strings.HasPrefix(body, "try {") || !strings.HasSuffix(body, "}") || !strings.Contains(body, "} catch (") {
+		t.Errorf("showUnloaded() body is not one try statement:\n%s", body)
+	}
+	if m := regexp.MustCompile(`(?:^|[^\w$.])(\$|el|str|lookup|t|fill|format|showView|showFatal|renderError)\(|CERTCHECK_STRINGS|strings\.`).FindString(unloaded); m != "" {
+		t.Errorf("showUnloaded() uses %q, which needs the code or the strings it stands in for", m)
+	}
+	for _, want := range []string{
+		"['en', 'This page did not load completely.']",
+		"['es', 'Esta página no se ha cargado por completo.']",
+		"['ca', 'Aquesta pàgina no s\\'ha carregat del tot.']",
+		".lang = lang;",
+		"'Reload / Recargar / Recarregar'",
+		"location.reload()",
+	} {
+		if !strings.Contains(unloaded, want) {
+			t.Errorf("showUnloaded() lacks %q", want)
 		}
 	}
 }
@@ -360,8 +417,8 @@ func TestAppJSFatalFallback(t *testing.T) {
 func TestWorkingViewExit(t *testing.T) {
 	html := readStatic(t, "index.html")
 	working := regexp.MustCompile(`(?s)<section id="view-working"[^>]*>(.*?)</section>`).FindStringSubmatch(html)
-	if working == nil || !strings.Contains(working[1], `<button id="cancel" class="pill" type="button">Start again</button>`) {
-		t.Error(`the working view lacks <button id="cancel" class="pill" type="button">Start again</button>`)
+	if working == nil || !strings.Contains(working[1], `<button id="cancel" class="pill" type="button" data-i18n="start_again">Start again</button>`) {
+		t.Error(`the working view lacks <button id="cancel" class="pill" type="button" data-i18n="start_again">Start again</button>`)
 	}
 	js := readStatic(t, "app.js")
 	if !strings.Contains(js, "$('cancel').addEventListener('click', startOver);") {
@@ -391,7 +448,7 @@ func TestRequiredText(t *testing.T) {
 		`<title>Certificate Authentication Checker</title>`,
 		`>Certificate Authentication Checker</h1>`,
 		`Check that your Spanish personal certificate works in this browser and see the identity data it carries.`,
-		`<label for="provider">Certificate provider</label>`,
+		`<label for="provider" data-i18n="provider_label">Certificate provider</label>`,
 		`<select id="provider"`,
 		`Requires a card reader and the DNIe software already working in this browser.`,
 		`id="authenticate" class="pill primary"`,
@@ -404,7 +461,9 @@ func TestRequiredText(t *testing.T) {
 		`>We could not authenticate this certificate</h1>`,
 		`id="error-message"`,
 		`id="error-guidance"`,
-		`<details id="tech"><summary>Technical details</summary><pre id="report"`,
+		`<details id="tech"><summary data-i18n="technical_details">Technical details</summary>`,
+		`<p class="hint" data-i18n="report_language">The diagnostic report is in English so that Vocdoni support can read it.</p><pre id="report"`,
+		`<pre id="report" lang="en" tabindex="0">`, // English on an es or ca page too (WCAG 3.1.2)
 		`id="copy-report"`,
 		`>Copy diagnostic report</button>`,
 		`This report contains your certificate details (name and ID number). Share it only with Vocdoni support.`,
@@ -414,9 +473,67 @@ func TestRequiredText(t *testing.T) {
 		`role="status"`,
 		`aria-live="polite"`,
 		`alt="Vocdoni"`,
+		// The language selector (AC3), its accessible label and the languages by their own names.
+		// It starts hidden: without JavaScript it would do nothing (app.js init shows it).
+		`<div class="language" hidden>`,
+		`<label for="language" class="sr-only" data-i18n="language_label">Language</label>`,
+		`<select id="language">`,
+		`<option value="en" lang="en">English</option>`,
+		`<option value="es" lang="es">Español</option>`,
+		`<option value="ca" lang="ca">Català</option>`,
+		// One sentence per language for a browser without JavaScript (AC5).
+		`<span lang="en">This page needs JavaScript to check a certificate.</span>`,
+		`<span lang="es">Esta página necesita JavaScript para comprobar un certificado.</span>`,
+		`<span lang="ca">Aquesta pàgina necessita JavaScript per comprovar un certificat.</span>`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Errorf("index.html lacks %q", want)
+		}
+	}
+	if header := regexp.MustCompile(`(?s)<header class="site-header">(.*?)</header>`).FindStringSubmatch(html); header == nil || !strings.Contains(header[1], `<select id="language">`) {
+		t.Error("the language selector is not in the site header")
+	}
+
+	// The required text in each language: formal register (usted, vostè) and the shared terms.
+	dicts := readDictionaries(t)
+	for _, c := range []struct{ section, key, en, es, ca string }{
+		{"text", "title", "Certificate Authentication Checker",
+			"Comprobador de autenticación con certificado", "Comprovador d'autenticació amb certificat"},
+		{"text", "language_label", "Language", "Idioma", "Idioma"},
+		{"text", "authenticate", "Authenticate", "Autenticarse", "Autenticar-se"},
+		{"text", "start_note",
+			"Your browser will ask you to choose a certificate. Nothing is uploaded and your private key never leaves your device.",
+			"Su navegador le pedirá que elija un certificado. No se envía ningún archivo y su clave privada nunca sale de su dispositivo.",
+			"El seu navegador li demanarà que triï un certificat. No s'envia cap fitxer i la seva clau privada no surt mai del seu dispositiu."},
+		{"text", "provider_hint", "Requires a card reader and the DNIe software already working in this browser.",
+			"Requiere un lector de tarjetas y que el software del DNIe ya funcione en este navegador.",
+			"Cal un lector de targetes i que el programari del DNIe ja funcioni en aquest navegador."},
+		{"text", "error_heading", "We could not authenticate this certificate",
+			"No hemos podido autenticar este certificado", "No hem pogut autenticar aquest certificat"},
+		{"text", "start_again", "Start again", "Volver a empezar", "Tornar a començar"},
+		{"text", "report_language", "The diagnostic report is in English so that Vocdoni support can read it.",
+			"El informe de diagnóstico está en inglés para que el equipo de soporte de Vocdoni pueda leerlo.",
+			"L'informe de diagnòstic és en anglès perquè l'equip de suport de Vocdoni el pugui llegir."},
+		{"text", "revocation_value", "{method}, checked {time}, source {source}",
+			"{method}, consulta del {time} en {source}", "{method}, consulta del {time} a {source}"},
+		{"messages", "never_reached", "The authentication step never reached our server.",
+			"El paso de autenticación no ha llegado a nuestro servidor.", "El pas d'autenticació no ha arribat al nostre servidor."},
+		{"messages", "store_full", "The service is busy. Please try again shortly.",
+			"El servicio está saturado. Vuelva a intentarlo en unos instantes.", "El servei està saturat. Torni-ho a provar d'aquí a uns instants."},
+		{"messages", "revoked", "The certificate has been revoked or suspended.",
+			"El certificado ha sido revocado o suspendido.", "El certificat ha estat revocat o suspès."},
+		{"messages", "expired", "The certificate has expired.", "El certificado ha caducado.", "El certificat ha caducat."},
+		{"messages", "unsupported_media_type", "Unsupported request format.",
+			"Formato de solicitud no admitido.", "Format de sol·licitud no admès."},
+	} {
+		for lang, want := range map[string]string{"en": c.en, "es": c.es, "ca": c.ca} {
+			table := dicts[lang].Text
+			if c.section == "messages" {
+				table = dicts[lang].Messages
+			}
+			if got := table[c.key]; got != want {
+				t.Errorf("i18n.js %s %s.%s = %q, want %q", lang, c.section, c.key, got, want)
+			}
 		}
 	}
 	for _, id := range []string{"view-start", "view-working", "view-success", "view-error"} {
@@ -440,13 +557,13 @@ func TestRequiredText(t *testing.T) {
 	if n := strings.Count(html, `tabindex="-1"`); n < 4 {
 		t.Errorf("index.html has %d focus-target headings (tabindex=-1), want at least 4", n)
 	}
-	if !strings.Contains(js, `'Beta'`) && !strings.Contains(js, `"Beta"`) {
+	if !strings.Contains(js, "group.label = t('beta');") {
 		t.Errorf("app.js lacks the Beta optgroup label")
 	}
 
 	// Brand copy rules (ruling R34/R39): no en or em dash in any shipped
 	// text, fixtures included; sentence case outside the three exceptions.
-	for _, name := range []string{"index.html", "app.js", "styles.css", "fonts/SOURCES.md"} {
+	for _, name := range []string{"index.html", "app.js", "i18n.js", "styles.css", "fonts/SOURCES.md"} {
 		assertNoDashes(t, name, readStatic(t, name))
 	}
 	for _, m := range mustGlob(t, "testdata/fixtures/*.json") {
@@ -456,6 +573,7 @@ func TestRequiredText(t *testing.T) {
 
 	assertSentenceCase(t, "index.html", visibleText(html))
 	assertSentenceCase(t, "app.js", stringLiterals(js))
+	assertSentenceCase(t, "i18n.js", stringLiterals(readStatic(t, "i18n.js")))
 }
 
 func assertNoDashes(t *testing.T, name, src string) {
@@ -483,13 +601,16 @@ func stringLiterals(js string) string {
 
 // assertSentenceCase rejects Title Case word pairs. The exceptions are the
 // owner's exact title, the report header that embeds it and the key name in the
-// copy fallback ("Press Ctrl+C to copy", wording fixed by the brief).
+// copy fallback ("Press Ctrl+C to copy", wording fixed by the brief, and its
+// Spanish and Catalan forms).
 func assertSentenceCase(t *testing.T, name, text string) {
 	t.Helper()
 	for _, allowed := range []string{
 		"Vocdoni Certificate Authentication Checker",
 		"Certificate Authentication Checker",
 		"Press Ctrl+C to copy",
+		"Pulse Ctrl+C para copiar",
+		"Premi Ctrl+C per copiar",
 	} {
 		text = strings.ReplaceAll(text, allowed, "")
 	}
@@ -505,6 +626,355 @@ func mustGlob(t *testing.T, pattern string) []string {
 		t.Fatalf("glob %s: %v (%d matches)", pattern, err, len(m))
 	}
 	return m
+}
+
+// dictionary is one language of i18n.js: the page texts by key, the error messages by code and the
+// recovery guidance lines by name.
+type dictionary struct {
+	Text     map[string]string   `json:"text"`
+	Messages map[string]string   `json:"messages"`
+	Guidance map[string][]string `json:"guidance"`
+}
+
+var languages = []string{"en", "es", "ca"}
+
+// readDictionaries decodes the strings of i18n.js, which are written as plain JSON, by language.
+func readDictionaries(t *testing.T) map[string]dictionary {
+	t.Helper()
+	m := regexp.MustCompile(`(?s)\nconst CERTCHECK_STRINGS = (\{\n.*\n\});\n$`).FindStringSubmatch(readStatic(t, "i18n.js"))
+	if m == nil {
+		t.Fatal("i18n.js does not end with const CERTCHECK_STRINGS = {...};")
+	}
+	if key, err := duplicateKey(json.NewDecoder(strings.NewReader(m[1]))); err != nil || key != "" {
+		t.Fatalf("i18n.js strings: duplicate key %q, error %v", key, err)
+	}
+	dec := json.NewDecoder(strings.NewReader(m[1]))
+	dec.DisallowUnknownFields()
+	var dicts map[string]dictionary
+	if err := dec.Decode(&dicts); err != nil {
+		t.Fatalf("i18n.js strings are not plain JSON of the expected shape: %v", err)
+	}
+	if got := slices.Sorted(maps.Keys(dicts)); !slices.Equal(got, []string{"ca", "en", "es"}) {
+		t.Fatalf("i18n.js languages = %q, want ca, en and es", got)
+	}
+	return dicts
+}
+
+// duplicateKey returns a key that appears twice in one object of the next JSON value, or "". JSON
+// and JavaScript both keep the last copy, so a repeated key would silently drop a text.
+func duplicateKey(dec *json.Decoder) (string, error) {
+	tok, err := dec.Token()
+	if err != nil {
+		return "", err
+	}
+	if tok != json.Delim('{') && tok != json.Delim('[') {
+		return "", nil
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		if tok == json.Delim('{') {
+			key, err := dec.Token()
+			if err != nil {
+				return "", err
+			}
+			k, _ := key.(string)
+			if seen[k] {
+				return k, nil
+			}
+			seen[k] = true
+		}
+		if dup, err := duplicateKey(dec); err != nil || dup != "" {
+			return dup, err
+		}
+	}
+	_, err = dec.Token() // the closing delimiter
+	return "", err
+}
+
+// flatten names every string of a dictionary: text.<key>, messages.<code> and guidance.<name>.<line>.
+func flatten(d dictionary) map[string]string {
+	out := map[string]string{}
+	for k, v := range d.Text {
+		out["text."+k] = v
+	}
+	for k, v := range d.Messages {
+		out["messages."+k] = v
+	}
+	for k, lines := range d.Guidance {
+		if len(lines) == 0 {
+			out["guidance."+k] = ""
+		}
+		for i, v := range lines {
+			out[fmt.Sprintf("guidance.%s.%d", k, i)] = v
+		}
+	}
+	return out
+}
+
+// TestI18nDictionaries covers AC1. The three languages have exactly the same texts, none of them
+// empty, with the same {placeholders}, and the Spanish and Catalan ones are translated. Every key
+// index.html and app.js name exists, index.html holds the English text of each, and no text is
+// unused.
+func TestI18nDictionaries(t *testing.T) {
+	dicts := readDictionaries(t)
+	en := flatten(dicts["en"])
+	placeholder := regexp.MustCompile(`\{[a-z]+\}`)
+	english := regexp.MustCompile(`(?i)\b(?:the|your|please|certificate|browser|could|again)\b`)
+	sameAsEnglish := map[string]bool{"es text.beta": true, "ca text.beta": true}
+	for _, lang := range languages {
+		got := flatten(dicts[lang])
+		for _, key := range slices.Sorted(maps.Keys(en)) {
+			if _, ok := got[key]; !ok {
+				t.Errorf("i18n.js %s lacks %s", lang, key)
+			}
+		}
+		for _, key := range slices.Sorted(maps.Keys(got)) {
+			v := got[key]
+			if strings.TrimSpace(v) == "" {
+				t.Errorf("i18n.js %s %s is empty", lang, key)
+			}
+			want, ok := en[key]
+			if !ok {
+				t.Errorf("i18n.js %s has %s, which en lacks", lang, key)
+				continue
+			}
+			if lang == "en" {
+				continue
+			}
+			g := slices.Sorted(slices.Values(placeholder.FindAllString(v, -1)))
+			if w := slices.Sorted(slices.Values(placeholder.FindAllString(want, -1))); !slices.Equal(g, w) {
+				t.Errorf("i18n.js %s %s placeholders = %q, want %q", lang, key, g, w)
+			}
+			if v == want && !sameAsEnglish[lang+" "+key] {
+				t.Errorf("i18n.js %s %s = %q is the English text", lang, key, v)
+			}
+			if m := english.FindString(v); m != "" {
+				t.Errorf("i18n.js %s %s = %q has the English word %q", lang, key, v, m)
+			}
+		}
+	}
+
+	// index.html: every data-i18n element holds only the English text of its key.
+	used := map[string]bool{}
+	html := readStatic(t, "index.html")
+	tagged := regexp.MustCompile(`<[a-z0-9]+\b[^>]*\sdata-i18n="([^"]*)"[^>]*>([^<]*)</`).FindAllStringSubmatch(html, -1)
+	if n := strings.Count(html, "data-i18n="); n == 0 || n != len(tagged) {
+		t.Errorf("index.html has %d data-i18n attributes and %d plain-text elements that carry one", n, len(tagged))
+	}
+	for _, m := range tagged {
+		used[m[1]] = true
+		if want, ok := dicts["en"].Text[m[1]]; !ok {
+			t.Errorf("index.html data-i18n=%q is not an i18n.js text", m[1])
+		} else if m[2] != want {
+			t.Errorf("index.html data-i18n=%q holds %q, want the en text %q", m[1], m[2], want)
+		}
+	}
+
+	// app.js: the keys it renders, and the guidance names its code tables list.
+	js := readStatic(t, "app.js")
+	for _, m := range regexp.MustCompile(`(?:\b(?:t|format|showWorking)\(|copyNote = )'([a-z_]+)'`).FindAllStringSubmatch(js, -1) {
+		used[m[1]] = true
+		if _, ok := dicts["en"].Text[m[1]]; !ok {
+			t.Errorf("app.js renders the text %q, which i18n.js lacks", m[1])
+		}
+	}
+	for _, key := range slices.Sorted(maps.Keys(dicts["en"].Text)) {
+		if !used[key] {
+			t.Errorf("i18n.js text %q is not used by index.html or app.js", key)
+		}
+	}
+	tables := regexp.MustCompile(`(?s)\n  const TEMPORARY = .*?\n  const DEFAULT_GUIDANCE = [^\n]*\n`).FindString(js)
+	if tables == "" {
+		t.Fatal("app.js has no guidance tables from TEMPORARY to DEFAULT_GUIDANCE")
+	}
+	names := map[string]bool{}
+	for _, list := range regexp.MustCompile(`\[([^\]]*)\]`).FindAllStringSubmatch(tables, -1) {
+		for _, m := range regexp.MustCompile(`'([a-z_]+)'`).FindAllStringSubmatch(list[1], -1) {
+			names[m[1]] = true
+		}
+	}
+	if got, want := slices.Sorted(maps.Keys(names)), slices.Sorted(maps.Keys(dicts["en"].Guidance)); !slices.Equal(got, want) {
+		t.Errorf("app.js guidance names = %q, want the i18n.js guidance %q", got, want)
+	}
+
+	// The DNIe entry's English parts that app.js replaces are the ones the API serves (AC5).
+	providers := string(readTestdata(t, filepath.Join("..", "..", "..", "testdata", "golden", "providers.json")))
+	for constant, key := range map[string]string{"DNIE_QUALIFIER": "dnie_qualifier", "DNIE_CLAUSE": "dnie_clause"} {
+		m := regexp.MustCompile(`\n  const ` + constant + ` = '([^']+)';`).FindStringSubmatch(js)
+		if m == nil {
+			t.Errorf("app.js has no %s", constant)
+			continue
+		}
+		if m[1] != dicts["en"].Text[key] || !strings.Contains(providers, m[1]) {
+			t.Errorf("app.js %s = %q, want the en text %q and a part of the served providers", constant, m[1], dicts["en"].Text[key])
+		}
+	}
+}
+
+// TestI18nErrorCodes covers AC2. Every code the API can return (the server's messages table and the
+// library's ErrorCodes) and every code app.js produces has a message in each language. The English
+// message is the server's own text, so the English page reads as before.
+func TestI18nErrorCodes(t *testing.T) {
+	dicts := readDictionaries(t)
+	library := libraryCodes(t)
+	server := serverMessages(t, library)
+	js := readStatic(t, "app.js")
+	m := regexp.MustCompile(`\n  const CLIENT_CODES = \[([^\]]*)\];`).FindStringSubmatch(js)
+	if m == nil {
+		t.Fatal("app.js has no CLIENT_CODES list")
+	}
+	codes := map[string]bool{}
+	client := map[string]bool{}
+	for _, c := range regexp.MustCompile(`'([a-z_]+)'`).FindAllStringSubmatch(m[1], -1) {
+		client[c[1]], codes[c[1]] = true, true
+	}
+	// The codes app.js hands to the error views itself are client codes.
+	produced := regexp.MustCompile(`\bcode: '([a-z_]+)'`).FindAllStringSubmatch(js, -1)
+	produced = append(produced, regexp.MustCompile(`'([a-z_]+)'`).FindAllStringSubmatch(jsFunc(t, js, "failureCode"), -1)...)
+	for _, c := range produced {
+		if !client[c[1]] {
+			t.Errorf("app.js produces the code %q, which CLIENT_CODES lacks", c[1])
+		}
+	}
+	for _, code := range library {
+		codes[code] = true
+	}
+	for code := range server {
+		codes[code] = true
+	}
+	for _, lang := range languages {
+		for _, code := range slices.Sorted(maps.Keys(codes)) {
+			if dicts[lang].Messages[code] == "" {
+				t.Errorf("i18n.js %s has no message for the code %q", lang, code)
+			}
+		}
+		for code := range dicts[lang].Messages {
+			if !codes[code] {
+				t.Errorf("i18n.js %s has a message for %q, which nothing produces", lang, code)
+			}
+		}
+	}
+	for code, msg := range server {
+		if got := dicts["en"].Messages[code]; got != msg {
+			t.Errorf("i18n.js en message for %q = %q, want the server's %q", code, got, msg)
+		}
+	}
+}
+
+// libraryCodes returns the root package's ErrorCode constants by name, read from types.go.
+func libraryCodes(t *testing.T) map[string]string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), filepath.Join("..", "..", "types.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codes := map[string]string{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		spec, ok := n.(*ast.ValueSpec)
+		if !ok {
+			return true
+		}
+		if typ, ok := spec.Type.(*ast.Ident); !ok || typ.Name != "ErrorCode" || len(spec.Values) != len(spec.Names) {
+			return true
+		}
+		for i, name := range spec.Names {
+			if lit, ok := spec.Values[i].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+				codes[name.Name], _ = strconv.Unquote(lit.Value)
+			}
+		}
+		return true
+	})
+	if codes["CodeNoCertificate"] != "no_certificate" || codes["CodeInternal"] != "internal" {
+		t.Fatalf("types.go ErrorCodes read as %v", codes)
+	}
+	return codes
+}
+
+// serverMessages returns the server's code to English message table, read from the source of
+// ../internal/server/api.go, where it is unexported. library resolves string(certcheck.CodeX).
+func serverMessages(t *testing.T, library map[string]string) map[string]string {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), filepath.Join("..", "internal", "server", "api.go"), nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var table *ast.CompositeLit
+	ast.Inspect(f, func(n ast.Node) bool {
+		if spec, ok := n.(*ast.ValueSpec); ok && len(spec.Names) == 1 && spec.Names[0].Name == "messages" && len(spec.Values) == 1 {
+			table, _ = spec.Values[0].(*ast.CompositeLit)
+		}
+		return table == nil
+	})
+	if table == nil {
+		t.Fatal("api.go has no messages table")
+	}
+	out := map[string]string{}
+	for i, elt := range table.Elts {
+		var key, value string
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			switch k := kv.Key.(type) {
+			case *ast.BasicLit:
+				key, _ = strconv.Unquote(k.Value)
+			case *ast.CallExpr: // string(certcheck.CodeX)
+				if len(k.Args) == 1 {
+					if sel, ok := k.Args[0].(*ast.SelectorExpr); ok {
+						key = library[sel.Sel.Name]
+					}
+				}
+			}
+			if lit, ok := kv.Value.(*ast.BasicLit); ok {
+				value, _ = strconv.Unquote(lit.Value)
+			}
+		}
+		if key == "" || value == "" {
+			t.Fatalf("api.go messages entry %d: cannot read its code or message", i)
+		}
+		out[key] = value
+	}
+	return out
+}
+
+// TestAppJSLanguage covers AC3, AC4 and AC7 in the source; TestBrowser runs them. A saved choice
+// comes first, then the browser's languages in order, then Spanish. Every code from storage or the
+// browser is checked against the three languages, storage errors are tolerated, and a switch
+// re-renders in place and saves the choice.
+func TestAppJSLanguage(t *testing.T) {
+	js := readStatic(t, "app.js")
+	for _, want := range []string{
+		"const LANG_KEY = 'certcheck.lang';",
+		"const LANGS = ['en', 'es', 'ca'];",
+		"const FALLBACK_LANG = 'es';",
+		"const SPANISH_TOO = ['gl', 'eu', 'ast', 'an', 'oc'];",
+		"$('language').addEventListener('change', changeLanguage);",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js lacks %q", want)
+		}
+	}
+	inOrder := func(fn string, steps ...string) {
+		t.Helper()
+		src, at := jsFunc(t, js, fn), 0
+		for _, step := range steps {
+			i := strings.Index(src[at:], step)
+			if i < 0 {
+				t.Errorf("%s() lacks %q after the previous step", fn, step)
+				return
+			}
+			at += i + len(step)
+		}
+	}
+	inOrder("detectLanguage", "readSavedLanguage()", "isLanguage(saved)", "navigator.languages", "[navigator.language]", "languageOf(", "return FALLBACK_LANG;")
+	inOrder("languageOf", "toLowerCase()", "isLanguage(", "SPANISH_TOO")
+	inOrder("readSavedLanguage", "try {", "localStorage.getItem(LANG_KEY)", "} catch (")
+	inOrder("saveLanguage", "try {", "localStorage.setItem(LANG_KEY", "} catch (")
+	inOrder("useLanguage", "lookup(STRINGS, code)", "document.documentElement.lang = code;", "document.title = t('title');", ".textContent = t(")
+	// A throw during a switch never replaces a shown result (the code is single use): gate F6.
+	inOrder("changeLanguage", "isLanguage(code)", "saveLanguage(code)", "useLanguage(code)", "renderProviders()", "} catch (", "if (!shownResult) {", "showFatal()")
+	inOrder("init", "history.replaceState(null, '', '/');", "useLanguage(detectLanguage());",
+		"$('language').closest('.language').hidden = false;", "await ")
+	if strings.Contains(jsFunc(t, js, "changeLanguage"), "reload") {
+		t.Error("changeLanguage() reloads; a switch re-renders in place")
+	}
 }
 
 func TestFontSources(t *testing.T) {
