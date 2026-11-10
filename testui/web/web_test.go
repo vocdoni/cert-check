@@ -432,6 +432,7 @@ func TestRequiredText(t *testing.T) {
 		`id="error-guidance"`,
 		`<details id="tech"><summary data-i18n="technical_details">Technical details</summary>`,
 		`<p class="hint" data-i18n="report_language">The diagnostic report is in English so that Vocdoni support can read it.</p><pre id="report"`,
+		`<pre id="report" lang="en" tabindex="0">`, // English on an es or ca page too (WCAG 3.1.2)
 		`id="copy-report"`,
 		`>Copy diagnostic report</button>`,
 		`This report contains your certificate details (name and ID number). Share it only with Vocdoni support.`,
