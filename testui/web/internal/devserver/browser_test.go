@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"html"
 	"io"
 	"io/fs"
@@ -74,22 +75,31 @@ var testPages = map[string]struct {
 	"never-start-again":  {false, neverJS + "function next() { document.getElementById('cancel').click(); }\n"},
 	"saved-ca":           {true, "localStorage.setItem('certcheck.lang', 'ca');\n"},
 	"saved-bad":          {true, "localStorage.setItem('certcheck.lang', '__proto__');\n"},
-	"switch-ca":          {false, switchJS},
+	"switch-ca":          {false, switchJS("")},
+	"switch-ca-broken":   {false, switchJS("delete Element.prototype.replaceChildren;")}, // the renderers throw
+	"no-strings":         {false, ""},                                                    // serves index.html with i18n.js swapped for a 404
 }
 
+// stringsTag loads the dictionaries; the no-strings page points it at a missing file instead, as a
+// dropped request would leave the page.
+const stringsTag = `<script src="/i18n.js" defer></script>`
+
 // switchJS chooses Catalan in the language selector, as a user would, once the page shows a view
-// other than the working one.
-const switchJS = `const poll = setInterval(() => {
+// other than the working one. prepare runs just before the switch.
+func switchJS(prepare string) string {
+	return `const poll = setInterval(() => {
   const shown = document.querySelector('section[id^="view-"]:not([hidden])');
   if (!shown || shown.id === 'view-working') {
     return;
   }
   clearInterval(poll);
+  ` + prepare + `
   const select = document.getElementById('language');
   select.value = 'ca';
   select.dispatchEvent(new Event('change'));
 }, 50);
 `
+}
 
 // TestBrowser covers U14-FABLE-4: headless Chrome loads the UI from the devserver and the test
 // checks the view the page settles on. The cases are fragment codes that name Object.prototype
@@ -140,29 +150,36 @@ func TestBrowser(t *testing.T) {
 		caStart   = `data-i18n="title">Comprovador d'autenticació amb certificat</h1>`
 		esRevoked = "El certificado ha sido revocado o suspendido."
 		caRevoked = "El certificat ha estat revocat o suspès."
+		// The DNIe option as the library serves it, with its English parts in the page language.
+		dnieOption = `<option value="dnie" title="Certificado de Autenticación del DNI electrónico; %s">DNIe (%s)</option>`
 	)
+	esDNIe := fmt.Sprintf(dnieOption, "el navegador ya debe poder usar la tarjeta", "requiere lector de tarjetas")
+	caDNIe := fmt.Sprintf(dnieOption, "el navegador ja ha de poder fer servir la targeta", "cal un lector de targetes")
+	enDNIe := fmt.Sprintf(dnieOption, "the browser must already be able to use the card", "requires card reader")
 	langCases := []struct {
 		name, accept, path string // accept: the browser's preferred languages
 		view, lang         string // the only visible view, and <html lang>
 		contains           []string
 	}{
-		{"es-ES start", "es-ES", "/", "start", "es", []string{esStart, "DNIe (requiere lector de tarjetas)", `>Autenticarse</button>`}},
+		{"es-ES start", "es-ES", "/", "start", "es", []string{esStart, esDNIe, `>Autenticarse</button>`}},
 		{"es-ES invalid_state", "es-ES", "/#error=invalid_state&diag=" + diagInvalidState, "error", "es",
 			[]string{"Este enlace de autenticación ya no es válido. Vuelva a empezar.", "El enlace ha caducado. Vuelva a empezar.", diagInvalidState}},
-		{"es-ES success dnie", "es-ES", "/#code=success-dnie", "success", "es", []string{"Fecha de nacimiento", "DNIe (requiere lector de tarjetas)"}},
-		{"ca-ES start", "ca-ES", "/", "start", "ca", []string{caStart, "DNIe (cal un lector de targetes)", `>Autenticar-se</button>`}},
+		{"es-ES success dnie", "es-ES", "/#code=success-dnie", "success", "es", []string{"Fecha de nacimiento", "DNIe (requiere lector de tarjetas)", "DNIe Autenticación"}},
+		{"ca-ES start", "ca-ES", "/", "start", "ca", []string{caStart, caDNIe, `>Autenticar-se</button>`}},
 		{"ca-ES revoked", "ca-ES", "/#code=error-revoked", "error", "ca", []string{caRevoked, "Posi's en contacte amb l'entitat que el va emetre.", revokedReport}},
 		{"ca-ES success", "ca-ES", "/#code=success", "success", "ca", []string{"Nom complet", "JUAN GARCÍA LÓPEZ"}},
 		{"fr-FR falls back to Spanish", "fr-FR", "/", "start", "es", []string{esStart}},
 		{"fr-FR revoked in Spanish", "fr-FR", "/#code=error-revoked", "error", "es", []string{esRevoked, revokedReport}},
 		{"first match wins: fr, ca", "fr-FR,ca-ES,es-ES", "/", "start", "ca", []string{caStart}},
-		{"first match wins: de, en", "de-DE,en-GB,es-ES", "/", "start", "en", []string{authenticate}},
+		{"first match wins: de, en", "de-DE,en-GB,es-ES", "/", "start", "en", []string{authenticate, enDNIe}},
 		{"galician reads Spanish", "gl-ES,en-US", "/", "start", "es", []string{esStart}},
 		{"saved choice beats the browser", "es-ES", "/__test/saved-ca.html", "start", "ca", []string{caStart}},
 		{"bad saved value is ignored", "en-US", "/__test/saved-bad.html", "start", "en", []string{authenticate}},
 		{"switch on the error view", "es-ES", "/__test/switch-ca.html#code=error-revoked", "error", "ca", []string{caRevoked, revokedReport}},
 		{"switch on the success view", "en-US", "/__test/switch-ca.html#code=success", "success", "ca", []string{"Nom complet", "JUAN GARCÍA LÓPEZ"}},
-		{"switch on the start view", "en-US", "/__test/switch-ca.html", "start", "ca", []string{caStart, "DNIe (cal un lector de targetes)"}},
+		{"switch on the start view", "en-US", "/__test/switch-ca.html", "start", "ca", []string{caStart, caDNIe}},
+		// A renderer that throws during the switch leaves the shown result in place.
+		{"switch that throws keeps the result", "en-US", "/__test/switch-ca-broken.html#code=success", "success", "ca", []string{"JUAN GARCÍA LÓPEZ", "Full name"}},
 	}
 	for _, c := range langCases {
 		t.Run(c.name, func(t *testing.T) {
@@ -170,6 +187,30 @@ func TestBrowser(t *testing.T) {
 			checkView(t, dumpDOM(t, chrome, base+c.path, c.accept), c.view, c.lang, c.contains)
 		})
 	}
+
+	// Without i18n.js app.js says so in the three languages, offers a reload and runs nothing
+	// else: the selector stays hidden.
+	t.Run("strings missing", func(t *testing.T) {
+		t.Parallel()
+		dom := dumpDOM(t, chrome, base+"/__test/no-strings.html#code=success", "es-ES")
+		views := visibleViews(dom)
+		if len(views) != 1 || views[0].name != "unloaded" {
+			t.Fatalf("visible views = %v, want only the unloaded panel:\n%s", views, dom)
+		}
+		for _, want := range []string{
+			`<p class="lede" lang="en">This page did not load completely.</p>`,
+			`<p class="lede" lang="es">Esta página no se ha cargado por completo.</p>`,
+			`<p class="lede" lang="ca">Aquesta pàgina no s'ha carregat del tot.</p>`,
+			`<button class="pill primary" type="button">Reload / Recargar / Recarregar</button>`,
+		} {
+			if !strings.Contains(views[0].body, want) {
+				t.Errorf("unloaded panel lacks %q:\n%s", want, views[0].body)
+			}
+		}
+		if !strings.Contains(dom, `<div class="language" hidden`) {
+			t.Error("the language selector is shown, but nothing can switch it")
+		}
+	})
 }
 
 var titles = map[string]string{
@@ -273,6 +314,9 @@ func serveTestPage(w http.ResponseWriter, r *http.Request) {
 		if page.before {
 			extra = `<script src="/__test/` + name + `.js"></script>` + app
 		}
+		if name == "no-strings" {
+			index = bytes.Replace(index, []byte(stringsTag), []byte(`<script src="/__test/missing.js" defer></script>`), 1)
+		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write(bytes.Replace(index, []byte(app), []byte(extra), 1))
 	default:
@@ -280,12 +324,18 @@ func serveTestPage(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// chromeSlots caps the headless Chromes running at once: the parallel cases otherwise start one
+// each, and on a loaded machine a Chrome could miss its deadline (gate F5).
+var chromeSlots = make(chan struct{}, 6)
+
 // dumpDOM loads url in a fresh headless profile whose preferred languages are accept (a
 // comma-separated list) and returns the DOM once 10 s of virtual time have passed (virtual time
 // stands still while a request is open). Headless Chrome takes navigator.languages from
 // --accept-lang and ignores --lang, which sets the language of a headed browser.
 func dumpDOM(t *testing.T, chrome, url, accept string) string {
 	t.Helper()
+	chromeSlots <- struct{}{}
+	defer func() { <-chromeSlots }()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	first, _, _ := strings.Cut(accept, ",")

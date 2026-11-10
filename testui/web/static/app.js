@@ -4,6 +4,12 @@
 // comes from the API or from the URL is inserted with textContent or a text node only, and so is
 // every text from i18n.js.
 (function () {
+  // i18n.js did not load (a dropped request): nothing below can run without it.
+  if (typeof CERTCHECK_STRINGS === 'undefined') {
+    showUnloaded();
+    return;
+  }
+
   const PENDING_KEY = 'certcheck.pending';
   const VERSION_KEY = 'certcheck.serverVersion';
   const LANG_KEY = 'certcheck.lang';
@@ -274,7 +280,10 @@
       $('copy-feedback').textContent = copyNote ? t(copyNote) : '';
       $('status').textContent = '';
     } catch (e) {
-      showFatal();
+      // A shown result stays as it is: its code is single use, so the panel would lose it for good.
+      if (!shownResult) {
+        showFatal();
+      }
     }
   }
 
@@ -415,6 +424,38 @@
       main.textContent = '';
       main.appendChild(panel);
       heading.focus();
+    } catch (e) {
+      // Without a working DOM there is nothing left to show.
+    }
+  }
+
+  // The page without i18n.js: one fixed sentence per language and a reload button in place of the
+  // views, written with plain DOM calls. The URL fragment is kept, so a reload resumes the attempt.
+  function showUnloaded() {
+    try {
+      const panel = document.createElement('section');
+      panel.id = 'view-unloaded';
+      panel.className = 'panel';
+      for (const [lang, text] of [
+        ['en', 'This page did not load completely.'],
+        ['es', 'Esta página no se ha cargado por completo.'],
+        ['ca', 'Aquesta pàgina no s\'ha carregat del tot.'],
+      ]) {
+        const line = document.createElement('p');
+        line.className = 'lede';
+        line.lang = lang;
+        line.textContent = text;
+        panel.appendChild(line);
+      }
+      const reload = document.createElement('button');
+      reload.className = 'pill primary';
+      reload.type = 'button';
+      reload.textContent = 'Reload / Recargar / Recarregar';
+      reload.addEventListener('click', () => location.reload());
+      panel.appendChild(reload);
+      const main = document.getElementById('main');
+      main.textContent = '';
+      main.appendChild(panel);
     } catch (e) {
       // Without a working DOM there is nothing left to show.
     }

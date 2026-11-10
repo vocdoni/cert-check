@@ -380,6 +380,37 @@ func TestAppJSFatalFallback(t *testing.T) {
 	}
 }
 
+// TestAppJSMissingStrings covers gate F4. When i18n.js did not load, app.js stops before it reads
+// the dictionaries and says so in the three languages with a reload button, written with plain DOM
+// calls inside one try.
+func TestAppJSMissingStrings(t *testing.T) {
+	js := readStatic(t, "app.js")
+	guard := regexp.MustCompile(`(?s)^'use strict';\n\n(?:// [^\n]*\n)*\(function \(\) \{\n(?:  // [^\n]*\n)*  if \(typeof CERTCHECK_STRINGS === 'undefined'\) \{\n    showUnloaded\(\);\n    return;\n  \}\n`)
+	if !guard.MatchString(js) {
+		t.Error("app.js does not start by calling showUnloaded() and returning when CERTCHECK_STRINGS is undefined")
+	}
+	unloaded := jsFunc(t, js, "showUnloaded")
+	body := strings.TrimSpace(unloaded[strings.Index(unloaded, "{")+1 : strings.LastIndex(unloaded, "}")])
+	if !strings.HasPrefix(body, "try {") || !strings.HasSuffix(body, "}") || !strings.Contains(body, "} catch (") {
+		t.Errorf("showUnloaded() body is not one try statement:\n%s", body)
+	}
+	if m := regexp.MustCompile(`(?:^|[^\w$.])(\$|el|str|lookup|t|fill|format|showView|showFatal|renderError)\(|CERTCHECK_STRINGS|strings\.`).FindString(unloaded); m != "" {
+		t.Errorf("showUnloaded() uses %q, which needs the code or the strings it stands in for", m)
+	}
+	for _, want := range []string{
+		"['en', 'This page did not load completely.']",
+		"['es', 'Esta página no se ha cargado por completo.']",
+		"['ca', 'Aquesta pàgina no s\\'ha carregat del tot.']",
+		".lang = lang;",
+		"'Reload / Recargar / Recarregar'",
+		"location.reload()",
+	} {
+		if !strings.Contains(unloaded, want) {
+			t.Errorf("showUnloaded() lacks %q", want)
+		}
+	}
+}
+
 // TestWorkingViewExit covers U14-FABLE-2. The working view has a "Start again" pill that forgets the
 // attempt and reloads the page. The reload cannot redeem a code again: init() replaces the URL with
 // / before its first await.
@@ -432,6 +463,7 @@ func TestRequiredText(t *testing.T) {
 		`id="error-guidance"`,
 		`<details id="tech"><summary data-i18n="technical_details">Technical details</summary>`,
 		`<p class="hint" data-i18n="report_language">The diagnostic report is in English so that Vocdoni support can read it.</p><pre id="report"`,
+		`<pre id="report" lang="en" tabindex="0">`, // English on an es or ca page too (WCAG 3.1.2)
 		`id="copy-report"`,
 		`>Copy diagnostic report</button>`,
 		`This report contains your certificate details (name and ID number). Share it only with Vocdoni support.`,
@@ -480,8 +512,14 @@ func TestRequiredText(t *testing.T) {
 			"No hemos podido autenticar este certificado", "No hem pogut autenticar aquest certificat"},
 		{"text", "start_again", "Start again", "Volver a empezar", "Tornar a començar"},
 		{"text", "report_language", "The diagnostic report is in English so that Vocdoni support can read it.",
-			"El informe de diagnóstico está en inglés para que el soporte de Vocdoni pueda leerlo.",
-			"L'informe de diagnòstic és en anglès perquè el suport de Vocdoni el pugui llegir."},
+			"El informe de diagnóstico está en inglés para que el equipo de soporte de Vocdoni pueda leerlo.",
+			"L'informe de diagnòstic és en anglès perquè l'equip de suport de Vocdoni el pugui llegir."},
+		{"text", "revocation_value", "{method}, checked {time}, source {source}",
+			"{method}, consulta del {time} en {source}", "{method}, consulta del {time} a {source}"},
+		{"messages", "never_reached", "The authentication step never reached our server.",
+			"El paso de autenticación no ha llegado a nuestro servidor.", "El pas d'autenticació no ha arribat al nostre servidor."},
+		{"messages", "store_full", "The service is busy. Please try again shortly.",
+			"El servicio está saturado. Vuelva a intentarlo en unos instantes.", "El servei està saturat. Torni-ho a provar d'aquí a uns instants."},
 		{"messages", "revoked", "The certificate has been revoked or suspended.",
 			"El certificado ha sido revocado o suspendido.", "El certificat ha estat revocat o suspès."},
 		{"messages", "expired", "The certificate has expired.", "El certificado ha caducado.", "El certificat ha caducat."},
@@ -930,7 +968,8 @@ func TestAppJSLanguage(t *testing.T) {
 	inOrder("readSavedLanguage", "try {", "localStorage.getItem(LANG_KEY)", "} catch (")
 	inOrder("saveLanguage", "try {", "localStorage.setItem(LANG_KEY", "} catch (")
 	inOrder("useLanguage", "lookup(STRINGS, code)", "document.documentElement.lang = code;", "document.title = t('title');", ".textContent = t(")
-	inOrder("changeLanguage", "isLanguage(code)", "saveLanguage(code)", "useLanguage(code)", "renderProviders()", "} catch (", "showFatal()")
+	// A throw during a switch never replaces a shown result (the code is single use): gate F6.
+	inOrder("changeLanguage", "isLanguage(code)", "saveLanguage(code)", "useLanguage(code)", "renderProviders()", "} catch (", "if (!shownResult) {", "showFatal()")
 	inOrder("init", "history.replaceState(null, '', '/');", "useLanguage(detectLanguage());",
 		"$('language').closest('.language').hidden = false;", "await ")
 	if strings.Contains(jsFunc(t, js, "changeLanguage"), "reload") {
