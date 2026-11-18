@@ -206,7 +206,9 @@ func (c *limitConn) Close() error {
 
 // newAuthServer returns the auth http.Server: HTTP/1.1 only (empty
 // TLSNextProto) and the spec timeouts. ReadHeaderTimeout, the shortest, also
-// bounds the TLS handshake: a silent connection holds a slot for 5 s. Its
+// bounds the TLS handshake until a ClientHello names a provider host: a
+// silent or unknown-SNI connection holds a slot for at most 5 s, a known SNI
+// gets handshakeBudget (90 s) for the certificate picker and PIN. Its
 // ErrorLog (TLS handshake errors, mostly scanners on a public port) goes to
 // slog at debug (ruling R61); ServeHTTP logs its own panics.
 // "OPTIONS *" reaches h (404 with the auth headers) instead of net/http's

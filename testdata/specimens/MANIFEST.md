@@ -10,7 +10,7 @@ must not be in the repository.
 Each file is the publisher's DER re-encoded as one PEM block (`openssl x509 -outform pem`). No
 private key was kept. The 28 non-DIGITEL rows come from the research fixture manifest
 (`~/.cache/cert-check/research/fixtures/MANIFEST.md`, 2026-10-30). DIGITEL, Bewor and Sectigo
-come from digest C `public_fixtures` (`docs/research/appendix-cde-other-providers.md`).
+come from the `public_fixtures` of research digest C (other providers; not kept in this repository).
 
 Privacy. Every committed specimen carries an explicit test or specimen identity in the subject
 (Ficticio, PRUEBAS, ESPECIMEN, ESPAÑOL JUAN, Peça de Proves; NIFs 00000000T, 99999018D, 99999999R,

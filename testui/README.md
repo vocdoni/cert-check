@@ -9,10 +9,6 @@ It is a nested Go module, `github.com/vocdoni/cert-check/testui`, that requires 
 `replace github.com/vocdoni/cert-check => ../`. The package itself is documented in the
 [root README](../README.md). This file covers the UI, its configuration and its deployment on Railway.
 
-Design: `../docs/specs/2026-10-30-cert-check-design.md` (the service) and
-`../docs/specs/2026-10-31-library-restructure-design.md` (the module layout). Implementation plans:
-`../docs/plans/2026-10-30-cert-check-plan.md` and `../docs/plans/2026-10-31-library-restructure-plan.md`.
-
 Contents: [What it is](#1-what-it-is) | [Local run](#2-local-run-with-a-static-certificate) |
 [Configuration](#3-configuration) | [Operations](#4-operations) | [Rollback](#5-rollback) |
 [Security notes](#6-security-notes)
@@ -31,8 +27,9 @@ Flow:
 1. The UI loads `GET /api/v1/providers` and the user presses **Authenticate**.
 2. `POST /api/v1/transactions {"provider":"<id>"}` creates a transaction, sets the
    `__Host-certcheck_tx` cookie and returns `authUrl`:
-   `https://<id>.auth.<authDomain>:<port>/v1/authenticate?state=<state>`.
-3. The browser navigates to `authUrl`. The SNI `<id>.auth.<authDomain>` selects the provider, the
+   `https://<id>.<CERTCHECK_AUTH_DOMAIN>:<port>/v1/authenticate?state=<state>`, for example on
+   the host `fnmt.auth.cert-check.vocdoni.dev`.
+3. The browser navigates to `authUrl`. The SNI `<id>.<CERTCHECK_AUTH_DOMAIN>` selects the provider, the
    server advertises only that provider's CA names, and the browser shows its certificate picker.
 4. The auth listener consumes the state, runs `certcheck.Handler.AuthAs` for the provider named by the
    SNI on the received chain, stores the result and answers `303` to `<publicURL>/#code=<code>` (or
@@ -388,9 +385,9 @@ ID. Find it with:
 railway logs --service cert-check --filter <diagnosticId>
 ```
 
-The line holds the non-PII fields: error code, failed step, provider, profile candidates, issuer DN,
-policy OIDs, the revocation URL host, status and duration, and the TLS version and cipher. The
-subject, names, document number, serial and certificate hashes are never logged. The report itself
+The line holds the non-PII fields: error code, failed step, provider, profile candidates (x509 error
+class only), policy OIDs, the revocation URL host, status and duration, and the TLS version and cipher.
+The subject, issuer, names, document number, serial and certificate hashes are never logged. The report itself
 carries those details, so users are told to share it only with Vocdoni support. Compare the report's
 `technicalDetail` and `revocationAttempts` with the log line to tell a bad certificate from a
 responder outage.
@@ -533,6 +530,11 @@ The package's own security notes (pinned anchors, test markers, `NewHandler` che
   there is no fallback. The cost: in TLS 1.2 the client certificate crosses the network unencrypted,
   so a passive observer on the path can read the holder's name and ID number. Set
   `CERTCHECK_AUTH_TLS13=true` once the client base is known to work.
+- **Auth listener timeouts.** At most 512 connections at once. A connection that sends nothing, or
+  whose ClientHello names no provider host, is closed after 5 s (the read-header timeout also bounds
+  the handshake). Once the ClientHello names a provider host, the handshake gets 90 s, so the holder
+  can pick a certificate and type a smart-card PIN. After the handshake the request timeouts apply:
+  5 s for the headers, 30 s to read the request, 60 s to write the response, 30 s idle.
 - **Zone-wide Cloudflare token, accepted on 2026-10-31.** With `Zone:Read + Zone.DNS:Edit` on
   `vocdoni.dev`, a leaked token can rewrite every record in the zone. The owner accepted the risk. The
   CNAME delegation above removes it and is supported without code changes. The token is a sealed

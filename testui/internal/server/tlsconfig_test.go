@@ -1,6 +1,7 @@
 package server_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -543,4 +544,80 @@ func TestProvider(t *testing.T) {
 			t.Errorf("Provider(%q) = (%q, %v), want (%q, %v)", c.serverName, got, ok, c.want, c.wantOK)
 		}
 	}
+}
+
+// TestHandshakeBudget: the server's handshake bound (the minimum of its
+// timeouts, here a 300 ms ReadHeaderTimeout) closes silent and unknown-SNI
+// connections, but a known provider SNI extends the handshake to the budget
+// (2 s here, 90 s in production), so a slow certificate picker or PIN
+// prompt still completes and the connection then serves a request.
+func TestHandshakeBudget(t *testing.T) {
+	const base, budget, picker = 300 * time.Millisecond, 2 * time.Second, time.Second
+	server.SetHandshakeBudget(t, budget)
+	w := newWorld(t)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusNoContent)
+	}))
+	srv.Config.ErrorLog = slog.NewLogLogger(slog.DiscardHandler, slog.LevelError)
+	srv.Config.ReadHeaderTimeout = base
+	srv.TLS = w.config(t, false, discard)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	addr := srv.Listener.Addr().String()
+
+	// closedWithin dials, lets start act on the connection and reports
+	// whether the server closed it within limit.
+	closedWithin := func(t *testing.T, start func(net.Conn), limit time.Duration) (time.Duration, bool) {
+		t.Helper()
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer c.Close()
+		begin := time.Now()
+		start(c)
+		_ = c.SetReadDeadline(begin.Add(budget + time.Second))
+		_, err = io.Copy(io.Discard, c) // returns at EOF/reset (closed) or at the read deadline
+		took := time.Since(begin)
+		var ne net.Error
+		return took, !(errors.As(err, &ne) && ne.Timeout()) && took < limit
+	}
+
+	t.Run("silent", func(t *testing.T) {
+		if took, ok := closedWithin(t, func(net.Conn) {}, budget/2); !ok {
+			t.Errorf("silent connection open for %v, want closed at the %v base bound", took, base)
+		}
+	})
+	t.Run("unknown SNI", func(t *testing.T) {
+		took, ok := closedWithin(t, func(c net.Conn) {
+			go func() { _ = tls.Client(c, &tls.Config{ServerName: gammaHost, RootCAs: w.serverPool}).Handshake() }()
+		}, budget/2)
+		if !ok {
+			t.Errorf("unknown-SNI connection open for %v, want closed within the %v base bound", took, base)
+		}
+	})
+	t.Run("known SNI, slow picker", func(t *testing.T) {
+		c, err := tls.Dial("tcp", addr, &tls.Config{
+			ServerName: alphaHost, RootCAs: w.serverPool, MaxVersion: tls.VersionTLS12,
+			GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				time.Sleep(picker) // longer than base, shorter than budget
+				return &tls.Certificate{}, nil
+			},
+		})
+		if err != nil {
+			t.Fatalf("handshake with a %v picker: %v, want success within the %v budget", picker, err, budget)
+		}
+		defer c.Close()
+		if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: "+alphaHost+"\r\n\r\n"); err != nil {
+			t.Fatalf("write request: %v", err)
+		}
+		res, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		_ = res.Body.Close()
+		if res.StatusCode != http.StatusNoContent {
+			t.Errorf("status = %d, want %d", res.StatusCode, http.StatusNoContent)
+		}
+	})
 }
