@@ -1,6 +1,3 @@
-// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 // Package server wires the main listener (UI + JSON API) and the auth
 // listener (TLS client authentication) around a shared transaction store.
 package server
