@@ -435,8 +435,9 @@ func TestFetchSizeCap(t *testing.T) {
 	mux.HandleFunc("/exact", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(big[:limit])
 	})
-	// A declared length far past the cap with no body: rejected before any
-	// allocation sized from the header.
+	// A declared length of 1 TiB with no body sent: ErrTooLarge before any
+	// allocation sized from the header. Fetch checks the declared length and
+	// readBody checks it again; either check alone must give this answer.
 	mux.HandleFunc("/declared", func(w http.ResponseWriter, _ *http.Request) {
 		c, buf, err := w.(http.Hijacker).Hijack()
 		if err != nil {

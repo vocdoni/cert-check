@@ -183,6 +183,9 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 	}
 	b, err := readBody(resp.Body, resp.ContentLength, r.MaxBytes)
 	res.Duration = time.Since(start)
+	if errors.Is(err, ErrTooLarge) { // readBody's own length guard: same answer as the check above
+		return res, ErrTooLarge
+	}
 	if err != nil {
 		return res, fetchError(req, err)
 	}
