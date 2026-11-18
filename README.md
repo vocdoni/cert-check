@@ -14,7 +14,7 @@ Contents: [Install](#install) | [Quick start](#quick-start) | [Choosing certific
 [Handler and TLS](#handler-and-tls) | [Verifying without HTTP](#verifying-without-http) |
 [Results and errors](#results-and-errors) | [Revocation and options](#revocation-and-options) |
 [Security notes](#security-notes) | [Supported providers](#supported-providers) |
-[Maintaining the trust set](#maintaining-the-trust-set) | [Development](#development)
+[Maintaining the trust set](#maintaining-the-trust-set) | [Development](#development) | [License](#license)
 
 ## Install
 
@@ -558,3 +558,7 @@ build of `testui/Dockerfile` and the `go doc` golden diff of the root package.
   pass: a difference is a behavior change.
 - `testdata/godoc.golden` is the committed `go doc` output of the public API, and CI diffs it. After an
   intended API change, update it with `go doc -all . > testdata/godoc.golden`.
+
+## License
+
+cert-check is released under the GNU Affero General Public License v3.0 (AGPL-3.0). See [LICENSE](LICENSE).
