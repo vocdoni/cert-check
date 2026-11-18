@@ -447,6 +447,42 @@ func TestHandlerBoundsBeforeDiagnostics(t *testing.T) {
 	}
 }
 
+// TestHandlerChainDNsBounded: a client controls the subject and issuer text
+// of every certificate it sends, so each chain entry is cut to a bound, on
+// the handler's own failures and on a provider's.
+func TestHandlerChainDNsBounded(t *testing.T) {
+	t.Parallel()
+	w := newHWorld(t)
+	big := testpki.NewRoot(t, "big", testpki.CertSpec{Now: w.now, Subject: testpki.Name{
+		testpki.UTF8(testpki.OIDCommonName, strings.Repeat("A", 10<<10))}}).Cert
+	chain := make([]*x509.Certificate, certcheck.DefaultMaxChainLen+1)
+	for i := range chain {
+		chain[i] = big
+	}
+	for _, tc := range []struct {
+		name   string
+		verify func() (*certcheck.Result, error)
+	}{
+		{"Verify", func() (*certcheck.Result, error) { return w.h.Verify(t.Context(), chain) }},
+		{"VerifyAs provider", func() (*certcheck.Result, error) { return w.h.VerifyAs(t.Context(), "alpha", chain) }},
+		{"VerifyAs unknown provider", func() (*certcheck.Result, error) { return w.h.VerifyAs(t.Context(), "nope", chain) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.verify()
+			d := hErr(t, err).Diagnostics
+			if len(d.Chain) != len(chain) {
+				t.Fatalf("%d chain entries, want %d", len(d.Chain), len(chain))
+			}
+			for i, e := range d.Chain {
+				if len(e.Subject) > 2<<10 || len(e.Issuer) > 2<<10 || !strings.HasPrefix(e.Subject, "CN=AAA") {
+					t.Fatalf("chain entry %d: subject %d bytes (%.10q), issuer %d bytes; want a prefix of at most 2 KiB",
+						i, len(e.Subject), e.Subject, len(e.Issuer))
+				}
+			}
+		})
+	}
+}
+
 // TestLogAttrsOmitsClientIssuer: the issuer DN of a presented certificate is
 // client text. A self-signed personal certificate (issuer == subject) must
 // not put the holder's names or document number in the log line.
