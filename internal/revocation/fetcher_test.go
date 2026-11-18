@@ -435,6 +435,17 @@ func TestFetchSizeCap(t *testing.T) {
 	mux.HandleFunc("/exact", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write(big[:limit])
 	})
+	// A declared length far past the cap with no body: rejected before any
+	// allocation sized from the header.
+	mux.HandleFunc("/declared", func(w http.ResponseWriter, _ *http.Request) {
+		c, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 1099511627776\r\n\r\n")
+		_ = buf.Flush()
+	})
 	n.Serve(t, "big.example.es", mux)
 	f := NewFetcher(FetcherOptions{DialContext: n.DialContext})
 
@@ -446,6 +457,7 @@ func TestFetchSizeCap(t *testing.T) {
 		{"/length", ErrTooLarge, 0},
 		{"/chunked", ErrTooLarge, 0},
 		{"/exact", nil, limit},
+		{"/declared", ErrTooLarge, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.path, func(t *testing.T) {
@@ -462,6 +474,14 @@ func TestFetchSizeCap(t *testing.T) {
 				t.Errorf("Fetch(%s) body length = %d, want %d", c.path, len(res.Body), c.wantLen)
 			}
 		})
+	}
+}
+
+// TestReadBodyDeclaredLengthCap: readBody refuses a declared length past the
+// cap before it allocates a buffer of that size.
+func TestReadBodyDeclaredLengthCap(t *testing.T) {
+	if b, err := readBody(strings.NewReader(""), 1<<40, 1<<10); !errors.Is(err, ErrTooLarge) || b != nil {
+		t.Errorf("readBody(1<<40 declared, 1KiB cap) = %d bytes, %v, want no body and %v", len(b), err, ErrTooLarge)
 	}
 }
 

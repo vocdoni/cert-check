@@ -199,6 +199,9 @@ func (f *Fetcher) Fetch(ctx context.Context, r FetchRequest) (FetchResult, error
 // its size with a length and 2x without one; io.ReadAll's chunks plus their
 // final copy took 2.3x.
 func readBody(body io.Reader, length, maxBytes int64) ([]byte, error) {
+	if length > maxBytes { // never allocate from an untrusted length past the cap
+		return nil, ErrTooLarge
+	}
 	if length >= 0 {
 		b := make([]byte, length)
 		if _, err := io.ReadFull(body, b); err != nil {
