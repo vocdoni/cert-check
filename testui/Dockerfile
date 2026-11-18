@@ -5,8 +5,8 @@
 # build.dockerfilePath testui/Dockerfile; locally: docker build -f testui/Dockerfile .).
 # The testui module requires the root module through `replace => ../`.
 
-# golang:1.27 (multi-arch index, resolved 2026-10-31 with `docker buildx imagetools inspect golang:1.27`)
-FROM golang:1.27@sha256:2920bb124f1a2e12a1d39f0cab756ae0068441ee1da7655dec7f5e374944095b AS build
+# golang:1.27 (multi-arch index, go1.27.4, resolved 2026-11-18 with `docker buildx imagetools inspect golang:1.27`)
+FROM golang:1.27@sha256:205c7636d74e0ffbe3d007162df7d74f859f5a8c8322dfb9f907977686c126cf AS build
 # Build with the pinned image's Go only: a go.mod above it fails here instead of downloading a toolchain.
 ENV GOTOOLCHAIN=local
 WORKDIR /src
