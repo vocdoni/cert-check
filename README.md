@@ -561,4 +561,7 @@ build of `testui/Dockerfile` and the `go doc` golden diff of the root package.
 
 ## License
 
-cert-check is released under the GNU Affero General Public License v3.0 (AGPL-3.0). See [LICENSE](LICENSE).
+Copyright (C) 2026 [Synergize S.L.](https://synergize.dev)
+
+cert-check is free software, released under the GNU Affero General Public License v3.0 (AGPL-3.0).
+See [LICENSE](LICENSE) for the full text.
