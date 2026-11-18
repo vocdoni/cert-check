@@ -25,9 +25,9 @@ func keyAlgorithm(c *x509.Certificate) string {
 }
 
 // describeChain returns the diagnostics of a received chain within the
-// bounds: at most maxLen+1 entries (nil certificates skipped) of at most
-// maxChainDN per name, and the leaf described only when its DER is within
-// MaxCertificateDER.
+// bounds: at most maxLen+1 entries (nil certificates skipped), each name cut
+// to at most maxChainDN bytes plus a "..." marker, and the leaf described
+// only when its DER is within MaxCertificateDER.
 func describeChain(chain []*x509.Certificate, maxLen int) ([]ChainEntry, *CertificateDetails) {
 	var entries []ChainEntry
 	for _, c := range chain[:min(len(chain), maxLen+1)] {
@@ -66,11 +66,13 @@ func reportAttempts(in []revocation.Attempt) []RevocationAttempt {
 // client chose both, and real DNs are a few hundred bytes.
 const maxChainDN = 1 << 10
 
-// chainEntry describes c for Diagnostics.Chain, each name cut to maxChainDN.
+// chainEntry describes c for Diagnostics.Chain, each name capped by capDN.
 func chainEntry(c *x509.Certificate) ChainEntry {
 	return ChainEntry{Subject: capDN(c.Subject.String()), Issuer: capDN(c.Issuer.String())}
 }
 
+// capDN returns s when it is at most maxChainDN bytes; otherwise it keeps at
+// most maxChainDN bytes, cut back to a rune boundary, plus a "..." marker.
 func capDN(s string) string {
 	if len(s) <= maxChainDN {
 		return s

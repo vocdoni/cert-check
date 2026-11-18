@@ -15,6 +15,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vocdoni/cert-check/internal/testpki"
 )
@@ -282,5 +283,42 @@ func TestDescribeCertificate(t *testing.T) {
 	rsaLeaf := w.leaf(t, w.rootB, func(s *testpki.CertSpec) { s.KeyPair = tKey(t, "leaf", testpki.RSA2048) })
 	if got := keyAlgorithm(rsaLeaf); got != "RSA-2048" {
 		t.Errorf("keyAlgorithm(RSA) = %s, want RSA-2048", got)
+	}
+}
+
+// TestDescribeChainCapsDN: each chain entry name keeps at most maxChainDN
+// bytes plus "...", cut back to a rune boundary; shorter names are unchanged.
+func TestDescribeChainCapsDN(t *testing.T) {
+	const capBytes = 1 << 10 // maxChainDN, written out so a change to the constant fails here
+	now := time.Now()
+	root := func(cn string) *x509.Certificate {
+		return testpki.NewRoot(t, "dn", testpki.CertSpec{Now: now, Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, cn)}}).Cert
+	}
+	for _, tc := range []struct {
+		name, cn, want string
+	}{
+		{"short", "Short Name", "CN=Short Name"},
+		{"at cap", strings.Repeat("A", capBytes-3), "CN=" + strings.Repeat("A", capBytes-3)},
+		{"ascii", strings.Repeat("A", 10<<10), "CN=" + strings.Repeat("A", capBytes-3) + "..."},
+		// "CN=" + 2-byte runes: byte capBytes falls inside a rune, which is dropped.
+		{"multi-byte", strings.Repeat("é", 5<<10), "CN=" + strings.Repeat("é", (capBytes-4)/2) + "..."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entries, _ := describeChain([]*x509.Certificate{root(tc.cn)}, 1)
+			if len(entries) != 1 {
+				t.Fatalf("%d entries, want 1", len(entries))
+			}
+			for field, got := range map[string]string{"subject": entries[0].Subject, "issuer": entries[0].Issuer} {
+				if got != tc.want {
+					t.Errorf("%s = %d bytes (%.12q...%q), want %d bytes", field, len(got), got, got[max(0, len(got)-6):], len(tc.want))
+				}
+				if !utf8.ValidString(got) {
+					t.Errorf("%s is not valid UTF-8", field)
+				}
+			}
+		})
+	}
+	if got := len(capDN(strings.Repeat("A", 4<<10))); got != capBytes+len("...") {
+		t.Errorf("capped ASCII name = %d bytes, want %d", got, capBytes+len("..."))
 	}
 }
