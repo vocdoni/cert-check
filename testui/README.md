@@ -31,8 +31,9 @@ Flow:
 1. The UI loads `GET /api/v1/providers` and the user presses **Authenticate**.
 2. `POST /api/v1/transactions {"provider":"<id>"}` creates a transaction, sets the
    `__Host-certcheck_tx` cookie and returns `authUrl`:
-   `https://<id>.auth.<authDomain>:<port>/v1/authenticate?state=<state>`.
-3. The browser navigates to `authUrl`. The SNI `<id>.auth.<authDomain>` selects the provider, the
+   `https://<id>.<CERTCHECK_AUTH_DOMAIN>:<port>/v1/authenticate?state=<state>`, for example on
+   the host `fnmt.auth.cert-check.vocdoni.dev`.
+3. The browser navigates to `authUrl`. The SNI `<id>.<CERTCHECK_AUTH_DOMAIN>` selects the provider, the
    server advertises only that provider's CA names, and the browser shows its certificate picker.
 4. The auth listener consumes the state, runs `certcheck.Handler.AuthAs` for the provider named by the
    SNI on the received chain, stores the result and answers `303` to `<publicURL>/#code=<code>` (or
@@ -388,9 +389,9 @@ ID. Find it with:
 railway logs --service cert-check --filter <diagnosticId>
 ```
 
-The line holds the non-PII fields: error code, failed step, provider, profile candidates, issuer DN,
-policy OIDs, the revocation URL host, status and duration, and the TLS version and cipher. The
-subject, names, document number, serial and certificate hashes are never logged. The report itself
+The line holds the non-PII fields: error code, failed step, provider, profile candidates (x509 error
+class only), policy OIDs, the revocation URL host, status and duration, and the TLS version and cipher.
+The subject, issuer, names, document number, serial and certificate hashes are never logged. The report itself
 carries those details, so users are told to share it only with Vocdoni support. Compare the report's
 `technicalDetail` and `revocationAttempts` with the log line to tell a bad certificate from a
 responder outage.

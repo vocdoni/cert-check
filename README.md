@@ -392,6 +392,9 @@ profile allowlists, never from loopback, private or link-local addresses, and a 
 To set the User-Agent, the timeouts or the cache bounds, create one `Revocation` with `NewRevocation`
 and pass it to every provider with `WithRevocation`. The caches are shared by everything that gets the
 same `*Revocation`. A zero `Revocation` is not usable, and `WithRevocation` panics on one.
+`CRLCacheBytes` also caps the size of a CRL: one whose parsed size would exceed it is refused, so a check
+that needs it fails with `revocation_unavailable` when OCSP does not answer. Keep the bound above the
+largest CRL of the providers you enable (about 160 bytes per entry).
 
 ```go
 func newHandler() (*certcheck.Handler, error) {
@@ -420,7 +423,8 @@ The options:
   validity at verification with it, and the `Handler` stamps its own errors with it. The revocation
   checker keeps its own clock, `RevocationOptions.Now`, so set both in tests.
 - `WithLogger(l)`: where construction warnings go (an anchor outside its validity, a disabled
-  profile). The default is `slog.Default()`.
+  profile). The default is `slog.Default()`. Revocation warnings go to `RevocationOptions.Logger`
+  instead (see [Security notes](#security-notes)).
 - `WithVersion(v)`: the `Diagnostics.ServerVersion` value.
 
 Pass the same options to the provider constructors and to `NewHandler`. The constructors use all of
@@ -458,7 +462,10 @@ answer is `internal` and retryable. `Auth` takes the context from the request, s
   (anchor or pinned intermediate) and a policy OID. The provider constructors panic on corrupt
   embedded data (a pin that does not match, a malformed declaration): that is a build-time error that
   the module's tests catch.
-- **No PII in logs.** The package logs only warnings at construction, through the `WithLogger` logger.
+- **No PII in logs.** The package logs only warnings: at construction, through the `WithLogger` logger,
+  and at verification, one per rejected piece of revocation evidence (the pinned CA's subject, method,
+  outcome and host), through `RevocationOptions.Logger` (`slog.Default()` for the default checker).
+  Neither carries client data.
   `Error.Detail` and `Diagnostics.LogAttrs()` never carry names, document numbers, subjects, serials or
   certificate hashes. Keep it that way in your own logging: log `LogAttrs()`, not `Diagnostics`.
 
