@@ -350,8 +350,9 @@ for tables keyed by code such as user messages or metrics.
 
 `Verify` runs the steps in this order and stops at the first failure: `bounds` (chain length and
 certificate size), `algorithms`, `path` (a chain from the leaf to a pinned anchor, client-authentication
-purpose), `profile` (exactly one profile whose policy OID the leaf asserts), `purpose`, `test_marker`,
-`identity` (strict parsing, then reserved identities), and `revocation` (OCSP, then CRL where the profile
+purpose), `profile` (exactly one profile whose policy OID the leaf asserts), `purpose`, `test_marker`
+(specimen fingerprints and subject markers), `identity` (strict parsing), then the reserved identities, a
+second test-certificate check reported as `test_marker`, and `revocation` (OCSP, then CRL where the profile
 allows it, for the leaf and every intermediate on the verified path). The failed step is
 `Diagnostics.FailedStep`; the constants are `StepBounds`, `StepAlgorithms` and so on.
 
