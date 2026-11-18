@@ -381,7 +381,7 @@ func TestAuthServerHTTP11Only(t *testing.T) {
 		t.Errorf("TLSNextProto = %v, want a non-nil empty map", srv.TLSNextProto)
 	}
 	for name, c := range map[string]struct{ got, want time.Duration }{
-		"ReadHeaderTimeout": {srv.ReadHeaderTimeout, 5 * time.Second}, // also the TLS handshake bound (U11-FABLE-4)
+		"ReadHeaderTimeout": {srv.ReadHeaderTimeout, 5 * time.Second}, // also the TLS handshake bound before a known SNI (U11-FABLE-4)
 		"ReadTimeout":       {srv.ReadTimeout, 30 * time.Second},
 		"WriteTimeout":      {srv.WriteTimeout, 60 * time.Second},
 		"IdleTimeout":       {srv.IdleTimeout, 30 * time.Second},

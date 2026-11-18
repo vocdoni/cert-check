@@ -219,18 +219,37 @@ func (h *Handler) chainsToPinnedCA(leaf *x509.Certificate) bool {
 
 // fail returns an *Error decided by the handler, with Diagnostics filled as
 // a provider fills them for any failure, within the bounds: at most
-// DefaultMaxChainLen+1 chain entries, and no description of a leaf over
+// DefaultMaxChainLen+1 chain entries, each name cut to at most maxChainDN
+// bytes plus a "..." marker, and no description of a leaf over
 // MaxCertificateDER.
 func (h *Handler) fail(chain []*x509.Certificate, providerID string, step Step, code ErrorCode, detail string) *Error {
 	d := Diagnostics{DiagnosticID: NewDiagnosticID(), Time: h.now().UTC(), ServerVersion: h.version, Provider: providerID,
 		FailedStep: step, Code: code, TechnicalDetail: detail}
 	for _, c := range chain[:min(len(chain), DefaultMaxChainLen+1)] {
 		if c != nil {
-			d.Chain = append(d.Chain, ChainEntry{Subject: c.Subject.String(), Issuer: c.Issuer.String()})
+			d.Chain = append(d.Chain, chainEntry(c))
 		}
 	}
 	if len(chain) > 0 && chain[0] != nil && len(chain[0].Raw) <= MaxCertificateDER {
 		d.Certificate = DescribeCertificate(chain[0])
 	}
 	return &Error{Code: code, Retryable: code.Retryable(), Detail: detail, Diagnostics: d}
+}
+
+// maxChainDN bounds each subject and issuer string of a chain entry: the
+// client chose both, and real DNs are a few hundred bytes.
+const maxChainDN = 1 << 10
+
+// chainEntry describes c for Diagnostics.Chain, each name capped by capDN.
+func chainEntry(c *x509.Certificate) ChainEntry {
+	return ChainEntry{Subject: capDN(c.Subject.String()), Issuer: capDN(c.Issuer.String())}
+}
+
+// capDN returns s when it is at most maxChainDN bytes; otherwise it keeps at
+// most maxChainDN bytes, cut back to a rune boundary, plus a "..." marker.
+func capDN(s string) string {
+	if len(s) <= maxChainDN {
+		return s
+	}
+	return strings.ToValidUTF8(s[:maxChainDN], "") + "..."
 }

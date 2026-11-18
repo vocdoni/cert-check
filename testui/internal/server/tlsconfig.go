@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"time"
 
 	certcheck "github.com/vocdoni/cert-check"
 )
@@ -19,6 +20,11 @@ type ConfigOptions struct {
 	Logger         *slog.Logger // handshake-level debug lines; nil = slog.Default()
 }
 
+// handshakeBudget is the TLS handshake time a connection gets once its
+// ClientHello names a provider host: enough for the browser's certificate
+// picker and a smart-card PIN prompt. Tests shorten it.
+var handshakeBudget = 90 * time.Second
+
 // maxLoggedSNI caps the client-chosen server name in logs and errors.
 const maxLoggedSNI = 64
 
@@ -27,6 +33,11 @@ const maxLoggedSNI = 64
 // "<id>.<AuthDomain>"; an unknown SNI is a handshake error (internal_error
 // alert), so nothing is served without a provider. Each provider config is
 // the certcheck.Handler TLSConfig of a handler holding that provider alone.
+// A known SNI moves the connection deadline to handshakeBudget (90 s) from
+// now: the http.Server's handshake bound (its shortest timeout) stays for
+// silent and unknown-SNI connections, while a holder choosing a certificate
+// or typing a PIN gets time to finish. net/http clears the deadline after
+// the handshake and applies its request timeouts as usual.
 func ServerConfig(o ConfigOptions) (*tls.Config, error) {
 	if len(o.Providers) == 0 || o.GetCertificate == nil || o.AuthDomain == "" {
 		return nil, errors.New("server: Providers, GetCertificate and AuthDomain are required")
@@ -48,6 +59,7 @@ func ServerConfig(o ConfigOptions) (*tls.Config, error) {
 		}
 		perSNI[p.Info().ID+"."+domain] = h.TLSConfig(o.GetCertificate, tlsOpts...)
 	}
+	budget := handshakeBudget
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		NextProtos: []string{"http/1.1"},
@@ -60,6 +72,9 @@ func ServerConfig(o ConfigOptions) (*tls.Config, error) {
 				shown := sni[:min(len(sni), maxLoggedSNI)]
 				log.Debug("auth handshake rejected: unknown SNI", "sni", shown)
 				return nil, fmt.Errorf("server: unknown server name %q", shown)
+			}
+			if hello.Conn != nil {
+				_ = hello.Conn.SetDeadline(time.Now().Add(budget)) // fails only on a closed conn; the handshake then fails anyway
 			}
 			return cfg, nil
 		},

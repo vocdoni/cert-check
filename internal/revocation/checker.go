@@ -167,7 +167,7 @@ func (c *Checker) checkOCSP(ctx context.Context, cert, issuer *x509.Certificate,
 	key := issuerKey(issuer) + " " + SerialKey(cert.SerialNumber)
 	if it, ok := c.ocsp.get(key, now, p); ok {
 		c.fillOCSP(res, it)
-		res.Attempts = append(res.Attempts, Attempt{Method: MethodOCSP, URL: it.source, Outcome: it.status, FromCache: true,
+		res.Attempts = append(res.Attempts, Attempt{Method: MethodOCSP, URL: it.url, Outcome: it.status, FromCache: true,
 			ThisUpdate: it.thisUpdate, NextUpdate: it.nextUpdate, ResponderSubject: it.responderSubject})
 		return it.status
 	}

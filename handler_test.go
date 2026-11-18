@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	certcheck "github.com/vocdoni/cert-check"
 	"github.com/vocdoni/cert-check/internal/revocation"
@@ -442,6 +443,61 @@ func TestHandlerBoundsBeforeDiagnostics(t *testing.T) {
 			}
 			if described := d.Certificate != nil; described != tc.describeLeaf {
 				t.Errorf("leaf described %v, want %v", described, tc.describeLeaf)
+			}
+		})
+	}
+}
+
+// TestHandlerChainDNsBounded: a client controls the subject and issuer text
+// of every certificate it sends, so each chain entry is cut to a bound, on
+// the handler's own failures and on a provider's.
+func TestHandlerChainDNsBounded(t *testing.T) {
+	t.Parallel()
+	const capBytes = 1 << 10 // the per-name cap (maxChainDN in handler.go and internal/engine)
+	w := newHWorld(t)
+	root := func(cn string) *x509.Certificate {
+		return testpki.NewRoot(t, "dn", testpki.CertSpec{Now: w.now, Subject: testpki.Name{testpki.UTF8(testpki.OIDCommonName, cn)}}).Cert
+	}
+	// Self-signed, so subject == issuer. Each name keeps at most capBytes
+	// bytes plus "...", cut back to a rune boundary; shorter names are unchanged.
+	ascii := root(strings.Repeat("A", 10<<10))
+	wantASCII := "CN=" + strings.Repeat("A", capBytes-3) + "..." // capBytes+3 bytes
+	chain := []*x509.Certificate{
+		root("Short Name"),
+		root(strings.Repeat("B", capBytes-3)),
+		// "CN=" + 2-byte runes: byte capBytes falls inside a rune, which is dropped.
+		root(strings.Repeat("é", 5<<10)),
+	}
+	want := []string{"CN=Short Name", "CN=" + strings.Repeat("B", capBytes-3), "CN=" + strings.Repeat("é", (capBytes-4)/2) + "..."}
+	for len(chain) < certcheck.DefaultMaxChainLen+1 {
+		chain, want = append(chain, ascii), append(want, wantASCII)
+	}
+	for _, tc := range []struct {
+		name   string
+		verify func() (*certcheck.Result, error)
+	}{
+		{"Verify", func() (*certcheck.Result, error) { return w.h.Verify(t.Context(), chain) }},
+		{"VerifyAs provider", func() (*certcheck.Result, error) { return w.h.VerifyAs(t.Context(), "alpha", chain) }},
+		{"VerifyAs unknown provider", func() (*certcheck.Result, error) { return w.h.VerifyAs(t.Context(), "nope", chain) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := tc.verify()
+			d := hErr(t, err).Diagnostics
+			if len(d.Chain) != len(chain) {
+				t.Fatalf("%d chain entries, want %d", len(d.Chain), len(chain))
+			}
+			for i, e := range d.Chain {
+				for field, got := range map[string]string{"subject": e.Subject, "issuer": e.Issuer} {
+					if got != want[i] {
+						t.Errorf("entry %d %s = %d bytes (%.12q...%q), want %d bytes", i, field, len(got), got, got[max(0, len(got)-6):], len(want[i]))
+					}
+					if !utf8.ValidString(got) {
+						t.Errorf("entry %d %s is not valid UTF-8", i, field)
+					}
+				}
+			}
+			if got := len(d.Chain[len(d.Chain)-1].Subject); got != capBytes+len("...") {
+				t.Errorf("capped ASCII name = %d bytes, want %d", got, capBytes+len("..."))
 			}
 		})
 	}
