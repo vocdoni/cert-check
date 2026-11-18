@@ -1,6 +1,3 @@
-// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 // Package testpki builds synthetic PKIs for tests: CAs, intermediates and
 // leaves with arbitrary raw subjects, SAN directoryName entries,
 // SubjectDirectoryAttributes, policies, KU/EKU, critical extensions, AIA/CDP,

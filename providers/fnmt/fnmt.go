@@ -1,6 +1,3 @@
-// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 // Package fnmt provides the certificate types of the FNMT-RCM (Fábrica
 // Nacional de Moneda y Timbre). Pass its providers to certcheck.NewHandler.
 package fnmt

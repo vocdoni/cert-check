@@ -1,6 +1,3 @@
-// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 // Package profiles holds the provider/profile registry: pinned anchors
 // (embedded PEM, SHA-256 and SPKI pins checked at load), exact policy OIDs,
 // purpose and algorithm rules, identity adapters, revocation policies and

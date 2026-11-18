@@ -1,6 +1,3 @@
-// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 // Package dnie provides the authentication certificate type of the DNI
 // electrónico, the Spanish electronic identity card (beta). Pass its provider
 // to certcheck.NewHandler.

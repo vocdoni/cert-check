@@ -1,6 +1,3 @@
-// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
-// SPDX-License-Identifier: AGPL-3.0-or-later
-
 package profiles
 
 // Firmaprofesional (beta): digest C; CUALIFICADOS pinned once (alias 4ccf17c0 not loaded) plus ICA B01.
