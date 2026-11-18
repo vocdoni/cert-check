@@ -2,6 +2,8 @@ module github.com/vocdoni/cert-check/testui
 
 go 1.27
 
+toolchain go1.27.4
+
 require (
 	github.com/caddyserver/certmagic v0.25.6
 	github.com/libdns/cloudflare v0.2.2
