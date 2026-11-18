@@ -2,7 +2,6 @@
 .delivery
 .claude
 .remember
-docs
 **/*_test.go
 **/testdata
 testui/web/internal

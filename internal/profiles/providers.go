@@ -7,8 +7,8 @@ import (
 	"github.com/vocdoni/cert-check/internal/revocation"
 )
 
-// Source digests: A = docs/research/appendix-a-fnmt-dnie-accv.md,
-// B = appendix-b-idcat-izenpe-camerfirma.md, C = appendix-cde-other-providers.md.
+// Source digests (provider research, not kept in this repository): A = FNMT, DNIe and ACCV;
+// B = idCAT, Izenpe and Camerfirma; C = the other providers.
 // Specimen fingerprints: testdata/specimens/MANIFEST.md.
 
 func anchor(sha, spki string) Anchor {

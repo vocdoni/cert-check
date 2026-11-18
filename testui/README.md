@@ -9,10 +9,6 @@ It is a nested Go module, `github.com/vocdoni/cert-check/testui`, that requires 
 `replace github.com/vocdoni/cert-check => ../`. The package itself is documented in the
 [root README](../README.md). This file covers the UI, its configuration and its deployment on Railway.
 
-Design: `../docs/specs/2026-10-30-cert-check-design.md` (the service) and
-`../docs/specs/2026-10-31-library-restructure-design.md` (the module layout). Implementation plans:
-`../docs/plans/2026-10-30-cert-check-plan.md` and `../docs/plans/2026-10-31-library-restructure-plan.md`.
-
 Contents: [What it is](#1-what-it-is) | [Local run](#2-local-run-with-a-static-certificate) |
 [Configuration](#3-configuration) | [Operations](#4-operations) | [Rollback](#5-rollback) |
 [Security notes](#6-security-notes)
