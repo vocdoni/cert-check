@@ -534,6 +534,11 @@ The package's own security notes (pinned anchors, test markers, `NewHandler` che
   there is no fallback. The cost: in TLS 1.2 the client certificate crosses the network unencrypted,
   so a passive observer on the path can read the holder's name and ID number. Set
   `CERTCHECK_AUTH_TLS13=true` once the client base is known to work.
+- **Auth listener timeouts.** At most 512 connections at once. A connection that sends nothing, or
+  whose ClientHello names no provider host, is closed after 5 s (the read-header timeout also bounds
+  the handshake). Once the ClientHello names a provider host, the handshake gets 90 s, so the holder
+  can pick a certificate and type a smart-card PIN. After the handshake the request timeouts apply:
+  5 s for the headers, 30 s to read the request, 60 s to write the response, 30 s idle.
 - **Zone-wide Cloudflare token, accepted on 2026-10-31.** With `Zone:Read + Zone.DNS:Edit` on
   `vocdoni.dev`, a leaked token can rewrite every record in the zone. The owner accepted the risk. The
   CNAME delegation above removes it and is supported without code changes. The token is a sealed
