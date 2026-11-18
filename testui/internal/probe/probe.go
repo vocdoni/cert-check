@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package probe checks, from the network it runs on, that the revocation
 // endpoints of every enabled profile answer with evidence the revocation
 // checker accepts (spec AC8). It backs the `cert-check probe` subcommand.

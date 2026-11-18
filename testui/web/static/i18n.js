@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Synergize S.L.
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 'use strict';
 
 // The UI texts in English, Spanish and Catalan, read by app.js. Spanish and Catalan address the

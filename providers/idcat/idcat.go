@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package idcat provides the idCAT certificate type of the Consorci AOC
 // (Catalonia). Pass its provider to certcheck.NewHandler.
 package idcat

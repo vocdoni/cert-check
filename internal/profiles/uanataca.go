@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package profiles
 
 // Uanataca (beta): digest C uanataca-citizen-sw, four issuing CAs. The

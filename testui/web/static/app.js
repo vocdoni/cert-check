@@ -1,5 +1,7 @@
 'use strict';
 
+// Copyright (C) 2026 Synergize S.L.
+// SPDX-License-Identifier: AGPL-3.0-or-later
 // Certificate Authentication Checker UI. Plain JavaScript, no build step. Every string that
 // comes from the API or from the URL is inserted with textContent or a text node only, and so is
 // every text from i18n.js.

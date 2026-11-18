@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package signe provides the SIGNE natural person certificate type for
 // other devices (beta). Pass its provider to certcheck.NewHandler.
 package signe

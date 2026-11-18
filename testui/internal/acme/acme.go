@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package acme provides the auth listener's certificate: certmagic with the
 // Cloudflare DNS-01 solver only (HTTP-01 and TLS-ALPN-01 disabled), storage
 // under the data directory, or a static certificate for local runs and tests.

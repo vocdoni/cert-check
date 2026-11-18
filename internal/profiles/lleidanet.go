@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 package profiles
 
 // Lleidanet (beta): digest C lleidanet-natural-person-sw. CRL only (R63): the

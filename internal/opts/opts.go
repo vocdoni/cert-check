@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package opts holds the settings that the certcheck options configure. It
 // exists so that package certcheck (which declares Option and the With*
 // constructors) and internal/engine (which applies them) share one type

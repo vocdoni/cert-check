@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Command devserver serves the embedded UI with a mocked API backed by the JSON fixtures in
 // web/testdata/fixtures. It exists for the offline UI checks (AC9: Playwright, axe) and is not
 // part of the shipped image. Run it from testui/:

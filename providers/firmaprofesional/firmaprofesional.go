@@ -1,3 +1,6 @@
+// Copyright (C) 2026 Synergize S.L. <https://synergize.dev>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 // Package firmaprofesional provides the Firmaprofesional natural person
 // certificate type (beta). Pass its provider to certcheck.NewHandler.
 package firmaprofesional
