@@ -68,6 +68,10 @@ func chkTRunReusePolicy(t *testing.T, tc chkTReuseCase, p Policy) {
 				second.ThisUpdate, second.NextUpdate, second.RevokedAt, second.Reason, second.Source,
 				first.ThisUpdate, first.NextUpdate, first.RevokedAt, first.Reason, first.Source)
 		}
+		// It also reports the full URL, as a fresh attempt does.
+		if got := second.Attempts[0].URL; got != chkTOCSPURL {
+			t.Errorf("cached attempt URL = %q, want %q", got, chkTOCSPURL)
+		}
 	}
 }
 
